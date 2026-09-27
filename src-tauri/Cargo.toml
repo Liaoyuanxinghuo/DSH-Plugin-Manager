@@ -1,0 +1,32 @@
+[package]
+name = "dsh-plugin-manager"
+version = "0.1.0"
+description = "DSH Plugin Manager - 图形化 DSH 环境与插件管理工具"
+authors = ["dshpm"]
+edition = "2021"
+
+[lib]
+name = "dsh_plugin_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+dirs = "6"
+thiserror = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

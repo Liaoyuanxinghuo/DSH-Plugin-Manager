@@ -1,0 +1,80 @@
+﻿
+> dsh-plugin-manager@0.1.0 tauri
+> tauri build
+
+node.exe :         Info Looking up installed tauri packages to check mismatched versions...
+所在位置 行:1 字符: 1
++ & "C:\Users\xiaolei\AppData\Local\Doubao\User Data\sandbox_runtime\ba ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (        Info Lo...hed versions...:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+        Warn The bundle identifier "com.dshpm.app" set in `"tauri.conf.json" identifier` ends with `.app`. This is not 
+recommended because it conflicts with the application bundle extension on macOS.
+     Running beforeBuildCommand `pnpm build`
+
+> dsh-plugin-manager@0.1.0 build E:\workspace\dshcjaz
+> tsc && vite build
+
+[36mvite v8.3.1 [32mbuilding client environment for production...[36m[39m
+transforming...
+✓ 24 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.48 kB │ gzip:  0.31 kB
+dist/assets/index-IXvJRZ7u.css   12.03 kB │ gzip:  2.85 kB
+dist/assets/index-CRSpUFSn.js   276.09 kB │ gzip: 84.91 kB
+
+[33m[33m[INEFFECTIVE_DYNAMIC_IMPORT] [0mnode_modules/.pnpm/@tauri-apps+api@2.12.0/node_modules/@tauri-apps/api/event
+.js is dynamically imported by src/App.tsx but also statically imported by src/InstallDialog.tsx, dynamic import will n
+ot move module into another chunk.
+[39m
+[32m✓ built in 156ms[39m
+   Compiling dsh-plugin-manager v0.1.0 (E:\workspace\dshcjaz\src-tauri)
+warning: unused variable: `scan_dirs`
+   --> src\scanner.rs:239:42
+    |
+239 | pub fn scan_envs(manual_envs: &[DshEnv], scan_dirs: &[ScanDirEntry]) -> Vec<DshEnv> {
+    |                                          ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_
+scan_dirs`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `profile`
+    --> src\lib.rs:1078:5
+     |
+1078 |     profile: String,
+     |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_profile`
+
+warning: unused variable: `profile`
+    --> src\lib.rs:1096:5
+     |
+1096 |     profile: String,
+     |     ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_profile`
+
+warning: function `run_key_legacy` is never used
+   --> src\lib.rs:496:4
+    |
+496 | fn run_key_legacy(env_id: &str, profile: &str) -> String {
+    |    ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `find_free_port` is never used
+   --> src\runner.rs:202:8
+    |
+202 | pub fn find_free_port(start: u16) -> Option<u16> {
+    |        ^^^^^^^^^^^^^^
+
+warning: `dsh-plugin-manager` (lib) generated 5 warnings (run `cargo fix --lib -p dsh-plugin-manager` to apply 3 sugges
+tions)
+    Finished `release` profile [optimized] target(s) in 2m 17s
+       Built application at: E:\workspace\dshcjaz\src-tauri\target\release\dsh-plugin-manager.exe
+        Info Patching E:\workspace\dshcjaz\src-tauri\target\release\dsh-plugin-manager.exe with bundle type information
+: nsis
+        Info Target: x64
+     Running makensis to produce E:\workspace\dshcjaz\src-tauri\target\release\bundle\nsis\dsh-plugin-manager_0.1.0_x64
+-setup.exe
+    Finished 1 bundle at:
+        E:\workspace\dshcjaz\src-tauri\target\release\bundle\nsis\dsh-plugin-manager_0.1.0_x64-setup.exe (2.08 MiB)
+
