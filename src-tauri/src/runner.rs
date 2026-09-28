@@ -41,6 +41,10 @@ pub fn resolve_dsh_launcher(env: &DshEnv) -> Result<(String, String), String> {
             .next()
             .map(|s| PathBuf::from(s.trim()))
             .filter(|p| p.is_file())
+    }).or_else(|| {
+        // 兜底：应用自装 / 探测到的 node（toolchain::probe 覆盖 runtime 目录、.dsh-win、npm 全局等）
+        let t = crate::toolchain::probe();
+        if t.node.is_file() { Some(t.node) } else { None }
     });
     let node = node.ok_or_else(|| "未找到 node.exe（PATH 中无 node，且 dsh 本体未自带）".to_string())?;
     Ok((node.to_string_lossy().to_string(), binjs.to_string_lossy().to_string()))

@@ -32,6 +32,19 @@ pub fn run_dsh_with_logs(
     if let Some(home) = dsh_home {
         cmd.env("DSH_HOME", home);
     }
+    // 注入 node 目录到 PATH（dsh.cmd shim / pnpm 依赖 node；PATH 可能没有）。
+    // 电脑未装 node 时先自动下载安装（失败不阻断，日志如实展示）。
+    let mut tc = crate::toolchain::probe();
+    if !tc.node.is_file() {
+        let registry = crate::settings::load_settings().npm_registry;
+        match crate::toolchain::ensure(app, &registry) {
+            Ok(t) => tc = t,
+            Err(e) => {
+                let _ = app.emit("install-log", serde_json::json!({ "line": format!("自动安装 Node.js 失败: {e}"), "kind": "stderr" }));
+            }
+        }
+    }
+    tc.inject_path(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

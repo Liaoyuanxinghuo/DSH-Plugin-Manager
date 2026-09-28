@@ -50,6 +50,7 @@ pub fn npm_search(query: &str, registry: &str) -> Result<Vec<NpmSearchHit>, Stri
     if q.is_empty() {
         return Err("搜索关键词不能为空".to_string());
     }
+    let registry = crate::settings::resolve_registry(registry);
     let url = format!("{registry}/-/v1/search?text={}&size=20", urlencode(q));
     let resp = reqwest::blocking::Client::new()
         .get(&url)
@@ -92,6 +93,7 @@ pub fn npm_package_info(name: &str, registry: &str) -> Result<NpmPackageInfo, St
     if name.is_empty() {
         return Err("包名不能为空".to_string());
     }
+    let registry = crate::settings::resolve_registry(registry);
     let url = format!("{registry}/{}", urlencode(name));
     let resp = reqwest::blocking::Client::new()
         .get(&url)

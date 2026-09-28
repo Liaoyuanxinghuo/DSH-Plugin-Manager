@@ -683,7 +683,7 @@ describe("M5 设置与 DSH 下载", () => {
   it("设置弹窗加载并保存镜像源与下载目录", async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "get_settings_cmd") {
-        return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions" });
+        return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "set_settings_cmd") {
         return Promise.resolve(null);
@@ -696,17 +696,19 @@ describe("M5 设置与 DSH 下载", () => {
       expect(screen.getByText("⚙ 设置")).toBeInTheDocument();
     });
     await user.click(screen.getByText("⚙ 设置"));
+    // 镜像源为下拉列表：getByDisplayValue 匹配 select 时取选项文本，改用 combobox + toHaveValue
+    const regSelect = screen.getByRole("combobox", { name: /npm 镜像源/ });
     await waitFor(() => {
-      expect(screen.getByDisplayValue("https://registry.npmmirror.com")).toBeInTheDocument();
+      expect(regSelect).toHaveValue("https://registry.npmmirror.com");
     });
-    const regInput = screen.getByDisplayValue("https://registry.npmmirror.com");
-    await user.clear(regInput);
-    await user.type(regInput, "https://registry.npmjs.org");
+    // 选择「npm 官方源（直连）」选项（value 为空字符串）
+    await user.selectOptions(regSelect, "");
     await user.click(screen.getByText("保存"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("set_settings_cmd", {
-        npmRegistry: "https://registry.npmjs.org",
+        npmRegistry: "",
         dshDownloadDir: "C:\\dsh-versions",
+        githubMirror: "https://ghfast.top",
       });
     });
   });
@@ -792,6 +794,63 @@ describe("M5 设置与 DSH 下载", () => {
     localStorage.removeItem("dshpm-sel-profile");
     localStorage.removeItem("dshpm-sel-port");
     localStorage.removeItem("dshpm-auto-port");
+  });
+
+  it("设置弹窗：关于本项目与检查更新", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings_cmd") {
+        return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
+      }
+      if (cmd === "check_update_cmd") {
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.0", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("⚙ 设置")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("⚙ 设置"));
+    // 关于本项目：点开后显示项目地址按钮
+    await user.click(screen.getByText("ℹ 关于本项目"));
+    await waitFor(() => {
+      expect(screen.getByText("🌐 项目地址（GitHub）")).toBeInTheDocument();
+    });
+    // 检查更新：mock 返回有新版本 → 显示提示
+    await user.click(screen.getByText("🔄 检查更新"));
+    await waitFor(() => {
+      expect(screen.getByText(/发现新版本/)).toBeInTheDocument();
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("check_update_cmd");
+    // 下载更新：mock 返回保存路径 → 显示完成
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings_cmd") {
+        return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
+      }
+      if (cmd === "check_update_cmd") {
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.0", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+      }
+      if (cmd === "download_update_cmd") {
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.0_x64-setup.exe");
+      }
+      return mockAllDefault(cmd);
+    });
+    await user.click(screen.getByText("⬇ 下载 v0.3.0"));
+    await waitFor(() => {
+      expect(screen.getByText(/已保存/)).toBeInTheDocument();
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.0" });
+    // 打开所在文件夹
+    await user.click(screen.getByText("📂 打开所在文件夹"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.0_x64-setup.exe" });
+    });
+    // 关闭程序并更新：启动安装程序
+    await user.click(screen.getByText("🔄 关闭程序并更新"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.0_x64-setup.exe" });
+    });
   });
 });
 

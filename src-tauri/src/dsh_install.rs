@@ -49,6 +49,21 @@ pub fn list_dsh_versions(registry: &str) -> Result<Vec<DshVersionInfo>, String> 
     Ok(out)
 }
 
+/// 构造 npm install 参数（在版本目录内安装，不走 --prefix，避免 cmd /C 嵌套引号问题）
+pub fn build_npm_install_args(version: &str, registry: &str) -> Vec<String> {
+    let mut args = vec![
+        "install".to_string(),
+        format!("@deepseek-ai/dsh@{version}"),
+    ];
+    let reg = registry.trim();
+    if !reg.is_empty() {
+        args.push("--registry".to_string());
+        args.push(crate::settings::resolve_registry(reg));
+    }
+    args.extend(["--no-save".to_string(), "--no-audit".to_string(), "--no-fund".to_string()]);
+    args
+}
+
 /// 安装指定版本到 target_dir/dsh-<version>
 pub fn install_dsh_version(
     app: &tauri::AppHandle,
@@ -56,6 +71,15 @@ pub fn install_dsh_version(
     target_dir: &str,
     registry: &str,
 ) -> DshInstallResult {
+    // 1) 下载前确保 node/npm/pnpm 环境（缺失自动安装）
+    let tc = match crate::toolchain::ensure(app, registry) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = app.emit("install-log", serde_json::json!({ "line": format!("工具链检查失败: {e}"), "kind": "stderr" }));
+            return DshInstallResult { success: false, exit_code: None, summary: format!("工具链检查失败: {e}"), bin_path: None, version: version.to_string() };
+        }
+    };
+
     let dir = Path::new(target_dir);
     let ver_dir = dir.join(format!("dsh-{version}"));
     if let Err(e) = std::fs::create_dir_all(&ver_dir) {
@@ -71,18 +95,11 @@ pub fn install_dsh_version(
             version: version.to_string(),
         };
     }
-    let full = format!(
-        "npm install \"@deepseek-ai/dsh@{}\" --prefix \"{}\" --registry \"{}\" --no-save --no-audit --no-fund",
-        version,
-        ver_dir.display(),
-        registry
-    );
-    let _ = full;
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", &format!(
-        "npm install \"@deepseek-ai/dsh@{}\" --prefix \"{}\" --registry \"{}\" --no-save --no-audit --no-fund",
-        version, ver_dir.display(), registry
-    )]);
+    let args = build_npm_install_args(version, registry);
+    let mut cmd = Command::new(&tc.npm);
+    cmd.args(&args);
+    cmd.current_dir(&ver_dir);
+    tc.inject_path(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -166,16 +183,24 @@ pub fn ensure_profile_npmrc(profile_dir: &Path, registry: &str) -> Result<(), St
     let npmrc = profile_dir.join(".npmrc");
     let existing = std::fs::read_to_string(&npmrc).unwrap_or_default();
     let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
-    let reg_line = format!("registry={registry}");
-    let mut found = false;
-    for l in &mut lines {
-        if l.trim_start().starts_with("registry=") || l.trim_start().starts_with("registry =") {
-            *l = reg_line.clone();
-            found = true;
+    let reg = registry.trim();
+    if reg.is_empty() {
+        // 空 = 不使用镜像源：移除 .npmrc 中所有 registry 行
+        lines.retain(|l| {
+            !(l.trim_start().starts_with("registry=") || l.trim_start().starts_with("registry ="))
+        });
+    } else {
+        let reg_line = format!("registry={}", crate::settings::resolve_registry(reg));
+        let mut found = false;
+        for l in &mut lines {
+            if l.trim_start().starts_with("registry=") || l.trim_start().starts_with("registry =") {
+                *l = reg_line.clone();
+                found = true;
+            }
         }
-    }
-    if !found {
-        lines.push(reg_line);
+        if !found {
+            lines.push(reg_line);
+        }
     }
     let content = lines.join("\n") + "\n";
     std::fs::write(&npmrc, content).map_err(|e| format!("写入 .npmrc 失败: {e}"))
@@ -201,6 +226,10 @@ mod tests {
         let c2 = std::fs::read_to_string(work.join(".npmrc")).unwrap();
         assert!(c2.contains("registry=https://b.com"));
         assert!(!c2.contains("https://a.com"));
+        // 空 registry：移除已有行
+        ensure_profile_npmrc(&work, "").unwrap();
+        let c3 = std::fs::read_to_string(work.join(".npmrc")).unwrap();
+        assert!(!c3.contains("registry="));
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -248,6 +277,13 @@ mod tests {
     #[ignore]
     fn list_dsh_versions_live() {
         let vs = crate::dsh_install::list_dsh_versions("https://registry.npmmirror.com").unwrap();
+        assert!(!vs.is_empty());
+        let args = crate::dsh_install::build_npm_install_args("0.1.7-rc.2", "https://registry.npmmirror.com");
+        assert_eq!(args[0], "install");
+        assert_eq!(args[1], "@deepseek-ai/dsh@0.1.7-rc.2");
+        assert_eq!(args[3], "--registry");
+        assert_eq!(args[4], "https://registry.npmmirror.com");
+        assert!(args.contains(&"--no-audit".to_string()));
         assert!(!vs.is_empty(), "版本列表为空");
         println!("共 {} 个版本，前 3 个：", vs.len());
         for v in vs.iter().take(3) {

@@ -382,8 +382,10 @@ const MARKET_INDEX_URL: &str =
 
 /// 拉取整合包市场索引
 pub fn read_market_index() -> Result<Vec<MarketPackEntry>, String> {
+    let mirror = crate::settings::load_settings().github_mirror;
+    let index_url = crate::settings::github_proxy(MARKET_INDEX_URL, &mirror);
     let resp = reqwest::blocking::Client::new()
-        .get(MARKET_INDEX_URL)
+        .get(&index_url)
         .timeout(std::time::Duration::from_secs(20))
         .send()
         .map_err(|e| format!("拉取整合包市场失败: {e}"))?;
@@ -434,6 +436,8 @@ pub fn download_pack(
     cache_dir: &Path,
 ) -> Result<String, String> {
     fs::create_dir_all(cache_dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
+    let mirror = crate::settings::load_settings().github_mirror;
+    let url = crate::settings::github_proxy(url, &mirror);
     let file_name = url
         .rsplit('/')
         .next()

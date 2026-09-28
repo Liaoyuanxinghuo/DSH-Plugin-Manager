@@ -11,6 +11,7 @@ mod health;
 mod packforge;
 mod patchfile;
 mod settings;
+mod toolchain;
 mod profile_io;
 mod runner;
 mod scanner;
@@ -267,13 +268,118 @@ fn save_manual_envs_from_state(state: &State<AppState>) {
     save_manual_envs(&envs);
 }
 
-/// 删除手动添加的环境
+/// 从 runCommand / binPath 向上解析「版本根目录」：
+/// 第一个目录名以 "dsh-" 开头且包含版本号的目录（如 dsh-0.1.7-rc.1）。
+fn version_root_of(env: &DshEnv) -> Option<std::path::PathBuf> {
+    let start = env
+        .run_command
+        .split_whitespace()
+        .next()
+        .map(|s| s.to_string())
+        .or_else(|| env.bin_path.clone())?;
+    let p = std::path::PathBuf::from(&start);
+    let mut dir = if p.is_dir() {
+        Some(p)
+    } else {
+        p.parent().map(|d| d.to_path_buf())
+    };
+    let v = env.version.trim().trim_start_matches('v').to_string();
+    while let Some(d) = dir {
+        let name = d
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if name.starts_with("dsh-") && (v.is_empty() || name.contains(&v)) {
+            return Some(d);
+        }
+        dir = d.parent().map(|d| d.to_path_buf());
+    }
+    None
+}
+
+/// 磁盘删除安全验证（四重防线，全部满足才允许删除）：
+/// 1) 目标不是下载根自身、也不包含下载根；
+/// 2) 目标位于下载根之内（仅删除下载根下的版本目录）；
+/// 3) 目录名以 "dsh-" 开头；
+/// 4) 目录具备 DSH 安装特征（package.json / node_modules\.bin\dsh.cmd / @deepseek-ai\dsh\package.json）。
+fn safe_to_delete_version(root: &std::path::Path, download_root: &std::path::Path) -> bool {
+    if root == download_root || download_root.starts_with(root) {
+        return false;
+    }
+    if !root.starts_with(download_root) {
+        return false;
+    }
+    let name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if !name.starts_with("dsh-") {
+        return false;
+    }
+    let has_pkg = root.join("package.json").is_file();
+    let has_bin = root.join("node_modules").join(".bin").join("dsh.cmd").is_file();
+    let has_dep = root
+        .join("node_modules")
+        .join("@deepseek-ai")
+        .join("dsh")
+        .join("package.json")
+        .is_file();
+    has_pkg || has_bin || has_dep
+}
+
+/// 删除手动添加的环境：从磁盘删除对应 DSH 版本目录（安全验证通过时），再移出列表。
+/// 返回删除结果说明；仅在验证不满足时才仅移出列表并明确说明。
 #[tauri::command]
-fn remove_manual_env(state: State<AppState>, id: String) -> Result<(), String> {
+fn remove_manual_env(state: State<AppState>, id: String) -> Result<String, String> {
     let mut envs = state.manual_envs.lock().unwrap();
+    let env = envs.iter().find(|e| e.id == id).cloned();
+    let Some(env) = env else {
+        return Err("环境不存在".to_string());
+    };
+
+    // 运行中拒绝删除（进程占用会删失败或留下半删除状态）
+    let running = state
+        .running
+        .lock()
+        .unwrap()
+        .values()
+        .any(|p| p.env_id == id);
+    if running {
+        return Err("该 DSH 版本正在运行，请先停止相关实例再删除".to_string());
+    }
+
+    let mut disk_msg = String::from("已从列表移除该环境（未发现可安全删除的版本目录，磁盘文件未动）");
+    if let Some(root) = version_root_of(&env) {
+        let dl = settings::load_settings().dsh_download_dir;
+        let dl_root = std::path::PathBuf::from(if dl.trim().is_empty() {
+            settings::DEFAULT_DSH_DIR
+        } else {
+            &dl
+        });
+        let dl_default = std::path::PathBuf::from(settings::DEFAULT_DSH_DIR);
+        if safe_to_delete_version(&root, &dl_root) || safe_to_delete_version(&root, &dl_default) {
+            match std::fs::remove_dir_all(&root) {
+                Ok(_) => {
+                    disk_msg = format!("已删除磁盘上的版本目录：{}", root.display());
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "版本目录删除失败（{}）：{e}（环境已保留在列表中，可手动删除该目录后重试）",
+                        root.display()
+                    ));
+                }
+            }
+        } else {
+            disk_msg = format!(
+                "已从列表移除该环境（版本目录 {} 不在受管下载根内，为避免误删未动磁盘）",
+                root.display()
+            );
+        }
+    }
+
     envs.retain(|e| e.id != id);
     save_manual_envs(&envs);
-    Ok(())
+    Ok(disk_msg)
 }
 
 fn uuid_like(s: &str) -> String {
@@ -519,6 +625,7 @@ fn pick_port(requested: Option<u16>, used: &[u16]) -> Result<u16, String> {
 /// 端口默认自动分配（从 3080 起找第一个空闲端口），指定端口被占用时报错。
 #[tauri::command]
 fn start_dsh_cmd(
+    app: tauri::AppHandle,
     state: State<AppState>,
     env_id: String,
     profile: String,
@@ -531,6 +638,10 @@ fn start_dsh_cmd(
     if env.run_command.trim().is_empty() {
         return Err("该环境未绑定 dsh 运行时，无法启动".to_string());
     }
+
+    // 启动前确保 node/npm/pnpm 可用（电脑未装时自动下载安装，日志流式）
+    let registry = settings::load_settings().npm_registry;
+    toolchain::ensure(&app, &registry).map_err(|e| format!("工具链检查失败：{e}（请检查网络或镜像源）"))?;
 
     // profile 来源目录（任意 dsh × 任意来源 profile 组合：注入 DSH_HOME）
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
@@ -706,15 +817,281 @@ fn get_settings_cmd() -> settings::Settings {
 
 /// 保存设置
 #[tauri::command]
-fn set_settings_cmd(npm_registry: String, dsh_download_dir: String) -> Result<(), String> {
+fn set_settings_cmd(npm_registry: String, dsh_download_dir: String, github_mirror: String) -> Result<(), String> {
     settings::validate_registry(&npm_registry)?;
+    settings::validate_github_mirror(&github_mirror)?;
     if dsh_download_dir.trim().is_empty() {
         return Err("DSH 下载目录不能为空".to_string());
     }
     let mut s = settings::load_settings();
     s.npm_registry = settings::normalize_registry(&npm_registry);
     s.dsh_download_dir = dsh_download_dir.trim().to_string();
+    s.github_mirror = github_mirror.trim().trim_end_matches('/').to_string();
     settings::save_settings(&s)
+}
+
+/// 项目仓库信息（关于 / 检查更新用）
+const PROJECT_REPO: &str = "Liaoyuanxinghuo/DSH-Plugin-Manager";
+
+/// 版本号数值化（v 前缀与 rc 后缀忽略，取前 3 段数字）
+fn ver_nums(v: &str) -> Vec<u32> {
+    v.trim_start_matches('v')
+        .split(['.', '-'])
+        .filter_map(|s| s.parse::<u32>().ok())
+        .take(3)
+        .collect()
+}
+
+/// 版本比较：a > b 返回 1，a < b 返回 -1，相等 0
+fn compare_versions(a: &str, b: &str) -> i32 {
+    let x = ver_nums(a);
+    let y = ver_nums(b);
+    for i in 0..3 {
+        let l = x.get(i).copied().unwrap_or(0);
+        let r = y.get(i).copied().unwrap_or(0);
+        if l != r {
+            return if l > r { 1 } else { -1 };
+        }
+    }
+    0
+}
+
+/// 走 GitHub 镜像拉取文本（raw 文件 / API），返回 (HTTP 状态码, 响应文本)
+fn github_get_text(fetch_url: &str) -> (u16, String) {
+    match reqwest::blocking::Client::new()
+        .get(fetch_url)
+        .timeout(std::time::Duration::from_secs(25))
+        .send()
+    {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let body = r.text().unwrap_or_default();
+            (status, body)
+        }
+        Err(e) => (0, format!("请求失败: {e}")),
+    }
+}
+
+/// 检查更新（走 GitHub 镜像，大陆无 VPN 可用）：
+/// 1) 优先 GitHub releases/latest API；2) 回退仓库根 VERSION 文件（main / master）。
+#[tauri::command]
+fn check_update_cmd() -> Result<serde_json::Value, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let repo_url = format!("https://github.com/{PROJECT_REPO}");
+    let mirror = settings::load_settings().github_mirror;
+
+    let mut latest = String::new();
+    let mut err_hint = String::new();
+
+    // 1) 主通道：仓库根 VERSION 文件（raw 走镜像；镜像被限流(403/0)时直连兜底）
+    for branch in ["main", "master"] {
+        let raw_url = format!("https://raw.githubusercontent.com/{PROJECT_REPO}/{branch}/VERSION");
+        let (status, body) = github_get_text(&settings::github_proxy(&raw_url, &mirror));
+        let (status, body) = if status == 403 || status == 0 {
+            github_get_text(&raw_url)
+        } else {
+            (status, body)
+        };
+        if status == 200 {
+            let v = body.trim().trim_start_matches('v').to_string();
+            if !v.is_empty() && v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                latest = v;
+                break;
+            }
+        }
+    }
+    if latest.is_empty() {
+        err_hint = "未获取到 VERSION 文件（raw 走镜像失败或仓库尚无该文件）".to_string();
+    }
+
+    // 2) 补充通道：GitHub API releases/latest（走镜像，失败静默）。
+    //    API 常被镜像代理 IP 限流返回 403，故仅作补充，成功则覆盖并清空错误。
+    if latest.is_empty() {
+        let api_url = format!("https://api.github.com/repos/{PROJECT_REPO}/releases/latest");
+        let (status, body) = github_get_text(&settings::github_proxy(&api_url, &mirror));
+        let (status, body) = if status == 0 {
+            // 镜像不通时直连（大陆实测 api.github.com 可直连）
+            github_get_text(&api_url)
+        } else {
+            (status, body)
+        };
+        if status == 200 {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(tag) = json.get("tag_name").and_then(|t| t.as_str()) {
+                    latest = tag.trim_start_matches('v').to_string();
+                }
+            }
+        }
+        if latest.is_empty() {
+            err_hint = format!("VERSION 与 GitHub API 均不可用（API 状态 {status}）");
+        }
+    }
+
+    let has_update = !latest.is_empty() && compare_versions(&latest, &current) > 0;
+    Ok(serde_json::json!({
+        "current": current,
+        "latest": latest,
+        "hasUpdate": has_update,
+        "url": repo_url,
+        "error": if err_hint.is_empty() { String::new() } else { format!("检查更新失败：{err_hint}（请检查网络或 GitHub 镜像设置）") },
+    }))
+}
+
+/// 更新安装包资产文件名（Tauri NSIS 默认产物名，仅作兜底猜测）
+fn update_asset_filename(version: &str) -> String {
+    format!("DSH Manager_{version}_x64-setup.exe")
+}
+
+/// 更新安装包下载 URL（空格做 URL 编码）
+fn update_asset_url(version: &str) -> String {
+    let fname = update_asset_filename(version);
+    format!(
+        "https://github.com/{PROJECT_REPO}/releases/download/v{version}/{}",
+        fname.replace(' ', "%20")
+    )
+}
+
+/// 资产名匹配规则：包含 "_{version}_x64-setup" 且以 .exe 结尾
+fn asset_matches(name: &str, version: &str) -> bool {
+    name.contains(&format!("_{version}_x64-setup")) && name.to_lowercase().ends_with(".exe")
+}
+
+/// 从 GitHub API releases/latest 的 assets 里模糊匹配安装包：
+/// 资产名包含 "_{version}_x64-setup" 且以 .exe 结尾即视为匹配。
+/// 返回 (资产名, 真实下载 URL)。
+fn find_setup_asset(version: &str) -> Result<(String, String), String> {
+    let needle = format!("_{version}_x64-setup");
+    let api_url = format!("https://api.github.com/repos/{PROJECT_REPO}/releases/latest");
+    let mirror = settings::load_settings().github_mirror;
+    // 1) 走镜像；2) 失败时直连（大陆实测 api.github.com 可直连）
+    let (status, body) = github_get_text(&settings::github_proxy(&api_url, &mirror));
+    let (status, body) = if status == 0 {
+        github_get_text(&api_url)
+    } else {
+        (status, body)
+    };
+    if status == 200 {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
+                for a in assets {
+                    let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let url = a
+                        .get("browser_download_url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    if asset_matches(name, version) && !url.is_empty() {
+                        return Ok((name.to_string(), url.to_string()));
+                    }
+                }
+            }
+        }
+        Err(format!("release 中未找到包含「{needle}」的安装包资产"))
+    } else {
+        Err(format!("获取 release 资产列表失败（状态 {status}）"))
+    }
+}
+
+/// 下载新版本安装包（走 GitHub 镜像，大陆无 VPN 可用）：
+/// release 资产命名固定：DSH Manager_{version}_x64-setup.exe
+/// 保存到 %USERPROFILE%\Downloads，下载完成后自动启动安装程序。
+#[tauri::command]
+fn download_update_cmd(version: String, app: tauri::AppHandle) -> Result<String, String> {
+    use std::io::{Read, Write};
+    use tauri::Emitter;
+
+    let version = version.trim_start_matches('v').to_string();
+    if version.is_empty() || !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return Err("无效的版本号".to_string());
+    }
+    let mirror = settings::load_settings().github_mirror;
+    // 优先按 release 资产列表模糊匹配（资产名包含 _{v}_x64-setup 即可）；
+    // 拿不到资产列表时回退固定命名构造 URL
+    let (fname, direct_url) = match find_setup_asset(&version) {
+        Ok((n, u)) => (n, u),
+        Err(_) => {
+            let n = update_asset_filename(&version);
+            (n.clone(), update_asset_url(&version))
+        }
+    };
+    let fetch_url = settings::github_proxy(&direct_url, &mirror);
+
+    let download_dir = std::env::var("USERPROFILE")
+        .map(|u| std::path::Path::new(&u).join("Downloads"))
+        .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join("Downloads")))
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&download_dir).map_err(|e| format!("无法创建下载目录: {e}"))?;
+    let out_path = download_dir.join(&fname);
+
+    let client = reqwest::blocking::Client::new();
+    let mut resp = client
+        .get(&fetch_url)
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .map_err(|e| format!("下载失败：{e}（请检查网络或 GitHub 镜像设置）"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "下载失败：HTTP {}（{fname}）。请确认 v{version} 的 release 已上传包含「_{version}_x64-setup」的安装包",
+            resp.status()
+        ));
+    }
+    let total = resp.content_length().unwrap_or(0);
+
+    let emit_progress = |done: u64| {
+        let percent = if total > 0 {
+            ((done as f64 / total as f64) * 100.0) as u32
+        } else {
+            0
+        };
+        let _ = app.emit(
+            "update-download",
+            serde_json::json!({ "done": done, "total": total, "percent": percent }),
+        );
+    };
+
+    let mut out_file = std::fs::File::create(&out_path).map_err(|e| format!("创建文件失败: {e}"))?;
+    let mut buf = [0u8; 65536];
+    let mut done: u64 = 0;
+    loop {
+        let n = resp
+            .read(&mut buf)
+            .map_err(|e| format!("下载中断：{e}"))?;
+        if n == 0 {
+            break;
+        }
+        out_file
+            .write_all(&buf[..n])
+            .map_err(|e| format!("写入文件失败: {e}"))?;
+        done += n as u64;
+        if done % (1024 * 1024) < 65536 {
+            emit_progress(done);
+        }
+    }
+    emit_progress(done);
+    let out_str = out_path.to_string_lossy().to_string();
+    let _ = app.emit(
+        "update-download",
+        serde_json::json!({ "done": true, "path": out_str }),
+    );
+    Ok(out_str)
+}
+
+/// 启动已下载的安装程序，然后立即退出当前程序（让安装器能覆盖正在运行的 exe）。
+/// 安装器为独立进程，父进程退出不影响它继续运行。
+#[tauri::command]
+fn launch_installer_and_exit_cmd(path: String, app: tauri::AppHandle) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("安装程序路径为空".to_string());
+    }
+    if !std::path::Path::new(&path).exists() {
+        return Err(format!("安装程序不存在: {path}"));
+    }
+    std::process::Command::new(&path)
+        .spawn()
+        .map_err(|e| format!("启动安装程序失败：{e}"))?;
+    // 稍等片刻确保安装程序已拉起，再退出自己
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    app.exit(0);
+    Ok(())
 }
 
 /// 列出 DSH 全部版本
@@ -1324,6 +1701,9 @@ pub fn run() {
             list_running_cmd,
             open_path,
             open_url_cmd,
+            check_update_cmd,
+            download_update_cmd,
+            launch_installer_and_exit_cmd,
             open_dsh_web_cmd,
             get_env_paths,
             export_profile_cmd,
@@ -1360,6 +1740,134 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore]
+    fn real_check_update_no_panic() {
+        // 真实网络调用：走镜像失败时回退 VERSION 文件；无论仓库是否有 release，都不 panic、返回结构完整
+        let r = check_update_cmd();
+        assert!(r.is_ok());
+        let v = r.unwrap();
+        assert!(v.get("current").is_some());
+        assert!(v.get("latest").is_some());
+        assert!(v.get("hasUpdate").is_some());
+        assert!(v.get("url").is_some());
+        assert!(v.get("error").is_some());
+        println!("check_update = {v}");
+    }
+
+    #[test]
+    fn asset_match_rules() {
+        assert!(asset_matches("DSH Manager_0.3.0_x64-setup.exe", "0.3.0"));
+        assert!(asset_matches("dsh-manager_0.3.0_x64-setup.exe", "0.3.0"));
+        assert!(asset_matches("任意名_0.3.0_x64-setup.exe", "0.3.0"));
+        assert!(!asset_matches("DSH-Manager-0.3.0-win-x64.exe", "0.3.0"));
+        assert!(!asset_matches("DSH Manager_0.3.0_x64-setup.exe.sha256", "0.3.0"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.0"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.0"));
+    }
+
+    #[test]
+    fn version_root_parsing() {
+        let mk = |cmd: &str, ver: &str, bin: Option<&str>| DshEnv {
+            id: "x".into(),
+            name: "x".into(),
+            source: models::EnvSource::Manual,
+            version: ver.into(),
+            home_dir: "C:\\Users\\t\\.dsh".into(),
+            run_command: cmd.into(),
+            bin_path: bin.map(|b| b.to_string()),
+            scan_profiles_dir: None,
+        };
+        // 下载安装的版本目录
+        let e = mk(
+            "C:\\dsh-versions\\dsh-0.1.7-rc.1\\node_modules\\.bin\\dsh.cmd",
+            "0.1.7-rc.1",
+            None,
+        );
+        assert_eq!(
+            version_root_of(&e).map(|p| p.to_string_lossy().to_string()),
+            Some("C:\\dsh-versions\\dsh-0.1.7-rc.1".into())
+        );
+        // 全局 CLI（无 dsh- 前缀）→ 无版本根
+        let g = mk("dsh", "0.1.0-rc.7", Some("C:\\Users\\t\\AppData\\Roaming\\npm\\dsh.cmd"));
+        assert_eq!(version_root_of(&g), None);
+        // 扫描目录（run_command 空、bin 为 null）→ 无版本根
+        let sc = mk("", "—", None);
+        assert_eq!(version_root_of(&sc), None);
+        // 版本号带 v 前缀不影响匹配
+        let e2 = mk(
+            "C:\\dsh-versions\\dsh-0.2.0\\node_modules\\.bin\\dsh.cmd",
+            "0.2.0",
+            None,
+        );
+        assert_eq!(
+            version_root_of(&e2).map(|p| p.to_string_lossy().to_string()),
+            Some("C:\\dsh-versions\\dsh-0.2.0".into())
+        );
+    }
+
+    #[test]
+    fn safe_delete_rules() {
+        use std::path::Path;
+        let dl = Path::new("C:\\dsh-versions");
+        // 不存在/无特征的版本目录 → 不允许（避免误删）
+        let v1 = Path::new("C:\\dsh-versions\\dsh-0.1.7-rc.99");
+        assert!(!safe_to_delete_version(v1, dl));
+        // 下载根本身 → 不允许
+        assert!(!safe_to_delete_version(dl, dl));
+        // 下载根外 → 不允许
+        assert!(!safe_to_delete_version(Path::new("C:\\Users\\t\\dsh-0.1.7-rc.1"), dl));
+        // 前缀相近的其他目录（dsh-other）→ 特征检查拦截（无 package.json 等）
+        assert!(!safe_to_delete_version(Path::new("C:\\dsh-versions\\dsh-tools"), dl));
+        // 父目录包含下载根（下载根在版本根内）→ 不允许
+        assert!(!safe_to_delete_version(Path::new("C:\\"), dl));
+    }
+
+    #[test]
+    fn safe_delete_with_real_dirs() {
+        // 真实目录结构验证：版本根 + 特征文件 → 允许删除
+        let tmp = std::env::temp_dir().join(format!("dshpm-rm-{}", uuid_like("rm")));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dl = tmp.join("versions");
+        let ver = dl.join("dsh-0.1.7-rc.1");
+        std::fs::create_dir_all(ver.join("node_modules").join(".bin")).unwrap();
+        std::fs::write(
+            ver.join("node_modules").join(".bin").join("dsh.cmd"),
+            "@echo off",
+        )
+        .unwrap();
+        // 特征齐备 → 允许
+        assert!(safe_to_delete_version(&ver, &dl));
+        // 再验证真实删除
+        std::fs::remove_dir_all(&ver).unwrap();
+        assert!(!ver.exists());
+        // 剩余：无特征目录不允许
+        let fake = dl.join("dsh-tools");
+        std::fs::create_dir_all(&fake).unwrap();
+        assert!(!safe_to_delete_version(&fake, &dl));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn update_asset_naming() {
+        assert_eq!(update_asset_filename("0.2.0"), "DSH Manager_0.2.0_x64-setup.exe");
+        assert_eq!(
+            update_asset_url("0.2.0"),
+            "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/releases/download/v0.2.0/DSH%20Manager_0.2.0_x64-setup.exe"
+        );
+        assert_eq!(update_asset_filename("0.3.1-rc.2"), "DSH Manager_0.3.1-rc.2_x64-setup.exe");
+    }
+
+    #[test]
+    fn version_compare() {
+        assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
+        assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
+        assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
+        assert_eq!(compare_versions("v0.3.0", "0.2.9"), 1);
+        assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
+        assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
+    }
 
     #[test]
     fn scan_dirs_save_and_load_roundtrip() {

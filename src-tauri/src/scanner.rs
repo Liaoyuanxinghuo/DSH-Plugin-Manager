@@ -31,6 +31,37 @@ pub fn run_cmd(command: &str) -> CommandOutput {
     }
 }
 
+/// 执行 dsh 可执行文件 `--version` 探测。
+/// 用 `cmd /C <路径> --version` 参数数组方式（非字符串拼接），
+/// 避免 Windows 下 cmd /C 外层引号与路径引号冲突导致命令解析失败；
+/// 同时注入 node 目录到 PATH（dsh.cmd shim 依赖 node）。
+pub fn probe_version_cmd(bin: &str) -> CommandOutput {
+    let mut cmd = Command::new("cmd");
+    cmd.args(["/C", bin.trim().trim_matches('"')]);
+    cmd.arg("--version");
+    let tc = crate::toolchain::probe();
+    tc.inject_path(&mut cmd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：禁止弹出控制台黑框
+    }
+    match cmd.output() {
+        Ok(o) => CommandOutput {
+            success: o.status.success(),
+            stdout: String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            exit_code: o.status.code(),
+        },
+        Err(e) => CommandOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: format!("命令执行失败: {e}"),
+            exit_code: None,
+        },
+    }
+}
+
 /// 获取默认 DSH_HOME（环境变量未设置时取 ~/.dsh）
 pub fn default_dsh_home() -> PathBuf {
     if let Ok(h) = std::env::var("DSH_HOME") {
@@ -181,7 +212,7 @@ fn scan_dir_recursive(
 
 /// 探测指定命令的 dsh 版本
 pub fn probe_version(command: &str) -> String {
-    let out = run_cmd(&format!("{command} --version"));
+    let out = probe_version_cmd(command);
     // 输出可能是 "dsh 0.1.0-rc.7" 或直接版本号，取第一个形如 x.y.z 的 token
     for line in out.stdout.lines() {
         for tok in line.split_whitespace() {
@@ -199,18 +230,23 @@ pub fn probe_version(command: &str) -> String {
     }
     // 兜底：命令执行失败时（如 PATH 中无 node），从可执行文件相邻的
     // node_modules/@deepseek-ai/dsh/package.json 读取版本（覆盖 DSH Desktop 内置目录等布局）
-    let p = Path::new(command);
+    let p = Path::new(command.trim().trim_matches('"'));
     if let Some(dir) = p.parent() {
         let mut candidates = vec![
-            dir.join("node_modules").join("@deepseek-ai").join("dsh").join("package.json"),
+            // .bin 同级的 package.json（npm shim 布局：node_modules/.bin/dsh.cmd）
             dir.join("package.json"),
+            // .bin 的上级 node_modules/@deepseek-ai/dsh/package.json
+            dir.parent().map(|m| m.join("@deepseek-ai").join("dsh").join("package.json")).unwrap_or_default(),
+            // 旧布局：dsh 可执行文件相邻的 node_modules
+            dir.join("node_modules").join("@deepseek-ai").join("dsh").join("package.json"),
         ];
         // 命令可能带参数（如 "node xxx/bin.js"），取第一个路径段
         if command.contains(' ') {
             if let Some(first) = command.split_whitespace().next() {
-                let p2 = Path::new(first);
+                let p2 = Path::new(first.trim().trim_matches('"'));
                 if let Some(d2) = p2.parent() {
                     candidates.push(d2.join("node_modules").join("@deepseek-ai").join("dsh").join("package.json"));
+                    candidates.push(d2.join("package.json"));
                 }
             }
         }
@@ -257,7 +293,7 @@ pub fn validate_manual_env(command: &str) -> Result<String, String> {
     if command.trim().is_empty() {
         return Err("命令不能为空".to_string());
     }
-    let out = run_cmd(&format!("{command} --version"));
+    let out = probe_version_cmd(command);
     if !out.success && out.stderr.is_empty() {
         return Err(format!("命令执行失败: {}", out.stderr));
     }
@@ -436,6 +472,23 @@ fn jdn_to_date(jdn: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_version_falls_back_to_package_json_in_sibling_node_modules() {
+        // 模拟 npm shim 布局：node_modules/.bin/dsh.cmd → 上级 node_modules/@deepseek-ai/dsh/package.json
+        let work = std::env::temp_dir().join(format!("dshpm-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        let bin_dir = work.join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("dsh.cmd"), "@echo off").unwrap();
+        let pkg_dir = work.join("node_modules").join("@deepseek-ai").join("dsh");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(pkg_dir.join("package.json"), r#"{"name":"@deepseek-ai/dsh","version":"9.9.9-probe"}"#).unwrap();
+        let cmd = bin_dir.join("dsh.cmd");
+        let v = probe_version(&cmd.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&work);
+        assert_eq!(v, "9.9.9-probe");
+    }
 
     #[test]
     fn test_version_like() {

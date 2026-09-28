@@ -27,6 +27,7 @@ import type {
   RunningProcess,
   ScanDirEntry,
   StartResult,
+  UpdateInfo,
 } from "./types";
 
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -118,8 +119,11 @@ export const api = {
     invoke<ExportResult>("export_diag_cmd", { envId, targetPath }),
   // M5 设置 / DSH 下载
   getSettings: () => invoke<Settings>("get_settings_cmd"),
-  setSettings: (npmRegistry: string, dshDownloadDir: string) =>
-    invoke<void>("set_settings_cmd", { npmRegistry, dshDownloadDir }),
+  checkUpdate: () => invoke<UpdateInfo>("check_update_cmd"),
+  downloadUpdate: (version: string) => invoke<string>("download_update_cmd", { version }),
+  launchInstallerAndExit: (path: string) => invoke<void>("launch_installer_and_exit_cmd", { path }),
+  setSettings: (npmRegistry: string, dshDownloadDir: string, githubMirror: string) =>
+    invoke<void>("set_settings_cmd", { npmRegistry, dshDownloadDir, githubMirror }),
   listDshVersions: () => invoke<DshVersionInfo[]>("list_dsh_versions_cmd"),
   installDshVersion: (version: string, targetDir: string) =>
     invoke<DshInstallResult>("install_dsh_version_cmd", { version, targetDir }),

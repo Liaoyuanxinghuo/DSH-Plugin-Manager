@@ -20,6 +20,7 @@ import type {
   RunningProcess,
   DshVersionInfo,
   DshInstallResult,
+  UpdateInfo,
 } from "./types";
 import "./App.css";
 
@@ -826,8 +827,16 @@ export default function App() {
                       className="btn tiny danger-inline"
                       onClick={(e) => {
                         e.stopPropagation();
-                        const act = env.source === "manual" ? api.removeManualEnv(env.id) : api.removeScanDir(env.id);
-                        act.then(loadEnvs).catch((x) => setError(String(x)));
+                        const isManual = env.source === "manual";
+                        const tip = isManual
+                          ? `确定从磁盘删除该 DSH 版本？\n\n${env.name}\n\n仅删除受管下载目录内的对应版本目录（如 C:\\dsh-versions\\dsh-${env.version}），其他文件不受影响。`
+                          : "确定移除该 profile 扫描目录？";
+                        if (!window.confirm(tip)) return;
+                        const act = isManual ? api.removeManualEnv(env.id) : api.removeScanDir(env.id);
+                        act.then((msg) => {
+                          loadEnvs();
+                          if (typeof msg === "string" && msg) window.alert(msg);
+                        }).catch((x) => setError(String(x)));
                       }}
                     >
                       移除
@@ -1279,7 +1288,7 @@ export default function App() {
                   <li>选中一个环境 + 在中栏选中任意 profile → 点击「▶ 启动」＝ 用该 DSH 加载该 profile。</li>
                   <li>任意环境 × 任意 profile 可自由组合；切换环境不影响 profile 列表。</li>
                   <li>可同时运行多个实例：不同环境 × 不同 profile 各自独立进程、独立端口（从 3080 起自动分配），每行可单独停止/重启。</li>
-                  <li>每行「移除」按钮可删除该环境（不影响磁盘上的 dsh 文件）。</li>
+                  <li>每行「移除」按钮：会删除磁盘上对应的 DSH 版本目录（仅限受管下载目录内、带版本标识与安装特征的目录，四重校验防误删）；全局 CLI 等非受管环境只移出列表。</li>
                 </ul>
               </div>
             ) : (
@@ -1614,17 +1623,61 @@ function CreateProfileForm({
   );
 }
 
-/** 设置弹窗：npm 镜像源 + DSH 下载目录 */
+/** npm 镜像源下拉预设（空 = npm 官方直连） */
+const NPM_REGISTRY_PRESETS: { value: string; label: string }[] = [
+  { value: "", label: "npm 官方源（直连）" },
+  { value: "https://registry.npmmirror.com", label: "npmmirror（淘宝，默认推荐）" },
+  { value: "https://mirrors.cloud.tencent.com/npm/", label: "腾讯云镜像" },
+  { value: "https://repo.huaweicloud.com/repository/npm/", label: "华为云镜像" },
+  { value: "__custom__", label: "自定义…" },
+];
+
+/** GitHub 下载镜像下拉预设（空 = 直连 GitHub） */
+const GITHUB_MIRROR_PRESETS: { value: string; label: string }[] = [
+  { value: "", label: "直连 GitHub（不做代理）" },
+  { value: "https://ghfast.top", label: "ghfast.top（默认推荐）" },
+  { value: "https://ghproxy.net", label: "ghproxy.net" },
+  { value: "https://gh-proxy.com", label: "gh-proxy.com" },
+  { value: "__custom__", label: "自定义…" },
+];
+
+/** 设置弹窗：npm 镜像源 + GitHub 镜像 + DSH 下载目录 */
 function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
   const [registry, setRegistry] = useState("");
   const [downloadDir, setDownloadDir] = useState("");
+  const [githubMirror, setGithubMirror] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  const [downPercent, setDownPercent] = useState(0);
+  const [downPath, setDownPath] = useState("");
+  const [downErr, setDownErr] = useState("");
+  const [closingForUpdate, setClosingForUpdate] = useState(false);
+
+  // 监听更新下载进度
+  useEffect(() => {
+    const un = listen("update-download", (e) => {
+      const p = e.payload as { done?: number | boolean; total?: number; percent?: number; path?: string; launched?: boolean };
+      if (typeof p?.done === "boolean" || p?.path) {
+        setDownloading(false);
+        if (p.path) setDownPath(p.path);
+      } else if (typeof p?.percent === "number") {
+        setDownPercent(p.percent);
+      }
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
 
   useEffect(() => {
     api.getSettings().then((s) => {
       setRegistry(typeof s?.npmRegistry === "string" ? s.npmRegistry : "");
       setDownloadDir(typeof s?.dshDownloadDir === "string" ? s.dshDownloadDir : "");
+      setGithubMirror(typeof s?.githubMirror === "string" ? s.githubMirror : "");
     }).catch((e) => setErr(String(e)));
   }, []);
 
@@ -1632,7 +1685,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
     setBusy(true);
     setErr("");
     try {
-      await api.setSettings(registry, downloadDir);
+      await api.setSettings(registry, downloadDir, githubMirror);
       onSaved();
     } catch (e) {
       setErr(String(e));
@@ -1641,22 +1694,181 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
     }
   };
 
+  // 当前值是否在预设内（决定下拉显示与是否出现自定义输入框）
+  const inPresets = (value: string, presets: { value: string; label: string }[]) =>
+    presets.some((p) => p.value === value);
+  const selectValue = (value: string, presets: { value: string; label: string }[]) =>
+    inPresets(value, presets) ? value : "__custom__";
+
   return (
     <div className="modal-mask" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h3>设置</h3>
         <p className="modal-hint">
-          npm 镜像源用于：插件市场/搜索、包信息查询、DSH 下载、写各 profile 的 .npmrc（插件安装）。大陆网络可保持
-          <code>registry.npmmirror.com</code> 镜像。
+          npm 镜像源用于：插件市场/搜索、包信息查询、DSH 下载、写各 profile 的 .npmrc（插件安装）。
+          <b>留空 = 不使用镜像源</b>（走 npm 官方源）。大陆网络可填
+          <code>registry.npmmirror.com</code>。
         </p>
         <label>
           npm 镜像源（registry）
-          <input
-            value={registry}
-            onChange={(e) => setRegistry(e.target.value)}
-            placeholder="https://registry.npmmirror.com"
-          />
+          <select
+            value={selectValue(registry, NPM_REGISTRY_PRESETS)}
+            onChange={(e) => {
+              const v = e.target.value;
+              setRegistry(v === "__custom__" ? "" : v);
+            }}
+          >
+            {NPM_REGISTRY_PRESETS.map((p) => (
+              <option key={p.value} value={p.value}>{p.label}</option>
+            ))}
+          </select>
         </label>
+        {selectValue(registry, NPM_REGISTRY_PRESETS) === "__custom__" && (
+          <label>
+            自定义 npm 镜像源
+            <input
+              value={registry}
+              onChange={(e) => setRegistry(e.target.value)}
+              placeholder="https://registry.npmmirror.com"
+            />
+          </label>
+        )}
+        <label>
+          GitHub 下载镜像
+          <select
+            value={selectValue(githubMirror, GITHUB_MIRROR_PRESETS)}
+            onChange={(e) => {
+              const v = e.target.value;
+              setGithubMirror(v === "__custom__" ? "" : v);
+            }}
+          >
+            {GITHUB_MIRROR_PRESETS.map((p) => (
+              <option key={p.value} value={p.value}>{p.label}</option>
+            ))}
+          </select>
+        </label>
+        {selectValue(githubMirror, GITHUB_MIRROR_PRESETS) === "__custom__" && (
+          <label>
+            自定义 GitHub 镜像前缀
+            <input
+              value={githubMirror}
+              onChange={(e) => setGithubMirror(e.target.value)}
+              placeholder="https://ghfast.top"
+            />
+          </label>
+        )}
+        <div className="modal-hint" style={{ marginTop: 6 }}>
+          <b>关于 / 更新</b>
+        </div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <button className="btn tiny" onClick={() => setAboutOpen(!aboutOpen)}>
+            ℹ 关于本项目
+          </button>
+          <button
+            className="btn tiny"
+            disabled={checking}
+            onClick={async () => {
+              setChecking(true);
+              setUpdateInfo(null);
+              try {
+                setUpdateInfo(await api.checkUpdate());
+              } catch (e) {
+                setUpdateInfo({ current: "", latest: "", hasUpdate: false, url: "", error: String(e) });
+              } finally {
+                setChecking(false);
+              }
+            }}
+          >
+            {checking ? "检查中…" : "🔄 检查更新"}
+          </button>
+        </div>
+        {aboutOpen && (
+          <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.0</span></div>
+            <div style={{ color: "var(--text-dim)" }}>
+              图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
+              支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
+            </div>
+            <div style={{ marginTop: 6 }}>
+              <button className="btn tiny" onClick={() => api.openUrl("https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/")}>
+                🌐 项目地址（GitHub）
+              </button>
+            </div>
+          </div>
+        )}
+        {updateInfo && (
+          <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
+            {updateInfo.error ? (
+              <div style={{ color: "#ffb3ad" }}>{updateInfo.error}</div>
+            ) : updateInfo.hasUpdate ? (
+              <div>
+                <div style={{ color: "#ffd479" }}>
+                  发现新版本：当前 v{updateInfo.current} → v{updateInfo.latest}
+                </div>
+                {!downloading && !downPath && (
+                  <button
+                    className="btn tiny"
+                    style={{ marginTop: 6 }}
+                    disabled={downloading}
+                    onClick={async () => {
+                      setDownloading(true);
+                      setDownPercent(0);
+                      setDownPath("");
+                      setDownErr("");
+                      try {
+                        const path = await api.downloadUpdate(updateInfo.latest);
+                        setDownPath(path);
+                      } catch (e) {
+                        setDownErr(String(e));
+                        setDownloading(false);
+                      }
+                    }}
+                  >
+                    ⬇ 下载 v{updateInfo.latest}
+                  </button>
+                )}
+                {downloading && (
+                  <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ flex: 1, height: 6, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
+                      <div style={{ width: `${downPercent}%`, height: "100%", background: "#5b8cff", transition: "width .15s" }} />
+                    </div>
+                    <span style={{ color: "var(--text-dim)", width: 44, textAlign: "right" }}>{downPercent}%</span>
+                  </div>
+                )}
+                {downErr && <div style={{ color: "#ffb3ad", marginTop: 6 }}>{downErr}</div>}
+                {downPath && (
+                  <div style={{ marginTop: 6 }}>
+                    <div style={{ color: "#7fd6a2", wordBreak: "break-all" }}>✅ 已保存：{downPath}</div>
+                    <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                      <button className="btn tiny" onClick={() => api.openPath(downPath)}>
+                        📂 打开所在文件夹
+                      </button>
+                      <button
+                        className="btn tiny"
+                        disabled={closingForUpdate}
+                        onClick={async () => {
+                          setClosingForUpdate(true);
+                          try {
+                            await api.launchInstallerAndExit(downPath);
+                          } catch (e) {
+                            setDownErr(String(e));
+                            setClosingForUpdate(false);
+                          }
+                        }}
+                      >
+                        {closingForUpdate ? "正在启动安装程序…" : "🔄 关闭程序并更新"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ color: "var(--text)" }}>
+                ✅ 已是最新版本（v{updateInfo.current || "?"}）{updateInfo.latest ? `（最新 v${updateInfo.latest}）` : ""}
+              </div>
+            )}
+          </div>
+        )}
         <label>
           DSH 下载目录（多版本共存根目录）
           <input
@@ -1678,7 +1890,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         {err && <div className="modal-err">{err}</div>}
         <div className="modal-actions">
           <button className="btn" onClick={onClose} disabled={busy}>取消</button>
-          <button className="btn primary" onClick={save} disabled={busy || !registry.trim() || !downloadDir.trim()}>
+          <button className="btn primary" onClick={save} disabled={busy || !downloadDir.trim()}>
             {busy ? "保存中..." : "保存"}
           </button>
         </div>

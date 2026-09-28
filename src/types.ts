@@ -69,6 +69,15 @@ export interface JunkEntry {
 export interface Settings {
   npmRegistry: string;
   dshDownloadDir: string;
+  githubMirror: string;
+}
+
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  hasUpdate: boolean;
+  url: string;
+  error: string;
 }
 
 export interface DshVersionInfo {
