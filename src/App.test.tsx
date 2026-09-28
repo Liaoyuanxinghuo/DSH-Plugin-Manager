@@ -150,7 +150,7 @@ describe("App 主界面", () => {
 
   it("渲染标题与环境列表", async () => {
     render(<App />);
-    expect(screen.getByText("DSH Plugin Manager")).toBeInTheDocument();
+    expect(screen.getByText("DSH Manager")).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByText(/全局 CLI/)).toBeInTheDocument();
     });

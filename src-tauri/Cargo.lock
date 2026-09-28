@@ -713,8 +713,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "dsh-plugin-manager"
-version = "0.1.0"
+name = "dsh-manager"
+version = "0.2.0"
 dependencies = [
  "dirs 6.0.0",
  "reqwest 0.12.28",

@@ -754,7 +754,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand">
           <span className="logo">◈</span>
-          <h1>DSH Plugin Manager</h1>
+          <h1>DSH Manager</h1>
         </div>
         <div className="topbar-actions">
           <button className="btn ghost" onClick={() => setShowSettings(true)} title="设置（镜像源 / DSH 下载目录）">

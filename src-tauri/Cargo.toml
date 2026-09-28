@@ -1,12 +1,12 @@
 [package]
-name = "dsh-plugin-manager"
-version = "0.1.0"
-description = "DSH Plugin Manager - 图形化 DSH 环境与插件管理工具"
+name = "dsh-manager"
+version = "0.2.0"
+description = "DSH Manager - 图形化 DSH 环境与插件管理工具"
 authors = ["dshpm"]
 edition = "2021"
 
 [lib]
-name = "dsh_plugin_manager_lib"
+name = "dsh_manager_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
