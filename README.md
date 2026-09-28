@@ -1,6 +1,6 @@
-# DSH Plugin Manager
+# DSH Manager
 
-面向 **本地 CLI 版 DSH** 的桌面管理工具（Tauri 2 + React 19 + TypeScript）。在图形界面中完成 DSH 多版本管理、Profile 管理、插件安装与管理、多实例独立启动，无需手敲命令行。
+面向 **本地 CLI 版 DSH** 的桌面管理工具（Tauri 2 + React 19 + TypeScript）。在图形界面中完成 DSH 多版本管理、Profile 管理、插件安装与管理、整合包安装与管理、多实例独立启动，无需手敲命令行。
 
 > 仅管理本地 CLI 版 DSH，不包含、不依赖 DSH Desktop。
 
@@ -77,6 +77,64 @@
 * 全程无命令行黑框（所有后台命令均以无窗口方式执行）
 
 
+
+***
+
+## 整合包（Modpack）—— 重点功能
+
+![整合包导入导出与包结构](docs/images/modpack.png)
+
+像 Minecraft 整合包一样，把 DSH AI 智能体配置**一键导出、分享、安装**。本应用遵循开源规范 [DSH-PackForge](https://github.com/DSH-PackForge/DSH-PackForge)（`.dspack` 容器 v3 + `manifest` v5），与生态内其他启动器互通。
+
+### 什么是整合包
+
+* 一个 `.dspack` 文件 = 一个 Profile 的**完整配置快照**：插件组合（bundles）、依赖（dependencies）、补丁（patch）、所需 DSH 版本（dshVersion）
+
+* **不含** `node_modules` / 运行数据 / 凭据 / 压缩包 —— 体积小、可安全分享
+
+* 支持两种形态：
+  * **profile**：单个 Profile 的整合包（可额外携带全局 skill / preset）
+  * **dshhome**：整个 DSH_HOME 快照（多 Profile + 全局 preset / skill / 指令）
+
+### 导出（Pack）
+
+1. 点击 Profile 行的 **⬆ 导出** → 弹窗切换为 **「整合包（.dspack）」**
+
+2. 填写**包名**（小写 slug）、**版本**（默认 `1.0.0`）、**显示名**（可选）
+
+3. 选择保存位置 → 生成 `.dspack` v3，并返回 **SHA-256** 校验值
+
+导出时自动执行五类安全过滤：精确名（`node_modules` / `data` / `sessions` / `.env` / 凭据…）、密钥扩展名（`.key` `.pem`…）、凭据文件名、嵌套压缩包（`.zip` `.tgz` `.dspack`）、home 级运行时目录。
+
+### 导入（Install）
+
+1. 点击 **⬇ 导入** → 第一步选择：**完整 profile zip**（含数据，原样恢复）或 **整合包（.dspack）**
+
+2. 选整合包 → 第二步选择来源：**在线下载整合包** 或 **本地导入整合包**
+
+3. 导入流程全自动：
+
+   * 校验容器（`dspack.json` format/version）→ 解析 manifest v5 → 落盘 `overrides/`（→ profile 根）与 `home/`（→ DSH_HOME）
+
+   * **自动重建依赖**：逐 Profile 执行 `dsh plugin install`（pnpm install），日志实时滚动显示
+
+   * **重名自动改名**（`xxx-import-1`…）；全局文件覆盖前自动备份到 `~/.dshpm-import-bak-<ts>/`，失败整体回滚
+
+### 市场（Market）
+
+* 「在线下载整合包」内置 [dsh-pack-market](https://github.com/DSH-PackForge/dsh-pack-market) 索引浏览
+
+* 列表展示：显示名 / 描述 / 作者 / bundle 数 / 依赖数 / 所需 DSH 版本 / 更新时间
+
+* 下载后逐字节校验 **size + SHA-256**，包不完整或篡改直接拒绝，不落盘
+
+### Profile 备注（配合整合包使用）
+
+* **右键**任意 Profile 即可添加备注与**适配版本**提示
+
+* 适配版本下拉直接选择左栏 DSH 版本 —— **仅作提示，无任何约束**，不影响实际运行
+
+* 同名不同来源目录的 Profile 可独立备注；可一键清除
 
 ***
 
@@ -194,7 +252,7 @@ pnpm test
 cd src-tauri && cargo test --lib
 ```
 
-当前基线：前端 42 项测试、后端 67 项测试（持续更新）。
+当前基线：前端 47 项测试、后端 73 项测试（持续更新）。
 
 ### 项目结构
 
@@ -233,6 +291,8 @@ dshcjaz/
 
 │       ├── profile\_io.rs   # Profile 导入导出
 
+│       ├── packforge.rs    # 整合包：.dspack v3 导出/导入/市场/校验/备注
+
 │       ├── dsh\_install.rs  # 多版本 DSH 下载安装
 
 │       └── settings.rs     # 镜像源等设置持久化
@@ -253,6 +313,10 @@ dshcjaz/
 | 应用设置（镜像源、DSH 下载目录）    | `%AppData%\dsh-plugin-manager\settings.json`           |
 | 排序与上次选择（localStorage） | 随应用数据目录                                                |
 | Profile（默认）           | `~/.dsh/profiles`                                      |
+
+| Profile 备注              | `%AppData%\dsh-plugin-manager\profile-notes.json`      |
+
+| 整合包下载缓存             | `%AppData%\dsh-plugin-manager\packs\`                 |
 | 运行日志                  | 系统临时目录 `dshpm-run-<profile>-<ts>.log`（供「打开界面」提取 token） |
 
 
@@ -276,6 +340,18 @@ dsh web 只监听 `127.0.0.1`，且访问需认证 token（`dsh web: http://127.
 **Q：启动后进程立即退出？**
 
 通常是 DSH 版本与 Profile 不匹配（如旧版 dsh 加载新版 Profile 导致 `ERR_MODULE_NOT_FOUND`）。请选择匹配的 DSH 版本，或查看运行日志诊断。
+
+**Q：整合包和完整 zip 有什么区别？**
+
+完整 zip 是整目录快照（含运行数据 / node_modules），适合本机备份恢复；整合包（.dspack）只含配置 + 插件 + 补丁，遵循 DSH-PackForge 规范，体积小、可分享，导入时自动重建依赖，还能从在线市场直接安装。
+
+**Q：导入整合包后插件没生效？**
+
+导入已自动执行依赖重建（pnpm install）。若日志显示失败（如网络原因），可在插件管理中对该 Profile 点「修复依赖」重试；版本豁免类问题见上方 FAQ。
+
+**Q：整合包文件能被篡改吗？**
+
+在线市场条目携带 `SHA-256` + `size`，下载后逐字节校验，不匹配直接拒绝；本地导入也会校验容器结构，非法文件报错并回滚。
 
 **Q：国内网络下载失败怎么办？**
 

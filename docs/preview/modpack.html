@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<style>
+  :root {
+    --bg: #0f141c; --panel: #161d2a; --panel2: #1b2433; --border: #2a3646;
+    --text: #dbe3ee; --dim: #8b98a9; --accent: #3884ff; --green: #3ddc84;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: "Microsoft YaHei", sans-serif; padding: 28px; width: 1280px; }
+  .title { font-size: 24px; font-weight: 700; margin-bottom: 4px; }
+  .sub { color: var(--dim); font-size: 13px; margin-bottom: 22px; }
+  .row { display: flex; gap: 16px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px 18px; flex: 1; }
+  .card h3 { font-size: 15px; color: var(--accent); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+  .card ul { list-style: none; font-size: 12.5px; line-height: 1.9; color: var(--text); }
+  .card ul li::before { content: "· "; color: var(--dim); }
+  .dim { color: var(--dim); font-size: 11.5px; }
+  .flow { display: flex; align-items: stretch; gap: 10px; margin: 20px 0; }
+  .step { background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; flex: 1; }
+  .step .s { font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+  .step .t { font-size: 13.5px; font-weight: 600; margin-bottom: 6px; }
+  .step .d { font-size: 11.5px; color: var(--dim); line-height: 1.6; }
+  .arrow { align-self: center; color: var(--dim); font-size: 20px; flex: none; }
+  .tag { font-size: 10.5px; padding: 1px 7px; border-radius: 4px; background: #26324a; color: #a8c6f0; margin-left: 6px; vertical-align: 2px; }
+  .green { color: var(--green); }
+  .file { font-family: Consolas, monospace; font-size: 11.5px; background: #101827; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-top: 8px; line-height: 1.7; }
+  .file b { color: #e0b76e; }
+  .badge { display: inline-block; background: #123326; color: var(--green); border: 1px solid #1e4a35; border-radius: 20px; padding: 2px 10px; font-size: 11px; margin-right: 6px; }
+</style>
+</head>
+<body>
+  <div class="title">📦 整合包（Modpack）<span class="badge">.dspack v3</span><span class="badge">manifest v5</span></div>
+  <div class="sub">像 Minecraft 整合包一样，一键导出、分享、安装 DSH AI 智能体配置包 —— 遵循 DSH-PackForge 开放规范</div>
+
+  <div class="row">
+    <div class="card">
+      <h3>📤 导出（Pack）</h3>
+      <ul>
+        <li>点击 Profile 行的「⬆ 导出」→ 切换为「整合包（.dspack）」</li>
+        <li>自动生成 manifest v5：bundles / dependencies / patch / dshVersion</li>
+        <li>自动排除 <span class="green">node_modules · 运行数据 · 凭据 · 压缩包</span></li>
+        <li>返回 SHA-256 校验值，可安全分享给任何人</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>📥 导入（Install）</h3>
+      <ul>
+        <li>「⬇ 导入」→ 选「整合包」→ 在线市场或本地文件</li>
+        <li>校验容器与 SHA-256 → 落盘 overrides/ 与 home/</li>
+        <li><span class="green">自动重建依赖</span>（pnpm install 流式日志）</li>
+        <li>重名自动改名；全局文件覆盖前自动备份可回滚</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>🌐 市场（Market）</h3>
+      <ul>
+        <li>内置 <span class="green">dsh-pack-market</span> 索引浏览</li>
+        <li>展示名 / 描述 / 作者 / bundle 数 / 所需 DSH 版本</li>
+        <li>下载后校验 size + SHA-256，防篡改</li>
+        <li>导入即用，无需手工配置</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>🔄 完整流程</h3>
+    <div class="flow">
+      <div class="step"><div class="s">第一步</div><div class="t">选择导出类型</div><div class="d">完整 zip（含数据）或整合包（仅配置 + 插件）</div></div>
+      <div class="arrow">→</div>
+      <div class="step"><div class="s">第二步</div><div class="t">填写包名 / 版本</div><div class="d">生成 .dspack v3 并计算 SHA-256</div></div>
+      <div class="arrow">→</div>
+      <div class="step"><div class="s">分享 / 下载</div><div class="t">市场或文件分发</div><div class="d">他人通过「⬇ 导入」一键安装</div></div>
+      <div class="arrow">→</div>
+      <div class="step"><div class="s">第三步</div><div class="t">自动重建依赖</div><div class="d">pnpm install 逐 profile 重建，日志实时可见</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>🗂 包结构（profile 形态）</h3>
+    <div class="file">
+<b>my-pack-1.0.0.dspack</b>（标准 ZIP）
+├── <b>dspack.json</b>      ← 容器标记 { "format": "dspack", "version": 3 }
+├── <b>manifest.json</b>    ← manifest v5：bundles / dependencies / patch / dshVersion
+├── package.json           ← 机器文件快照（导入时由 manifest 权威重建）
+├── pnpm-lock.yaml         ← 依赖锁定（可选）
+└── <b>overrides/</b>         ← 用户文件 → $DSH_HOME/profiles/&lt;name&gt;/
+    ├── cordis.patch.yml   ← 补丁层
+    └── …                  ← 其余用户文件
+（可选 home/ → $DSH_HOME 全局 skill / preset / AGENTS.md）
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3>📌 Profile 备注</h3>
+    <ul>
+      <li><span class="green">右键</span>任意 Profile 添加备注与「适配版本」提示</li>
+      <li>适配版本下拉直接选择左栏 DSH 版本 —— 仅作提示，<span class="dim">无任何约束</span></li>
+    </ul>
+  </div>
+</body>
+</html>
