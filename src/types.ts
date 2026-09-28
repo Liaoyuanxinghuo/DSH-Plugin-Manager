@@ -123,6 +123,8 @@ export interface StartResult {
 
 export interface EnvPaths {
   homeDir: string;
+  /** DSH_HOME：当前选中 profile 来源目录的父目录（直接包含 profiles/sessions 的数据根） */
+  dshHome?: string;
   /** 当前选中 profile 的目录（不存在时为 null） */
   profileDir: string | null;
   profilesDir: string;

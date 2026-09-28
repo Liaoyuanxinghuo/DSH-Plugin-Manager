@@ -607,6 +607,22 @@ export default function App() {
     }
   };
 
+  // 复制并重命名 profile 副本（同目录，自动 -1 递增；node_modules 一并复制，立即可用）
+  const doClone = async () => {
+    if (!selectedEnv || !exportTarget || busy) return;
+    setBusy(true);
+    try {
+      const newName = await api.cloneProfile(selectedEnv, exportTarget.profile, exportTarget.profilesDir);
+      setInfo(`已复制为副本「${newName}」（与「${exportTarget.profile}」同目录，node_modules 已一并复制）`);
+      loadProfiles();
+      setExportTarget(null);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   // 添加本地 profile 扫描目录
   const handleAddScanDir = async () => {
     const path = await pickFolder("选择要扫描的 DSH_HOME 或 profiles 目录");
@@ -809,7 +825,7 @@ export default function App() {
   const fileButtons = paths
     ? [
         ...(paths.profileDir ? [{ label: "当前 Profile 目录", path: paths.profileDir }] : []),
-        { label: "DSH_HOME", path: paths.homeDir },
+        { label: "DSH_HOME", path: paths.dshHome ?? paths.homeDir },
         { label: "Profiles 目录", path: paths.profilesDir },
         { label: "日志目录", path: paths.logsDir },
         { label: "会话目录", path: paths.sessionsDir },
@@ -1510,6 +1526,7 @@ export default function App() {
               nmSize={exportTarget.nmSize}
               onConfirmZip={(exclude) => doExport(exclude)}
               onConfirmPack={(name, version, displayName) => doExportPack(name, version, displayName)}
+              onClone={doClone}
               onCancel={() => setExportTarget(null)}
               busy={busy}
             />
@@ -1629,6 +1646,7 @@ function ExportOptions({
   nmSize,
   onConfirmZip,
   onConfirmPack,
+  onClone,
   onCancel,
   busy,
 }: {
@@ -1636,6 +1654,7 @@ function ExportOptions({
   nmSize: number;
   onConfirmZip: (exclude: boolean) => void;
   onConfirmPack: (name: string, version: string, displayName: string) => void;
+  onClone: () => void;
   onCancel: () => void;
   busy: boolean;
 }) {
@@ -1680,9 +1699,12 @@ function ExportOptions({
           </p>
         </div>
       )}
-      <div className="modal-actions">
+      <div className="modal-actions" style={{ flexWrap: "wrap", gap: 8 }}>
         <button className="btn" onClick={onCancel} disabled={busy}>
           取消
+        </button>
+        <button className="btn" onClick={onClone} disabled={busy} title="复制到同目录，自动补 -1 递增名（含 node_modules，立即可用）">
+          📋 复制并重命名副本
         </button>
         {mode === "zip" ? (
           <button className="btn primary" onClick={() => onConfirmZip(exclude)} disabled={busy}>
@@ -1908,7 +1930,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.5</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.6</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -2214,6 +2236,22 @@ function ImportDialog({
   const [installing, setInstalling] = useState(false);
   const [done, setDone] = useState<{ success: boolean; summary: string } | null>(null);
   const unsubsRef = useRef<Array<() => void>>([]);
+  // 导入目标目录：默认记住上次选择的目录，否则用当前选中 profile 的来源目录
+  const [targetDir, setTargetDir] = useState<string>(() => {
+    const saved = localStorage.getItem("dshpm-import-dir");
+    return saved || profilesDir;
+  });
+  const chooseTargetDir = async () => {
+    const chosen = await pickFolder("选择 DSH_HOME 或 profiles 目录（目标目录名必须为 profiles）");
+    if (!chosen) return;
+    const target = chosen.replace(/[\\/]+$/, "");
+    if (!target.toLowerCase().endsWith("profiles")) {
+      setGlobalError("目标目录名必须以 profiles 结尾，请重新选择（例如选择 DSH_HOME\profiles 目录）");
+      return;
+    }
+    setTargetDir(target);
+    localStorage.setItem("dshpm-import-dir", target);
+  };
 
   // 监听依赖重建日志（dsh plugin install 流式输出）
   useEffect(() => {
@@ -2263,11 +2301,11 @@ function ImportDialog({
     setGlobalError("");
     setStep("busy");
     try {
-      const r = await api.importPack(envId, packPath, profilesDir);
+      const r = await api.importPack(envId, packPath, targetDir);
       setLogs((prev) => [...prev, { line: `已落盘：${r.finalNames.join("、")}，开始重建依赖…`, kind: "stdout" }]);
       for (const name of r.finalNames) {
         setLogs((prev) => [...prev, { line: `── 重建 ${name} 依赖（dsh plugin install）`, kind: "stdout" }]);
-        const out = await api.fixDeps(envId, name, profilesDir);
+        const out = await api.fixDeps(envId, name, targetDir);
         if (!out.success) {
           setDone({ success: false, summary: `依赖重建失败（${name}）：${out.summary}` });
           setInstalling(false);
@@ -2304,7 +2342,12 @@ function ImportDialog({
           <h3>导入 Profile（目标：{envName}）</h3>
           <button className="btn tiny" onClick={close} disabled={installing}>✕</button>
         </div>
-        <p className="modal-hint">导入到 profiles 目录：{profilesDir || "（当前环境默认）"}；重名自动改名。</p>
+        <p className="modal-hint">
+          导入到 profiles 目录：{targetDir || "（当前环境默认）"}；重名自动改名。
+          <button className="btn tiny" onClick={chooseTargetDir} style={{ marginLeft: 10 }} disabled={installing}>
+            选择目录
+          </button>
+        </p>
 
         {step === "choose" && (
           <div className="import-choices">
@@ -2313,7 +2356,7 @@ function ImportDialog({
               if (!path) return;
               setInstalling(true);
               try {
-                const r = await api.importProfile(envId, path, profilesDir);
+                const r = await api.importProfile(envId, path, targetDir);
                 setGlobalInfo(
                   r.renamed
                     ? `导入成功：原 "${r.profileName}" 与现有重名，已改名为 "${r.finalName}"（${r.pluginCount} 个插件）`

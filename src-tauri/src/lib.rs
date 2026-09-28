@@ -665,6 +665,23 @@ fn ensure_profile_deps(profile: &str, profiles_dir: &std::path::Path) -> Result<
     if !profile_dir.is_dir() {
         return Err(format!("profile 不存在: {profile}"));
     }
+    // 兼容第三方整合包的非法 github: 依赖 key（pnpm 拒绝，自动规范后 pnpm install 才能通过）
+    let pj = profile_dir.join("package.json");
+    if pj.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&pj) {
+            if let Ok(mut data) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(deps) = data
+                    .get_mut("dependencies")
+                    .and_then(|d| d.as_object_mut())
+                {
+                    packforge::normalize_dependencies(deps);
+                    if let Ok(out) = serde_json::to_string_pretty(&data) {
+                        let _ = std::fs::write(&pj, out);
+                    }
+                }
+            }
+        }
+    }
     let ws = profile_dir.join("pnpm-workspace.yaml");
     if !ws.is_file() {
         std::fs::write(
@@ -1347,6 +1364,8 @@ async fn fix_deps_cmd(
         return Err("该环境未绑定 dsh 运行时，无法修复依赖".to_string());
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    // 修复前先规范 package.json 依赖声明（兼容 github: 前缀 key），否则 pnpm 直接失败
+    let _ = ensure_profile_deps(&profile, &profiles_dir);
     let dsh_home = runner::dsh_home_of(&profiles_dir);
     let app2 = app.clone();
     let env2 = env.clone();
@@ -1465,6 +1484,108 @@ async fn export_profile_cmd(
     tauri::async_runtime::spawn_blocking(move || profile_io::export_profile(&profile_dir, &target, excl))
         .await
         .map_err(|e| format!("导出任务失败：{e}"))?
+}
+
+/// 复制 profile 到同目录副本，自动补 -N 递增名（N 从 1 起，跳过已存在），
+/// 保留 node_modules（复制后立即可用，无需重建依赖）。
+#[tauri::command]
+async fn clone_profile_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    profile: String,
+    profiles_dir_str: String,
+) -> Result<serde_json::Value, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    let src = profiles_dir.join(&profile);
+    if !src.is_dir() {
+        return Err(format!("profile 不存在: {profile}"));
+    }
+    // 运行中的 profile 有文件被进程锁定（日志/session），复制会遇「拒绝访问」——
+    // 明确提示先停止，避免复制出残缺副本
+    let running_this = state
+        .running
+        .lock()
+        .unwrap()
+        .values()
+        .any(|p| p.env_id == env_id && p.profile == profile && p.profiles_dir == profiles_dir);
+    if running_this {
+        return Err(format!("「{profile}」正在运行，请先停止相关实例再复制副本"));
+    }
+    let mut n: u32 = 1;
+    let mut dest = profiles_dir.join(format!("{profile}-{n}"));
+    while dest.exists() {
+        n += 1;
+        dest = profiles_dir.join(format!("{profile}-{n}"));
+    }
+    let final_name = dest
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    let src2 = src.clone();
+    let dest2 = dest.clone();
+    // 大目录（node_modules）复制放阻塞线程池；
+    // 权限/占用错误跳过并计数（多为运行期临时文件、只读文件），不中断整体复制
+    let (files, skipped) = tauri::async_runtime::spawn_blocking(move || copy_dir_all(&src2, &dest2))
+        .await
+        .map_err(|e| format!("复制任务失败：{e}"))?
+        .map_err(|e| format!("复制失败：{e}"))?;
+    if files == 0 && skipped == 0 {
+        return Err("复制失败：目录为空或不可读".to_string());
+    }
+    // 修改副本 package.json 的 name 字段为 dsh-profile-{新名}，避免与原件同名
+    let pj = dest.join("package.json");
+    if pj.is_file() {
+        if let Ok(text) = std::fs::read_to_string(&pj) {
+            if let Ok(mut data) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(format!("dsh-profile-{final_name}")),
+                    );
+                    if let Ok(out) = serde_json::to_string_pretty(&data) {
+                        let _ = std::fs::write(&pj, out);
+                    }
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({ "name": final_name, "skipped": skipped, "files": files }))
+}
+
+/// 递归复制目录树（含子目录与隐藏文件）。
+/// 返回 (已复制文件数, 跳过的文件数)；权限拒绝/文件被占用（os error 5 等）跳过计数，
+/// 其余错误返回 Err。符号链接（junction）跳过避免递归进不可达目标。
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<(usize, usize)> {
+    let mut files = 0usize;
+    let mut skipped = 0usize;
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            let (f, s) = copy_dir_all(&from, &to)?;
+            files += f;
+            skipped += s;
+        } else if ty.is_symlink() {
+            skipped += 1; // junction / 符号链接：不跟随，避免不可达目标
+        } else {
+            match std::fs::copy(&from, &to) {
+                Ok(_) => files += 1,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(5) =>
+                {
+                    skipped += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok((files, skipped))
 }
 
 /// 导入 zip 到指定环境的 profiles 目录（重名自动改名）
@@ -1919,6 +2040,7 @@ fn get_env_paths(
         .unwrap_or(home);
     Ok(serde_json::json!({
         "homeDir": env.home_dir,
+        "dshHome": dsh_home.to_string_lossy().to_string(),
         "profileDir": profile_dir,
         "profilesDir": profiles_dir,
         "sessionsDir": dsh_home.join("sessions").to_string_lossy().to_string(),
@@ -1978,6 +2100,7 @@ pub fn run() {
             get_env_paths,
             export_profile_cmd,
             import_profile_cmd,
+            clone_profile_cmd,
             profile_node_modules_size,
             export_pack_cmd,
             market_packs_cmd,
@@ -2011,6 +2134,24 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_dir_all_copies_tree() {
+        // 复制整棵目录树（含子目录），统计文件数
+        let tmp = std::env::temp_dir().join("dshpm-clone-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let src = tmp.join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), "a").unwrap();
+        std::fs::write(src.join("sub").join("b.txt"), "b").unwrap();
+        let dst = tmp.join("dst");
+        let (n, skipped) = copy_dir_all(&src, &dst).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(skipped, 0);
+        assert!(dst.join("a.txt").is_file());
+        assert!(dst.join("sub").join("b.txt").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     #[ignore]
@@ -2055,13 +2196,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.5_x64-setup.exe", "0.3.5"));
-        assert!(asset_matches("dsh-manager_0.3.5_x64-setup.exe", "0.3.5"));
-        assert!(asset_matches("任意名_0.3.5_x64-setup.exe", "0.3.5"));
-        assert!(!asset_matches("DSH-Manager-0.3.5-win-x64.exe", "0.3.5"));
-        assert!(!asset_matches("DSH Manager_0.3.5_x64-setup.exe.sha256", "0.3.5"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.5"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.5"));
+        assert!(asset_matches("DSH Manager_0.3.6_x64-setup.exe", "0.3.6"));
+        assert!(asset_matches("dsh-manager_0.3.6_x64-setup.exe", "0.3.6"));
+        assert!(asset_matches("任意名_0.3.6_x64-setup.exe", "0.3.6"));
+        assert!(!asset_matches("DSH-Manager-0.3.6-win-x64.exe", "0.3.6"));
+        assert!(!asset_matches("DSH Manager_0.3.6_x64-setup.exe.sha256", "0.3.6"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.6"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.6"));
     }
 
     #[test]
@@ -2179,7 +2320,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.5", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.6", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

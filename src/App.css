@@ -98,6 +98,7 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .title-actions { display: flex; gap: 6px; }
 .check-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim); margin-bottom: 12px; cursor: pointer; }
 .modal label.check-row { display: flex; align-items: center; gap: 8px; color: var(--text-dim); margin-bottom: 12px; cursor: pointer; }
+.modal label.check-row input { display: inline-block; width: auto; margin-top: 0; flex: 0 0 auto; }
 .check-row input { accent-color: var(--accent); }
 .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: #2a3646; color: var(--text-dim); }
 .tag.bundle { background: #233d33; color: var(--accent); }
@@ -195,7 +196,7 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 
 /* 弹窗 */
 .modal-mask { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
-.modal { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: 420px; max-width: 90vw; }
+.modal { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: 420px; max-width: 90vw; max-height: 85vh; overflow-y: auto; }
 .modal h3 { font-size: 15px; margin-bottom: 8px; }
 .modal-hint { font-size: 12px; color: var(--text-dim); margin-bottom: 12px; }
 .scan-help-body ul { margin: 4px 0 10px 18px; padding: 0; font-size: 12px; color: var(--text); line-height: 1.8; }

@@ -584,16 +584,57 @@ fn copy_tree_with_backup(src: &Path, dst: &Path, backup: &Path) -> Result<usize,
 }
 
 /// 重建 profile package.json（manifest 权威）
+/// 兼容第三方整合包的非法依赖写法：dependencies 的 key 形如 `github:owner/repo`
+/// （pnpm 要求 key 必须是合法包名，GitHub 地址应放在 value，如
+/// `"pkg": "github:owner/repo#commit"`）。这里自动把这种 key 改写为仓库短名，
+/// value 改写为 `github:owner/repo#<原值>` 的合法格式（原值为 commit hash 或 tag）。
+pub fn normalize_dependencies(deps: &mut serde_json::Map<String, serde_json::Value>) {
+    let mut fixes: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut drop_keys: Vec<String> = Vec::new();
+    for (k, v) in deps.iter() {
+        if let Some(rest) = k.strip_prefix("github:") {
+            let repo = rest.split('/').last().unwrap_or(rest).to_string();
+            if repo.is_empty() || repo.as_str() == k.as_str() {
+                continue;
+            }
+            let new_val = if let Some(s) = v.as_str() {
+                if s.contains('#') || s.starts_with("github:") {
+                    v.clone()
+                } else if s.is_empty() {
+                    serde_json::Value::String(format!("github:{rest}"))
+                } else {
+                    serde_json::Value::String(format!("github:{rest}#{s}"))
+                }
+            } else {
+                v.clone()
+            };
+            fixes.push((repo, new_val));
+            drop_keys.push(k.clone());
+        }
+    }
+    for k in drop_keys {
+        deps.remove(&k);
+    }
+    for (k, v) in fixes {
+        deps.insert(k, v);
+    }
+}
+
 fn rebuild_package_json(
     profile_dir: &Path,
     final_name: &str,
     bundles: &[String],
     deps: &HashMap<String, String>,
 ) -> Result<(), String> {
+    // 先规范依赖声明（兼容 github: 前缀 key 的第三方包），再写盘
+    let mut deps_json = serde_json::to_value(deps).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = deps_json.as_object_mut() {
+        normalize_dependencies(map);
+    }
     let pkg = serde_json::json!({
         "name": format!("dsh-profile-{final_name}"),
         "private": true,
-        "dependencies": deps,
+        "dependencies": deps_json,
         "dsh": { "profile": { "bundles": bundles } }
     });
     fs::write(

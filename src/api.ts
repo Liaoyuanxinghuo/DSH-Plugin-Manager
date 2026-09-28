@@ -104,6 +104,8 @@ export const api = {
   ) => invoke<ExportResult>("export_profile_cmd", { envId, profile, profilesDirStr: profilesDir, targetPath, excludeNodeModules }),
   importProfile: (envId: string, zipPath: string, profilesDir: string) =>
     invoke<ImportResult>("import_profile_cmd", { envId, zipPath, profilesDirStr: profilesDir }),
+  cloneProfile: (envId: string, profile: string, profilesDir: string) =>
+    invoke<{ name: string; skipped: number; files: number }>("clone_profile_cmd", { envId, profile, profilesDirStr: profilesDir }),
   createProfile: (envId: string, name: string, profilesDir: string) =>
     invoke<CreateProfileResult>("create_profile_cmd", { envId, name, profilesDirStr: profilesDir }),
   deleteProfile: (envId: string, name: string, profilesDir: string) =>
