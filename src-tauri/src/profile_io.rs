@@ -412,6 +412,12 @@ pub fn create_profile(profiles_dir: &Path, name: &str) -> Result<CreateProfileRe
     let pkg_path = target.join("package.json");
     fs::write(&pkg_path, serde_json::to_string_pretty(&pkg).unwrap())
         .map_err(|e| format!("写入 package.json 失败: {e}"))?;
+    // 与现有正常 profile 一致：声明独立 workspace，依赖安装到本 profile 的 node_modules
+    fs::write(
+        target.join("pnpm-workspace.yaml"),
+        "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n",
+    )
+    .map_err(|e| format!("写入 pnpm-workspace.yaml 失败: {e}"))?;
     Ok(CreateProfileResult {
         name: safe,
         path: target.to_string_lossy().to_string(),

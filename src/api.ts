@@ -85,6 +85,8 @@ export const api = {
   dshStatus: (envId: string, profile: string, profilesDir: string) =>
     invoke<DshStatus>("dsh_status", { envId, profile, profilesDirStr: profilesDir }),
   listRunning: () => invoke<RunningProcess[]>("list_running_cmd"),
+  /** 停止全部运行中的 DSH（关闭软件前用）；返回停止失败项 */
+  stopAllDsh: () => invoke<string[]>("stop_all_dsh_cmd"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   openUrl: (url: string) => invoke<void>("open_url_cmd", { url }),
   /** 打开 DSH web 界面：后端实时从日志提取带 token 的地址 */

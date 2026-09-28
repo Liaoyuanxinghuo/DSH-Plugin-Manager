@@ -72,28 +72,29 @@ pub fn probe() -> Toolchain {
         }
         node = found;
     }
-    // 2) PATH 中的 node（where node）
+    // 2) DSH Desktop 自带 node（与 dsh 配套，版本新，通常 ≥24，能跑 import.meta.main）
+    //    优先于 PATH 中的 node——PATH 里可能是不兼容的老 node（如 v22 会静默退出）。
     if node.is_none() {
-        for line in run_capture("where node").lines() {
-            let p = PathBuf::from(line.trim());
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let appdata = std::env::var("APPDATA").unwrap_or_default();
+        let mut candidates: Vec<String> = vec![
+            format!("{home}\\.dsh-win\\node\\node.exe"),
+            "C:\\Program Files\\nodejs\\node.exe".to_string(),
+            "C:\\Program Files (x86)\\nodejs\\node.exe".to_string(),
+            format!("{appdata}\\npm\\node.exe"),
+        ];
+        for c in candidates.drain(..) {
+            let p = PathBuf::from(&c);
             if p.is_file() {
                 node = Some(p);
                 break;
             }
         }
     }
-    // 3) 常见安装位置（含 DSH Desktop 自带 node、npm 全局目录）
+    // 3) PATH 中的 node（where node）最后兜底
     if node.is_none() {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let appdata = std::env::var("APPDATA").unwrap_or_default();
-        let mut candidates: Vec<String> = vec![
-            "C:\\Program Files\\nodejs\\node.exe".to_string(),
-            "C:\\Program Files (x86)\\nodejs\\node.exe".to_string(),
-            format!("{home}\\.dsh-win\\node\\node.exe"),
-            format!("{appdata}\\npm\\node.exe"),
-        ];
-        for c in candidates.drain(..) {
-            let p = PathBuf::from(&c);
+        for line in run_capture("where node").lines() {
+            let p = PathBuf::from(line.trim());
             if p.is_file() {
                 node = Some(p);
                 break;
@@ -176,7 +177,14 @@ pub fn pick_lts_list(entries: &[NodeIndexEntry]) -> Vec<String> {
 pub fn fetch_node_index(registry: &str) -> Result<Vec<NodeIndexEntry>, String> {
     let base = crate::settings::resolve_node_base(registry);
     let url = format!("{base}/index.json");
-    let body = reqwest::blocking::get(&url)
+    // 带超时的 blocking client（防网络挂起导致 ensure 永久卡住）
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+    let body = client
+        .get(&url)
+        .send()
         .map_err(|e| format!("获取 Node.js 版本索引失败: {e}"))?
         .text()
         .map_err(|e| format!("读取版本索引失败: {e}"))?;
@@ -200,7 +208,13 @@ pub fn download_node(app: &tauri::AppHandle, registry: &str, ver: &str) -> Resul
     let zip_url = format!("{base}/{ver}/node-{ver}-win-x64.zip");
     emit_log(app, &format!("下载 Node.js {ver}（{zip_url}）…"), "stdout");
 
-    let resp = reqwest::blocking::get(&zip_url)
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+    let resp = client
+        .get(&zip_url)
+        .send()
         .map_err(|e| format!("下载 Node.js 失败: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("下载 Node.js 失败：HTTP {}", resp.status()));
@@ -319,13 +333,85 @@ pub fn install_pnpm(app: &tauri::AppHandle, node_dir: &Path, registry: &str) -> 
 pub fn ensure(app: &tauri::AppHandle, registry: &str) -> Result<Toolchain, String> {
     let mut t = probe();
     if t.node.is_file() && t.npm.is_file() {
-        if t.pnpm.is_none() {
-            t.pnpm = Some(install_pnpm(app, &t.node_dir, registry)?);
+        // 已有 node：新 dsh 需要 Node 24+（bin.js 用 import.meta.main，老 node 会
+        // 静默退出）。明确探测到 <24 时视为不可用，直接升级到最新 LTS；
+        // 版本未知（无法判定）时保守使用已有 node。
+        match node_major_of(&t.node) {
+            Some(maj) if maj >= 24 => {
+                if t.pnpm.is_none() {
+                    t.pnpm = Some(install_pnpm(app, &t.node_dir, registry)?);
+                }
+                return Ok(t);
+            }
+            Some(_) => {
+                emit_log(
+                    app,
+                    &format!(
+                        "本机 Node 版本过低（{}），自动升级到最新 LTS…",
+                        t.node.display()
+                    ),
+                    "stdout",
+                );
+            }
+            None => {
+                if t.pnpm.is_none() {
+                    t.pnpm = Some(install_pnpm(app, &t.node_dir, registry)?);
+                }
+                return Ok(t);
+            }
         }
-        return Ok(t);
     }
-    // 需要自动安装 node
-    emit_log(app, "未检测到 Node.js 环境，开始自动安装…", "stdout");
+    install_lts(app, registry)
+}
+
+/// 读取指定 node.exe 的主版本号（跑 `node --version`，如 v22.15.0 → 22）
+fn node_major_of(node: &std::path::Path) -> Option<u32> {
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    let mut child = std::process::Command::new(node)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .spawn()
+        .ok()?;
+    // 超时轮询：node.exe 挂起时 6s 后放弃，避免 ensure() 永久卡住
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let v = s.trim().strip_prefix('v').unwrap_or(s.trim());
+    v.split('.')
+        .next()
+        .and_then(|p| p.parse::<u32>().ok())
+}
+
+/// 强制下载最新 Node LTS（不信任本机已有 node——例如本机只有 Node <24，
+/// 跑不了使用 import.meta.main 的新 dsh，即使 probe 能发现也不可用）。
+pub fn ensure_force(app: &tauri::AppHandle, registry: &str) -> Result<Toolchain, String> {
+    emit_log(app, "本机 Node 版本过低或不可用，开始下载最新 Node LTS…", "stdout");
+    install_lts(app, registry)
+}
+
+/// 下载最新 LTS Node 到 runtime 目录并装好 npm/pnpm（失败时逐级回退更早 LTS）
+fn install_lts(app: &tauri::AppHandle, registry: &str) -> Result<Toolchain, String> {
+    emit_log(app, "未检测到可用的 Node.js 环境，开始自动安装…", "stdout");
     let entries = fetch_node_index(registry)?;
     let candidates = pick_lts_list(&entries);
     if candidates.is_empty() {

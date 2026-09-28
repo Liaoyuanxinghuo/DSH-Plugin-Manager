@@ -105,6 +105,18 @@ function useDragReorder<T>(list: T[], onPersist: (next: T[]) => void) {
   return { bind, dragCls, listRef };
 }
 
+// 日志行样式分类：npm warn 等 → 黄色；error/ERR/ENOENT 等 → 红色；其余 stderr → 默认色
+function logLineClass(l: { line: string; kind?: string }): string {
+  const line = l.line.trimStart();
+  if (/^(npm warn|npm WARN|warn|warning|WARN)/.test(line)) return "log-warn";
+  if (
+    /^(npm error|npm ERR|error|fatal|ENOENT|EACCES|EPERM|EADDRINUSE|ECONNREFUSED|ERR_|errored)/.test(line)
+  ) {
+    return "log-err";
+  }
+  return "";
+}
+
 export default function App() {
   const [envs, setEnvs] = useState<DshEnv[]>([]);
   const [selectedEnv, setSelectedEnv] = useState<string>(() => localStorage.getItem("dshpm-sel-env") ?? "");
@@ -150,6 +162,11 @@ export default function App() {
   const [cleaningJunk, setCleaningJunk] = useState(false);
   const [confirmCleanJunk, setConfirmCleanJunk] = useState(false);
   const [diagExporting, setDiagExporting] = useState(false);
+  // 关闭软件时仍有 DSH 在运行 → 三选一弹窗（关闭所有 / 放生 / 取消）
+  const [closeCheck, setCloseCheck] = useState<number | null>(null);
+  const [closingAll, setClosingAll] = useState(false);
+  // 移除 DSH 环境二次确认（手动 = 磁盘删除版本目录；扫描目录 = 仅移出列表）
+  const [confirmRemoveEnv, setConfirmRemoveEnv] = useState<{ env: DshEnv; isManual: boolean } | null>(null);
   // M5 设置 / DSH 下载
   const [showSettings, setShowSettings] = useState(false);
   const [showDshDownload, setShowDshDownload] = useState(false);
@@ -259,6 +276,56 @@ export default function App() {
     const t = setInterval(tick, 3000);
     return () => clearInterval(t);
   }, []);
+
+  // 关闭软件拦截：若有 DSH 在运行 → 阻止关闭并弹窗三选一
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    import("@tauri-apps/api/window")
+      .then(async ({ getCurrentWindow }) => {
+        const w = getCurrentWindow();
+        unsub = await w.onCloseRequested(async (event) => {
+          // 先同步阻止关闭（否则 await 期间窗口会直接关掉），再异步查询
+          event.preventDefault();
+          try {
+            const runs = await api.listRunning();
+            if (runs && runs.length > 0) {
+              setCloseCheck(runs.length);
+            } else {
+              // 无运行实例 → 正常关闭（destroy 不触发本回调，不会死循环）
+              await w.destroy();
+            }
+          } catch {
+            await w.destroy();
+          }
+        });
+      })
+      .catch(() => {});
+    return () => unsub?.();
+  }, []);
+
+  // 关闭选择：stop-all（停全部后退出）/ release（放生，DSH 继续后台运行）/ cancel
+  const closeAppChoice = async (action: "stop-all" | "release" | "cancel") => {
+    if (action === "cancel") {
+      setCloseCheck(null);
+      return;
+    }
+    try {
+      if (action === "stop-all") {
+        setClosingAll(true);
+        const failed = await api.stopAllDsh();
+        if (failed && failed.length > 0) {
+          setInfo(`以下 DSH 停止失败（软件仍将退出）：${failed.join("；")}`);
+        }
+      }
+      const w = (await import("@tauri-apps/api/window")).getCurrentWindow();
+      await w.destroy();
+    } catch (e) {
+      setCloseCheck(null);
+      setError(`关闭失败：${e}`);
+    } finally {
+      setClosingAll(false);
+    }
+  };
 
   // 启动 + 就绪轮询（供启动/重启共用）
   const startAndPoll = async (eid: string, pname: string, pdir: string) => {
@@ -827,16 +894,7 @@ export default function App() {
                       className="btn tiny danger-inline"
                       onClick={(e) => {
                         e.stopPropagation();
-                        const isManual = env.source === "manual";
-                        const tip = isManual
-                          ? `确定从磁盘删除该 DSH 版本？\n\n${env.name}\n\n仅删除受管下载目录内的对应版本目录（如 C:\\dsh-versions\\dsh-${env.version}），其他文件不受影响。`
-                          : "确定移除该 profile 扫描目录？";
-                        if (!window.confirm(tip)) return;
-                        const act = isManual ? api.removeManualEnv(env.id) : api.removeScanDir(env.id);
-                        act.then((msg) => {
-                          loadEnvs();
-                          if (typeof msg === "string" && msg) window.alert(msg);
-                        }).catch((x) => setError(String(x)));
+                        setConfirmRemoveEnv({ env, isManual: env.source === "manual" });
                       }}
                     >
                       移除
@@ -1459,6 +1517,72 @@ export default function App() {
         </div>
       )}
 
+      {/* 关闭软件时仍有 DSH 在运行 → 三选一 */}
+      {closeCheck !== null && (
+        <div className="modal-mask">
+          <div className="modal">
+            <h3>仍有 DSH 在运行</h3>
+            <p className="modal-hint">
+              当前有 <b>{closeCheck}</b> 个 DSH 实例正在后台运行。关闭软件前请选择：
+            </p>
+            <div className="modal-actions" style={{ flexDirection: "column", alignItems: "stretch" }}>
+              <button className="btn primary" disabled={closingAll} onClick={() => closeAppChoice("stop-all")}>
+                {closingAll ? "正在关闭全部 DSH..." : "关闭所有 DSH 并退出"}
+              </button>
+              <button className="btn" disabled={closingAll} onClick={() => closeAppChoice("release")}>
+                放生 DSH（软件退出，DSH 继续运行）
+              </button>
+              <button className="btn" disabled={closingAll} onClick={() => closeAppChoice("cancel")}>
+                取消
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 移除 DSH 环境二次确认 */}
+      {confirmRemoveEnv && (
+        <div className="modal-mask" onClick={() => setConfirmRemoveEnv(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>{confirmRemoveEnv.isManual ? "移除 DSH 环境" : "移除扫描目录"}</h3>
+            <p className="modal-hint">
+              {confirmRemoveEnv.isManual ? (
+                <>
+                  将从磁盘删除该 DSH 版本目录：
+                  <br />
+                  <b>{confirmRemoveEnv.env.name}</b>（dsh {confirmRemoveEnv.env.version}）
+                  <br />
+                  程序: {binDir(confirmRemoveEnv.env.binPath ?? "")}
+                  <br />
+                  <br />
+                  仅删除受管下载目录内带版本标识的目录（如 C:\dsh-versions\dsh-
+                  {confirmRemoveEnv.env.version}），其他文件不受影响。此操作不可恢复。
+                </>
+              ) : (
+                <>将移出该 profile 扫描目录（磁盘文件不受影响）。</>
+              )}
+            </p>
+            <div className="modal-actions">
+              <button className="btn" onClick={() => setConfirmRemoveEnv(null)}>取消</button>
+              <button
+                className="btn danger"
+                onClick={() => {
+                  const { env, isManual } = confirmRemoveEnv;
+                  setConfirmRemoveEnv(null);
+                  const act = isManual ? api.removeManualEnv(env.id) : api.removeScanDir(env.id);
+                  act.then((msg) => {
+                    loadEnvs();
+                    if (typeof msg === "string" && msg) setError(msg);
+                  }).catch((x) => setError(String(x)));
+                }}
+              >
+                确认移除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 导入对话框（完整 zip / 整合包） */}
       {showImportDialog && selectedEnv && (
         <ImportDialog
@@ -1784,7 +1908,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.0</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.5</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -1906,9 +2030,22 @@ function DshDownloadDialog({ onClose, onInstalled }: { onClose: () => void; onIn
   const [dir, setDir] = useState("");
   const [ver, setVer] = useState("");
   const [installing, setInstalling] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [prog, setProg] = useState<{ bytes: number; total: number; percent: number } | null>(null);
   const [logs, setLogs] = useState<InstallLogLine[]>([]);
   const [err, setErr] = useState("");
   const [done, setDone] = useState<DshInstallResult | null>(null);
+
+  // 安装计时：让用户知道安装仍在进行（npm 安装无进度输出，容易误以为卡死）
+  useEffect(() => {
+    if (!installing) {
+      setElapsed(0);
+      return;
+    }
+    setElapsed(0);
+    const t = setInterval(() => setElapsed((e) => e + 1), 1000);
+    return () => clearInterval(t);
+  }, [installing]);
 
   useEffect(() => {
     let alive = true;
@@ -1932,6 +2069,9 @@ function DshDownloadDialog({ onClose, onInstalled }: { onClose: () => void; onIn
           if (alive) setLogs((prev) => [...prev.slice(-200), e.payload]);
         }).then((un) => unLogListeners.push(un)).catch(() => {});
         listen("install-done", () => {}).then((un) => unLogListeners.push(un)).catch(() => {});
+        listen<{ bytes: number; total: number; percent: number }>("install-progress", (e) => {
+          if (alive) setProg(e.payload);
+        }).then((un) => unLogListeners.push(un)).catch(() => {});
       } catch {
         // 无 Tauri IPC 桥时忽略
       }
@@ -1970,8 +2110,8 @@ function DshDownloadDialog({ onClose, onInstalled }: { onClose: () => void; onIn
   };
 
   return (
-    <div className="modal-mask" onClick={onClose}>
-      <div className="modal install-modal" onClick={(e) => e.stopPropagation()}>
+    <div className="modal-mask">
+      <div className="modal install-modal">
         <div className="modal-head">
           <h3>下载 DSH 版本</h3>
           <button className="btn tiny" onClick={onClose} disabled={installing}>×</button>
@@ -2013,17 +2153,31 @@ function DshDownloadDialog({ onClose, onInstalled }: { onClose: () => void; onIn
                 {done.success ? `✅ ${done.summary}` : `❌ ${done.summary}`}
               </div>
             )}
+            {installing && prog && prog.percent !== 4294967295 && prog.percent > 0 && (
+              <div className="install-progress">
+                <div className="bar"><div className="bar-fill" style={{ width: `${Math.min(100, Math.max(3, prog.percent))}%` }} /></div>
+                <div className="bar-text">
+                  {Math.round(prog.percent)}% · 已安装 {(prog.bytes / 1024 / 1024).toFixed(1)} MB / {(prog.total / 1024 / 1024).toFixed(1)} MB（参考）
+                </div>
+              </div>
+            )}
+            {installing && prog && prog.percent === 4294967295 && (
+              <div className="install-progress">
+                <div className="bar"><div className="bar-fill indeterminate" /></div>
+                <div className="bar-text">已安装 {(prog.bytes / 1024 / 1024).toFixed(1)} MB（估算中…）</div>
+              </div>
+            )}
             {logs.length > 0 && (
               <div className="log-box" style={{ maxHeight: 120 }}>
                 {logs.map((l, i) => (
-                  <div key={i} className={`log-line ${l.kind === "stderr" ? "log-err" : ""}`}>{l.line}</div>
+                  <div key={i} className={`log-line ${logLineClass(l)}`}>{l.line}</div>
                 ))}
               </div>
             )}
             <div className="modal-actions">
               <button className="btn" onClick={onClose} disabled={installing}>关闭</button>
               <button className="btn primary" onClick={start} disabled={installing || !ver || !(dir ?? "").trim()}>
-                {installing ? "下载安装中..." : `⬇ 安装 dsh ${ver}`}
+                {installing ? `下载安装中...（已运行 ${elapsed}s）` : `⬇ 安装 dsh ${ver}`}
               </button>
             </div>
           </>
@@ -2253,7 +2407,7 @@ function ImportDialog({
             {logs.length > 0 && (
               <div className="log-box" style={{ maxHeight: 220 }}>
                 {logs.map((l, i) => (
-                  <div key={i} className={`log-line ${l.kind === "stderr" ? "log-err" : ""}`}>{l.line}</div>
+                  <div key={i} className={`log-line ${logLineClass(l)}`}>{l.line}</div>
                 ))}
               </div>
             )}

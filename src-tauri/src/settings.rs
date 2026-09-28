@@ -19,6 +19,8 @@ pub struct Settings {
     pub dsh_download_dir: String,
     /// GitHub 下载镜像前缀（空 = 直连 GitHub）；用于整合包市场、raw 文件等
     pub github_mirror: String,
+    /// 各 DSH 版本安装后的实际体积（学习式进度总量：首次安装记录，后续安装有准确百分比）
+    pub dsh_install_sizes: std::collections::HashMap<String, u64>,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             npm_registry: DEFAULT_REGISTRY.to_string(),
             dsh_download_dir: DEFAULT_DSH_DIR.to_string(),
             github_mirror: DEFAULT_GITHUB_MIRROR.to_string(),
+            dsh_install_sizes: std::collections::HashMap::new(),
         }
     }
 }

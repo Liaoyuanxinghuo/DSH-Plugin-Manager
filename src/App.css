@@ -285,3 +285,39 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .junk-name { font-family: Consolas, monospace; word-break: break-all; }
 .junk-size { color: var(--text-dim); flex-shrink: 0; }
 .junk-hint { font-size: 11px; color: var(--text-dim); margin-top: 4px; }
+
+
+/* 安装进度条（下载 DSH / 插件安装） */
+.install-progress { margin: 6px 0 2px; }
+.bar {
+  height: 10px; border-radius: 5px; background: var(--border, #333);
+  overflow: hidden; position: relative;
+}
+.bar-fill {
+  height: 100%; border-radius: 5px;
+  background: linear-gradient(90deg, #3a7afe, #5c8dff);
+  transition: width 0.3s ease;
+}
+.bar-fill.indeterminate {
+  width: 35% !important; position: absolute; top: 0; left: 0;
+  animation: bar-slide 1.2s ease-in-out infinite;
+}
+@keyframes bar-slide {
+  0% { left: -35%; }
+  100% { left: 100%; }
+}
+.bar-text { margin-top: 3px; font-size: 12px; color: var(--muted, #999); }
+
+
+/* 滚动条（深色主题适配，WebView2/Chromium） */
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: var(--bg, #1e1e1e); border-radius: 5px; }
+*::-webkit-scrollbar-thumb { background: #4a4a4a; border-radius: 5px; border: 2px solid var(--bg, #1e1e1e); }
+*::-webkit-scrollbar-thumb:hover { background: #5c5c5c; }
+*::-webkit-scrollbar-corner { background: transparent; }
+/* Firefox 兜底 */
+* { scrollbar-color: #4a4a4a var(--bg, #1e1e1e); scrollbar-width: thin; }
+
+/* 日志：warn 黄色 / error 红色 */
+.log-warn { color: #e6c85c; }
+.log-err { color: #ffb3ad; }

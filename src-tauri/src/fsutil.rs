@@ -20,13 +20,21 @@ pub fn open_in_explorer(path: &str) -> Result<(), String> {
 }
 
 /// 使用默认浏览器打开 URL
+/// 注意：不能用 `explorer.exe <url>`——带查询参数/token 的 URL（如 dsh web 的
+/// http://127.0.0.1:3080/?token=...）会被 explorer 误判为文件路径而打开资源管理器。
+/// 改用 rundll32 url.dll,FileProtocolHandler（Windows 官方协议分发入口），
+/// 交给默认浏览器处理，且不会弹出 cmd 黑框。
 pub fn open_url(url: &str) -> Result<(), String> {
     if url.is_empty() {
         return Err("URL 为空".to_string());
     }
-    // 用 explorer.exe 打开 URL（默认浏览器），避免 cmd /C start 弹出控制台黑框
-    let _ = Command::new("explorer.exe").arg(url).spawn();
-    Ok(())
+    match Command::new("rundll32.exe")
+        .args(["url.dll", "FileProtocolHandler", url])
+        .spawn()
+    {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("无法打开浏览器: {e}")),
+    }
 }
 
 #[cfg(test)]

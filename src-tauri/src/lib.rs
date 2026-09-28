@@ -22,6 +22,7 @@ use tauri::Manager;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
+use tauri::Emitter;
 
 /// 应用全局状态
 pub struct AppState {
@@ -31,6 +32,8 @@ pub struct AppState {
     pub scan_dirs: Mutex<Vec<ScanDirEntry>>,
     /// 运行中的 DSH 进程（env_id -> process）
     pub running: Mutex<HashMap<String, RunningProcess>>,
+    /// 正在启动中的组合 key（per-key 互斥，防并发双击双开/抢端口）
+    pub starting: Mutex<std::collections::HashSet<String>>,
 }
 
 /// 手动环境持久化文件路径
@@ -85,15 +88,18 @@ fn save_manual_envs(envs: &[DshEnv]) {
 
 /// 扫描全部 DSH 环境（全局 CLI + 手动 + 扫描目录）
 #[tauri::command]
-fn scan_envs(state: State<AppState>) -> Vec<DshEnv> {
+async fn scan_envs(state: State<'_, AppState>) -> Result<Vec<DshEnv>, String> {
     let manual = state.manual_envs.lock().unwrap().clone();
     let scans = state.scan_dirs.lock().unwrap().clone();
-    scanner::scan_envs(&manual, &scans)
+    // 目录扫描放阻塞线程池，避免占用 tokio worker
+    tauri::async_runtime::spawn_blocking(move || scanner::scan_envs(&manual, &scans))
+        .await
+        .map_err(|e| format!("扫描失败：{e}"))
 }
 
 /// 手动添加环境（如 pnpm dlx 版本）
 #[tauri::command]
-fn add_manual_env(state: State<AppState>, name: String, command: String) -> Result<DshEnv, String> {
+fn add_manual_env(state: State<'_, AppState>, name: String, command: String) -> Result<DshEnv, String> {
     let name = name.trim().to_string();
     let command = command.trim().to_string();
     if name.is_empty() || command.is_empty() {
@@ -119,7 +125,7 @@ fn add_manual_env(state: State<AppState>, name: String, command: String) -> Resu
 
 /// 添加本地 profile 扫描目录
 #[tauri::command]
-fn add_scan_dir(state: State<AppState>, path: String) -> Result<ScanDirEntry, String> {
+fn add_scan_dir(state: State<'_, AppState>, path: String) -> Result<ScanDirEntry, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("目录路径不能为空".to_string());
@@ -201,7 +207,7 @@ fn is_profiles_dir(p: &std::path::Path) -> bool {
 
 /// 删除扫描目录
 #[tauri::command]
-fn remove_scan_dir(state: State<AppState>, id: String) -> Result<(), String> {
+fn remove_scan_dir(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let mut dirs = state.scan_dirs.lock().unwrap();
     dirs.retain(|d| d.id != id);
     save_scan_dirs(&dirs);
@@ -210,13 +216,13 @@ fn remove_scan_dir(state: State<AppState>, id: String) -> Result<(), String> {
 
 /// 列出所有扫描目录
 #[tauri::command]
-fn list_scan_dirs(state: State<AppState>) -> Vec<ScanDirEntry> {
+fn list_scan_dirs(state: State<'_, AppState>) -> Vec<ScanDirEntry> {
     state.scan_dirs.lock().unwrap().clone()
 }
 
 /// 在指定目录中扫描 dsh 本体并添加为可运行环境（自动探测命令与版本）
 #[tauri::command]
-fn add_dsh_scan_dir(state: State<AppState>, path: String) -> Result<Vec<DshEnv>, String> {
+async fn add_dsh_scan_dir(state: State<'_, AppState>, path: String) -> Result<Vec<DshEnv>, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("目录路径不能为空".to_string());
@@ -225,7 +231,11 @@ fn add_dsh_scan_dir(state: State<AppState>, path: String) -> Result<Vec<DshEnv>,
     if !p.is_dir() {
         return Err(format!("目录不存在或不可访问: {path}"));
     }
-    let found = scanner::scan_dsh_binary_tree(p, 3);
+    // 递归扫描大目录放阻塞线程池，避免卡 UI
+    let scan_root = p.to_path_buf();
+    let found = tauri::async_runtime::spawn_blocking(move || scanner::scan_dsh_binary_tree(&scan_root, 3))
+        .await
+        .map_err(|e| format!("扫描失败：{e}"))?;
     if found.is_empty() {
         return Err(format!("未在目录中发现 dsh 本体：{path}"));
     }
@@ -263,7 +273,7 @@ fn add_dsh_scan_dir(state: State<AppState>, path: String) -> Result<Vec<DshEnv>,
     Ok(added)
 }
 
-fn save_manual_envs_from_state(state: &State<AppState>) {
+fn save_manual_envs_from_state(state: &State<'_, AppState>) {
     let envs = state.manual_envs.lock().unwrap();
     save_manual_envs(&envs);
 }
@@ -330,9 +340,12 @@ fn safe_to_delete_version(root: &std::path::Path, download_root: &std::path::Pat
 /// 删除手动添加的环境：从磁盘删除对应 DSH 版本目录（安全验证通过时），再移出列表。
 /// 返回删除结果说明；仅在验证不满足时才仅移出列表并明确说明。
 #[tauri::command]
-fn remove_manual_env(state: State<AppState>, id: String) -> Result<String, String> {
-    let mut envs = state.manual_envs.lock().unwrap();
-    let env = envs.iter().find(|e| e.id == id).cloned();
+async fn remove_manual_env(state: State<'_, AppState>, id: String) -> Result<String, String> {
+    // 锁包在独立作用域：guard 在块尾自动释放（MutexGuard 非 Send，跨 await 会让 future 非 Send）
+    let env = {
+        let envs = state.manual_envs.lock().unwrap();
+        envs.iter().find(|e| e.id == id).cloned()
+    };
     let Some(env) = env else {
         return Err("环境不存在".to_string());
     };
@@ -348,6 +361,14 @@ fn remove_manual_env(state: State<AppState>, id: String) -> Result<String, Strin
         return Err("该 DSH 版本正在运行，请先停止相关实例再删除".to_string());
     }
 
+    // ===== 先从列表移除（立即生效；用户意图是移除该版本，不依赖磁盘删除结果）=====
+    state.manual_envs.lock().unwrap().retain(|e| e.id != id);
+    {
+        let envs_now = state.manual_envs.lock().unwrap();
+        save_manual_envs(&envs_now);
+    }
+
+    // ===== 再尝试删除磁盘目录（尽力而为；失败仅提示，不影响列表移除）=====
     let mut disk_msg = String::from("已从列表移除该环境（未发现可安全删除的版本目录，磁盘文件未动）");
     if let Some(root) = version_root_of(&env) {
         let dl = settings::load_settings().dsh_download_dir;
@@ -358,15 +379,20 @@ fn remove_manual_env(state: State<AppState>, id: String) -> Result<String, Strin
         });
         let dl_default = std::path::PathBuf::from(settings::DEFAULT_DSH_DIR);
         if safe_to_delete_version(&root, &dl_root) || safe_to_delete_version(&root, &dl_default) {
-            match std::fs::remove_dir_all(&root) {
+            // 大目录删除放阻塞线程池
+            let root2 = root.clone();
+            let rm = tauri::async_runtime::spawn_blocking(move || std::fs::remove_dir_all(&root2))
+                .await
+                .map_err(|e| format!("版本目录删除任务失败：{e}"))?;
+            match rm {
                 Ok(_) => {
                     disk_msg = format!("已删除磁盘上的版本目录：{}", root.display());
                 }
                 Err(e) => {
-                    return Err(format!(
-                        "版本目录删除失败（{}）：{e}（环境已保留在列表中，可手动删除该目录后重试）",
+                    disk_msg = format!(
+                        "已从列表移除该环境；磁盘目录删除失败（{}）：{e}，可稍后手动删除该目录",
                         root.display()
-                    ));
+                    );
                 }
             }
         } else {
@@ -376,10 +402,20 @@ fn remove_manual_env(state: State<AppState>, id: String) -> Result<String, Strin
             );
         }
     }
-
-    envs.retain(|e| e.id != id);
-    save_manual_envs(&envs);
     Ok(disk_msg)
+}
+
+/// per-key 启动互斥的 RAII 守卫：离开作用域（含提前 return）时自动释放
+struct StartLockGuard<'a> {
+    key: String,
+    state_starting: &'a Mutex<std::collections::HashSet<String>>,
+}
+impl Drop for StartLockGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.state_starting.lock() {
+            set.remove(&self.key);
+        }
+    }
 }
 
 fn uuid_like(s: &str) -> String {
@@ -393,7 +429,7 @@ fn uuid_like(s: &str) -> String {
 
 /// 获取指定环境
 #[tauri::command]
-fn get_env(state: State<AppState>, env_id: String) -> Option<DshEnv> {
+fn get_env(state: State<'_, AppState>, env_id: String) -> Option<DshEnv> {
     get_env_inner(&state, &env_id).ok()
 }
 
@@ -425,14 +461,14 @@ fn list_all_profiles_inner(scans: &[ScanDirEntry]) -> Vec<ProfileInfo> {
 
 /// 合并列出全部可用 profile（默认 DSH_HOME/profiles + 所有扫描目录），每个带来源目录
 #[tauri::command]
-fn list_all_profiles(state: State<AppState>) -> Vec<ProfileInfo> {
+async fn list_all_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileInfo>, String> {
     let scans = state.scan_dirs.lock().unwrap().clone();
-    list_all_profiles_inner(&scans)
+    Ok(list_all_profiles_inner(&scans))
 }
 
 /// 列出某环境的全部 profile
 #[tauri::command]
-fn list_profiles(state: State<AppState>, env_id: String) -> Result<Vec<ProfileInfo>, String> {
+async fn list_profiles(state: State<'_, AppState>, env_id: String) -> Result<Vec<ProfileInfo>, String> {
     let env = get_env_inner(&state, &env_id)?;
     if let Some(spd) = &env.scan_profiles_dir {
         Ok(scanner::list_profiles_from(std::path::Path::new(spd)))
@@ -441,7 +477,7 @@ fn list_profiles(state: State<AppState>, env_id: String) -> Result<Vec<ProfileIn
     }
 }
 
-fn get_env_inner(state: &State<AppState>, env_id: &str) -> Result<DshEnv, String> {
+fn get_env_inner(state: &State<'_, AppState>, env_id: &str) -> Result<DshEnv, String> {
     let scans = state.scan_dirs.lock().unwrap().clone();
     scanner::scan_envs(&state.manual_envs.lock().unwrap(), &scans)
         .into_iter()
@@ -451,8 +487,8 @@ fn get_env_inner(state: &State<AppState>, env_id: &str) -> Result<DshEnv, String
 
 /// 读取 profile 的插件清单
 #[tauri::command]
-fn list_plugins(
-    state: State<AppState>,
+async fn list_plugins(
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -519,7 +555,7 @@ fn read_disabled_ids(profile_dir: &std::path::Path) -> Vec<String> {
 /// 设置插件启用/停用（写入 cordis.patch.yml）
 #[tauri::command]
 fn set_plugin_enabled_cmd(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -547,8 +583,8 @@ fn set_plugin_enabled_cmd(
 
 /// 检查插件更新（并行查询 npm latest）
 #[tauri::command]
-fn check_updates_cmd(
-    state: State<AppState>,
+async fn check_updates_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -621,12 +657,34 @@ fn pick_port(requested: Option<u16>, used: &[u16]) -> Result<u16, String> {
     }
 }
 
-/// 启动 DSH（多实例）：任意 env×profile 组合独立进程；
-/// 端口默认自动分配（从 3080 起找第一个空闲端口），指定端口被占用时报错。
+/// 启动前补齐 profile 关键文件：pnpm-workspace.yaml（dsh 模块解析依赖它；
+/// 旧版创建 / 部分导入的 profile 可能缺失，缺它会导致启动失败）。
+/// dsh 启动时自行处理 bundles 依赖，无需预装 node_modules。
+fn ensure_profile_deps(profile: &str, profiles_dir: &std::path::Path) -> Result<(), String> {
+    let profile_dir = profiles_dir.join(profile);
+    if !profile_dir.is_dir() {
+        return Err(format!("profile 不存在: {profile}"));
+    }
+    let ws = profile_dir.join("pnpm-workspace.yaml");
+    if !ws.is_file() {
+        std::fs::write(
+            &ws,
+            "packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+",
+        )
+        .map_err(|e| format!("写入 pnpm-workspace.yaml 失败: {e}"))?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
-fn start_dsh_cmd(
+async fn start_dsh_cmd(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -639,31 +697,77 @@ fn start_dsh_cmd(
         return Err("该环境未绑定 dsh 运行时，无法启动".to_string());
     }
 
-    // 启动前确保 node/npm/pnpm 可用（电脑未装时自动下载安装，日志流式）
+    // 启动前确保 node/npm/pnpm 可用（电脑未装时自动下载安装，日志流式）。
+    // ensure 内部含 blocking 网络调用（拉取 node 版本索引 / 下载），放阻塞线程池执行。
     let registry = settings::load_settings().npm_registry;
-    toolchain::ensure(&app, &registry).map_err(|e| format!("工具链检查失败：{e}（请检查网络或镜像源）"))?;
+    {
+        let app2 = app.clone();
+        let reg2 = registry.clone();
+        tauri::async_runtime::spawn_blocking(move || toolchain::ensure(&app2, &reg2))
+            .await
+            .map_err(|e| format!("工具链检查失败：{e}"))?
+            .map_err(|e| format!("工具链检查失败：{e}（请检查网络或镜像源）"))?;
+    }
 
     // profile 来源目录（任意 dsh × 任意来源 profile 组合：注入 DSH_HOME）
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    let key = run_key(&env_id, &profiles_dir_str, &profile);
-    let mut running = state.running.lock().unwrap();
-    if let Some(existing) = running.get(&key) {
-        return Err(format!(
-            "「{profile}」在该环境下已在运行（PID {}，端口 {}），请先停止",
-            existing.pid, existing.port
-        ));
+    // 启动前兜底：profile 缺依赖（新建未装/导入未装）时自动 pnpm install（日志流式）
+    if let Err(e) = ensure_profile_deps(&profile, &profiles_dir) {
+        return Err(format!("profile 依赖检查失败：{e}"));
     }
-
-    // 确定端口：用户指定（非 0）→ 校验占用；否则自动分配（避开本应用已用端口 + 系统占用）
-    let port = pick_port(port, &running.values().map(|p| p.port).collect::<Vec<_>>())?;
+    let key = run_key(&env_id, &profiles_dir_str, &profile);
+    // per-key 启动互斥：并发双击同一组合时，第二次直接拒绝（防双开/抢端口）
+    let _start_guard = {
+        let mut starting = state.starting.lock().unwrap();
+        if !starting.insert(key.clone()) {
+            return Err(format!("「{profile}」正在启动中，请稍候"));
+        }
+        StartLockGuard { key: key.clone(), state_starting: &state.starting }
+    };
+    // 锁操作包在独立作用域内：guard 在块尾自动释放。
+    // （MutexGuard 非 Send，若跨 await 存活会让 command future 无法跨线程发送）
+    let port = {
+        let running = state.running.lock().unwrap();
+        if let Some(existing) = running.get(&key) {
+            return Err(format!(
+                "「{profile}」在该环境下已在运行（PID {}，端口 {}），请先停止",
+                existing.pid, existing.port
+            ));
+        }
+        // 确定端口：用户指定（非 0）→ 校验占用；否则自动分配（避开本应用已用端口 + 系统占用）
+        let used: Vec<u16> = running.values().map(|r| r.port).collect();
+        pick_port(port, &used)?
+    };
 
     let dsh_home = runner::dsh_home_of(&profiles_dir);
-    let (pid, log_path) =
-        runner::start_dsh(&env, &profile, port, Some(&dsh_home))?;
+    let (pid, log_path) = match runner::start_dsh(&env, &profile, port, Some(&dsh_home)) {
+        Ok(r) => r,
+        Err(first_err) => {
+            // 启动解析失败，且原因指向 node 不可用（本机 node <24 跑不了新 dsh）：
+            // 强制下载最新 Node LTS 后重试一次，而不是直接报错。
+            if first_err.contains("可运行该 DSH 的 Node") {
+                let app2 = app.clone();
+                let reg2 = registry.clone();
+                let install_result = tauri::async_runtime::spawn_blocking(move || {
+                    toolchain::ensure_force(&app2, &reg2)
+                })
+                .await
+                .map_err(|e| format!("自动安装 Node LTS 失败：{e}"))?
+                .map_err(|e| format!("自动安装 Node LTS 失败：{e}"))?;
+                let _ = install_result;
+                runner::start_dsh(&env, &profile, port, Some(&dsh_home))?
+            } else {
+                return Err(first_err);
+            }
+        }
+    };
 
     // 短暂探测：2 秒后进程仍存活才算启动成功。
     // dsh 若启动失败（例如用旧版 dsh 加载新版 profile → ERR_MODULE_NOT_FOUND）会秒退。
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // 睡眠放阻塞线程池，避免占用 tokio worker 线程导致其他命令排队。
+    tauri::async_runtime::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(2)))
+        .await
+        .map_err(|e| format!("等待进程探测失败：{e}"))?;
     if !runner::is_pid_alive(pid) {
         let tail = runner::read_log_tail(&log_path, 12);
         let _ = std::fs::remove_file(&log_path);
@@ -686,7 +790,16 @@ fn start_dsh_cmd(
         url: url.clone(),
         log_path: log_path.clone(),
     };
-    running.insert(key, proc.clone());
+    // 重新加锁插入（旧锁已在跨 await 前释放）；插入前二次校验，
+    // 防「检查未运行 → 释放锁 → 启动期间另一并发请求已插入」的双开竞态
+    {
+        let mut running = state.running.lock().unwrap();
+        if running.contains_key(&key) {
+            let _ = runner::stop_dsh(pid); // 兜底：杀掉本次多余启动的进程
+            return Err(format!("「{profile}」已被另一请求启动，本次已停止"));
+        }
+        running.insert(key.clone(), proc.clone());
+    }
 
     Ok(StartResult {
         success: true,
@@ -714,7 +827,7 @@ fn prune_dead(running: &mut HashMap<String, RunningProcess>) {
 
 /// 停止指定 env×profile 的进程（每个停止按钮只结束特定进程）
 #[tauri::command]
-fn stop_dsh_cmd(state: State<AppState>, env_id: String, profile: String, profiles_dir_str: String) -> Result<(), String> {
+async fn stop_dsh_cmd(state: State<'_, AppState>, env_id: String, profile: String, profiles_dir_str: String) -> Result<(), String> {
     let key = run_key(&env_id, &profiles_dir_str, &profile);
     let mut running = state.running.lock().unwrap();
     let proc = running.remove(&key);
@@ -737,9 +850,42 @@ fn stop_dsh_cmd(state: State<AppState>, env_id: String, profile: String, profile
     }
 }
 
+/// 停止全部运行中的 DSH 进程（关闭软件前调用）。返回停止失败项（空 = 全部成功）。
+#[tauri::command]
+async fn stop_all_dsh_cmd(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    // 快照运行 key（锁不跨 await；MutexGuard 非 Send）
+    let keys: Vec<String> = {
+        let mut running = state.running.lock().unwrap();
+        prune_dead(&mut running);
+        running.keys().cloned().collect()
+    };
+    let mut failed: Vec<String> = Vec::new();
+    for key in keys {
+        let parts: Vec<&str> = key.splitn(3, "::").collect();
+        if parts.len() < 3 {
+            failed.push(format!("{key}: 运行记录格式异常"));
+            continue;
+        }
+        let k = key.clone();
+        // 锁只在该语句内临时持有（taskkill 是同步快操作，不跨 await）
+        let proc = {
+            let mut running = state.running.lock().unwrap();
+            running.remove(&k)
+        };
+        if let Some(p) = proc {
+            if runner::is_pid_alive(p.pid) {
+                if let Err(e) = runner::stop_dsh(p.pid) {
+                    failed.push(format!("{}: {e}", p.profile));
+                }
+            }
+        }
+    }
+    Ok(failed)
+}
+
 /// 查询指定 env×profile 的运行状态（自动清理已退出进程）
 #[tauri::command]
-fn dsh_status(state: State<AppState>, env_id: String, profile: String, profiles_dir_str: String) -> DshStatus {
+fn dsh_status(state: State<'_, AppState>, env_id: String, profile: String, profiles_dir_str: String) -> DshStatus {
     let mut running = state.running.lock().unwrap();
     prune_dead(&mut running);
     let proc = running.get(&run_key(&env_id, &profiles_dir_str, &profile)).cloned();
@@ -760,7 +906,7 @@ fn dsh_status(state: State<AppState>, env_id: String, profile: String, profiles_
 
 /// 列出全部运行中的 DSH 进程（跨环境跨 profile，自动清理已退出进程）
 #[tauri::command]
-fn list_running_cmd(state: State<AppState>) -> Vec<RunningProcess> {
+fn list_running_cmd(state: State<'_, AppState>) -> Vec<RunningProcess> {
     let mut running = state.running.lock().unwrap();
     prune_dead(&mut running);
     running.values().cloned().collect()
@@ -771,7 +917,8 @@ fn list_running_cmd(state: State<AppState>) -> Vec<RunningProcess> {
 /// 新建 profile
 #[tauri::command]
 fn create_profile_cmd(
-    state: State<AppState>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
     env_id: String,
     name: String,
     profiles_dir_str: String,
@@ -781,13 +928,16 @@ fn create_profile_cmd(
     if !profiles_dir.is_dir() {
         return Err(format!("profiles 目录不存在: {}", profiles_dir.display()));
     }
-    profile_io::create_profile(&profiles_dir, &name)
+    let result = profile_io::create_profile(&profiles_dir, &name)?;
+    // dsh 启动时会自行处理 bundles（dsh-base / dsh-web-app 由运行时解析），
+    // 无需预先 pnpm install；关键文件 pnpm-workspace.yaml 已在 create_profile 中写入。
+    Ok(result)
 }
 
 /// 删除 profile（running 时拒绝）
 #[tauri::command]
-fn delete_profile_cmd(
-    state: State<AppState>,
+async fn delete_profile_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     name: String,
     profiles_dir_str: String,
@@ -804,7 +954,11 @@ fn delete_profile_cmd(
         .unwrap()
         .values()
         .any(|p| p.profile == name);
-    profile_io::delete_profile(&profiles_dir, &name, running)
+    let pd = profiles_dir.clone();
+    let nm = name.clone();
+    tauri::async_runtime::spawn_blocking(move || profile_io::delete_profile(&pd, &nm, running))
+        .await
+        .map_err(|e| format!("删除任务失败：{e}"))?
 }
 
 // ==================== 命令：M5 设置 / DSH 多版本下载 ====================
@@ -875,7 +1029,9 @@ fn github_get_text(fetch_url: &str) -> (u16, String) {
 /// 检查更新（走 GitHub 镜像，大陆无 VPN 可用）：
 /// 1) 优先 GitHub releases/latest API；2) 回退仓库根 VERSION 文件（main / master）。
 #[tauri::command]
-fn check_update_cmd() -> Result<serde_json::Value, String> {
+async fn check_update_cmd() -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+
     let current = env!("CARGO_PKG_VERSION").to_string();
     let repo_url = format!("https://github.com/{PROJECT_REPO}");
     let mirror = settings::load_settings().github_mirror;
@@ -935,6 +1091,10 @@ fn check_update_cmd() -> Result<serde_json::Value, String> {
         "url": repo_url,
         "error": if err_hint.is_empty() { String::new() } else { format!("检查更新失败：{err_hint}（请检查网络或 GitHub 镜像设置）") },
     }))
+
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 更新安装包资产文件名（Tauri NSIS 默认产物名，仅作兜底猜测）
@@ -995,7 +1155,9 @@ fn find_setup_asset(version: &str) -> Result<(String, String), String> {
 /// release 资产命名固定：DSH Manager_{version}_x64-setup.exe
 /// 保存到 %USERPROFILE%\Downloads，下载完成后自动启动安装程序。
 #[tauri::command]
-fn download_update_cmd(version: String, app: tauri::AppHandle) -> Result<String, String> {
+async fn download_update_cmd(version: String, app: tauri::AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+
     use std::io::{Read, Write};
     use tauri::Emitter;
 
@@ -1073,6 +1235,10 @@ fn download_update_cmd(version: String, app: tauri::AppHandle) -> Result<String,
         serde_json::json!({ "done": true, "path": out_str }),
     );
     Ok(out_str)
+
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 启动已下载的安装程序，然后立即退出当前程序（让安装器能覆盖正在运行的 exe）。
@@ -1096,32 +1262,49 @@ fn launch_installer_and_exit_cmd(path: String, app: tauri::AppHandle) -> Result<
 
 /// 列出 DSH 全部版本
 #[tauri::command]
-fn list_dsh_versions_cmd() -> Result<Vec<dsh_install::DshVersionInfo>, String> {
+async fn list_dsh_versions_cmd() -> Result<Vec<dsh_install::DshVersionInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+
     let registry = settings::load_settings().npm_registry;
     dsh_install::list_dsh_versions(&registry)
+
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 下载并安装指定 DSH 版本到目标目录（流式日志）
 #[tauri::command]
-fn install_dsh_version_cmd(
+async fn install_dsh_version_cmd(
     app: tauri::AppHandle,
     version: String,
     target_dir: String,
 ) -> Result<dsh_install::DshInstallResult, String> {
-    if version.trim().is_empty() {
-        return Err("版本不能为空".to_string());
-    }
-    if target_dir.trim().is_empty() {
-        return Err("目标目录不能为空".to_string());
-    }
-    let registry = settings::load_settings().npm_registry;
-    Ok(dsh_install::install_dsh_version(&app, version.trim(), target_dir.trim(), &registry))
+    // 下载+安装较耗时且含 blocking 网络调用（工具链 ensure / npm install），
+    // 整体放到阻塞线程池执行，避免卡 UI / tokio blocking panic。
+    tauri::async_runtime::spawn_blocking(move || {
+        if version.trim().is_empty() {
+            return Err("版本不能为空".to_string());
+        }
+        if target_dir.trim().is_empty() {
+            return Err("目标目录不能为空".to_string());
+        }
+        let registry = settings::load_settings().npm_registry;
+        Ok(dsh_install::install_dsh_version(
+            &app,
+            version.trim(),
+            target_dir.trim(),
+            &registry,
+        ))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 确保 profile 的 .npmrc 使用当前镜像（安装插件前调用）
 #[tauri::command]
 fn ensure_profile_npmrc_cmd(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1139,8 +1322,8 @@ fn ensure_profile_npmrc_cmd(
 
 /// 依赖健康检查
 #[tauri::command]
-fn check_deps_cmd(
-    state: State<AppState>,
+async fn check_deps_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1152,9 +1335,9 @@ fn check_deps_cmd(
 
 /// 修复依赖：在 profile 目录执行 dsh plugin install（pnpm install，流式日志）
 #[tauri::command]
-fn fix_deps_cmd(
+async fn fix_deps_cmd(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1165,18 +1348,21 @@ fn fix_deps_cmd(
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
     let dsh_home = runner::dsh_home_of(&profiles_dir);
-    Ok(installer::run_dsh_with_logs(
-        &app,
-        &env,
-        &["plugin".to_string(), "--profile".to_string(), profile, "install".to_string()],
-        Some(&dsh_home),
-    ))
+    let app2 = app.clone();
+    let env2 = env.clone();
+    let args = ["plugin".to_string(), "--profile".to_string(), profile, "install".to_string()];
+    // pnpm install 子进程较久，放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(installer::run_dsh_with_logs(&app2, &env2, &args, Some(&dsh_home)))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
 /// 扫描 profile 内残留/缓存目录
 #[tauri::command]
-fn scan_junk_cmd(
-    state: State<AppState>,
+async fn scan_junk_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1191,8 +1377,8 @@ fn scan_junk_cmd(
 
 /// 清理残留目录
 #[tauri::command]
-fn clean_junk_cmd(
-    state: State<AppState>,
+async fn clean_junk_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1203,13 +1389,17 @@ fn clean_junk_cmd(
     if !profile_dir.is_dir() {
         return Err(format!("profile 不存在: {profile}"));
     }
-    health::clean_junk(&profile_dir, &names)
+    let pd = profile_dir.clone();
+    let ns = names.clone();
+    tauri::async_runtime::spawn_blocking(move || health::clean_junk(&pd, &ns))
+        .await
+        .map_err(|e| format!("清理任务失败：{e}"))?
 }
 
 /// 导出诊断包（配置文件 + 会话/存储摘要 + 各 profile 元数据）
 #[tauri::command]
-fn export_diag_cmd(
-    state: State<AppState>,
+async fn export_diag_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     target_path: String,
 ) -> Result<profile_io::ExportResult, String> {
@@ -1244,8 +1434,8 @@ fn profiles_dir_of(env: &DshEnv) -> std::path::PathBuf {
 
 /// 导出 profile 为 zip 压缩包
 #[tauri::command]
-fn export_profile_cmd(
-    state: State<AppState>,
+async fn export_profile_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1271,26 +1461,34 @@ fn export_profile_cmd(
         let _ = std::fs::create_dir_all(dir);
     }
     let excl = exclude_node_modules.unwrap_or(false);
-    profile_io::export_profile(&profile_dir, &target, excl)
+    // zip 打包放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || profile_io::export_profile(&profile_dir, &target, excl))
+        .await
+        .map_err(|e| format!("导出任务失败：{e}"))?
 }
 
 /// 导入 zip 到指定环境的 profiles 目录（重名自动改名）
 #[tauri::command]
-fn import_profile_cmd(
-    state: State<AppState>,
+async fn import_profile_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     zip_path: String,
     profiles_dir_str: String,
 ) -> Result<profile_io::ImportResult, String> {
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    profile_io::import_profile(std::path::Path::new(&zip_path), &profiles_dir)
+    // 解压放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        profile_io::import_profile(std::path::Path::new(&zip_path), &profiles_dir)
+    })
+    .await
+    .map_err(|e| format!("导入任务失败：{e}"))?
 }
 
 /// 获取 profile 的 node_modules 体积（导出前提示用）
 #[tauri::command]
-fn profile_node_modules_size(
-    state: State<AppState>,
+async fn profile_node_modules_size(
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1298,15 +1496,19 @@ fn profile_node_modules_size(
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
     let profile_dir = profiles_dir.join(&profile);
-    Ok(profile_io::node_modules_size(&profile_dir))
+    // node_modules 可能巨大，递归遍历放阻塞线程池
+    let p2 = profile_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || profile_io::node_modules_size(&p2))
+        .await
+        .map_err(|e| format!("统计失败：{e}"))
 }
 
 // ==================== 命令：整合包（DSH-PackForge） ====================
 
 /// 导出整合包：profile → .dspack v3
 #[tauri::command]
-fn export_pack_cmd(
-    state: State<AppState>,
+async fn export_pack_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1330,48 +1532,71 @@ fn export_pack_cmd(
     } else {
         std::path::PathBuf::from(target_path)
     };
-    packforge::export_pack(
-        &profile_dir,
-        &profiles_dir,
-        &target,
-        &name,
-        &pack_version,
-        &display_name,
-        &env.version,
-    )
+    let env_ver = env.version.clone();
+    // zip 打包放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        packforge::export_pack(
+            &profile_dir,
+            &profiles_dir,
+            &target,
+            &name,
+            &pack_version,
+            &display_name,
+            &env_ver,
+        )
+    })
+    .await
+    .map_err(|e| format!("导出任务失败：{e}"))?
 }
 
 /// 拉取整合包市场索引（dsh-pack-market index.json）
 #[tauri::command]
-fn market_packs_cmd() -> Result<Vec<packforge::MarketPackEntry>, String> {
+async fn market_packs_cmd() -> Result<Vec<packforge::MarketPackEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+
     packforge::read_market_index()
+
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 下载整合包到缓存目录并校验 sha256 + size
 #[tauri::command]
-fn download_pack_cmd(
+async fn download_pack_cmd(
     url: String,
     sha256: String,
     size: u64,
 ) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+
     let dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("dsh-plugin-manager")
         .join("packs");
     packforge::download_pack(&url, &sha256, size, &dir)
+
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 导入整合包（本地 .dspack 文件）到目标 profiles 目录
 #[tauri::command]
-fn import_pack_cmd(
-    state: State<AppState>,
+async fn import_pack_cmd(
+    state: State<'_, AppState>,
     env_id: String,
     pack_path: String,
     profiles_dir_str: String,
 ) -> Result<packforge::PackImportResult, String> {
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    packforge::import_pack(std::path::Path::new(&pack_path), &profiles_dir)
+    // 解压放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        packforge::import_pack(std::path::Path::new(&pack_path), &profiles_dir)
+    })
+    .await
+    .map_err(|e| format!("导入任务失败：{e}"))?
 }
 
 // ==================== 命令：profile 备注 ====================
@@ -1412,45 +1637,68 @@ fn timestamp_compact() -> String {
 
 /// 搜索 npm 包
 #[tauri::command]
-fn npm_search_cmd(query: String) -> Result<Vec<npm::NpmSearchHit>, String> {
+async fn npm_search_cmd(query: String) -> Result<Vec<npm::NpmSearchHit>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+
     let registry = settings::load_settings().npm_registry;
     npm::npm_search(&query, &registry)
+
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 获取包全部版本信息
 #[tauri::command]
-fn npm_package_info_cmd(name: String) -> Result<npm::NpmPackageInfo, String> {
+async fn npm_package_info_cmd(name: String) -> Result<npm::NpmPackageInfo, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+
     let registry = settings::load_settings().npm_registry;
     npm::npm_package_info(&name, &registry)
+
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 兼容性预检：指定插件版本 vs 运行时版本
 #[tauri::command]
-fn check_compat_cmd(
+async fn check_compat_cmd(
     name: String,
     version: String,
     runtime_version: String,
 ) -> Result<Vec<npm::PeerIssue>, String> {
-    let registry = settings::load_settings().npm_registry;
-    let info = npm::npm_package_info(&name, &registry)?;
-    let vinfo = info
-        .versions
-        .iter()
-        .find(|v| v.version == version)
-        .ok_or_else(|| format!("未找到版本 {version}"))?;
-    Ok(npm::check_peer_compat(&vinfo.peer_dependencies, &runtime_version))
+    // npm 包信息查询是 blocking 网络调用，放阻塞线程池，避免占 IPC 线程
+    tauri::async_runtime::spawn_blocking(move || {
+        let registry = settings::load_settings().npm_registry;
+        let info = npm::npm_package_info(&name, &registry)?;
+        let vinfo = info
+            .versions
+            .iter()
+            .find(|v| v.version == version)
+            .ok_or_else(|| format!("未找到版本 {version}"))?;
+        Ok(npm::check_peer_compat(&vinfo.peer_dependencies, &runtime_version))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 拉取插件市场目录
 #[tauri::command]
-fn market_catalog_cmd() -> Result<market::MarketCatalog, String> {
+async fn market_catalog_cmd() -> Result<market::MarketCatalog, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+
     market::market_catalog()
+
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 修复 pnpm 构建白名单（git 源插件安装需要）
 #[tauri::command]
 fn fix_build_permit_cmd(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1467,9 +1715,9 @@ fn fix_build_permit_cmd(
 
 /// 本地安装插件：文件夹（file:）或 .tgz 压缩包
 #[tauri::command]
-fn install_local_plugin_cmd(
+async fn install_local_plugin_cmd(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1485,7 +1733,14 @@ fn install_local_plugin_cmd(
     }
     let spec = local_plugin_spec(&path)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    Ok(installer::install_plugin(&app, &env, &profile, &spec, &profiles_dir))
+    let app2 = app.clone();
+    let env2 = env.clone();
+    // pnpm 子进程较久，放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(installer::install_plugin(&app2, &env2, &profile, &spec, &profiles_dir))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
 /// 由本地路径构造安装 spec：
@@ -1512,9 +1767,9 @@ fn local_plugin_spec(path: &str) -> Result<String, String> {
 
 /// 在线安装插件（流式日志）
 #[tauri::command]
-fn install_plugin_cmd(
+async fn install_plugin_cmd(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1525,14 +1780,21 @@ fn install_plugin_cmd(
         return Err("该环境未绑定 dsh 运行时，无法安装插件".to_string());
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    Ok(installer::install_plugin(&app, &env, &profile, &spec, &profiles_dir))
+    let app2 = app.clone();
+    let env2 = env.clone();
+    // pnpm 子进程较久，放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(installer::install_plugin(&app2, &env2, &profile, &spec, &profiles_dir))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
 /// 卸载插件
 #[tauri::command]
-fn remove_plugin_cmd(
+async fn remove_plugin_cmd(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1543,14 +1805,21 @@ fn remove_plugin_cmd(
         return Err("该环境未绑定 dsh 运行时，无法卸载插件".to_string());
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    Ok(installer::remove_plugin(&app, &env, &profile, &name, &profiles_dir))
+    let app2 = app.clone();
+    let env2 = env.clone();
+    // pnpm 子进程较久，放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(installer::remove_plugin(&app2, &env2, &profile, &name, &profiles_dir))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
 /// 豁免版本校验
 #[tauri::command]
 fn allow_version_cmd(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1568,7 +1837,7 @@ fn allow_version_cmd(
 #[tauri::command]
 fn disallow_version_cmd(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1601,7 +1870,7 @@ fn open_url_cmd(url: String) -> Result<(), String> {
 /// 避免启动早期抓不到 token 导致"连接中"。
 #[tauri::command]
 fn open_dsh_web_cmd(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1625,7 +1894,7 @@ fn open_dsh_web_cmd(
 /// 以选中 profile 的来源目录为基准：sessions/logs 位于其父目录（即注入的 DSH_HOME）。
 #[tauri::command]
 fn get_env_paths(
-    state: State<AppState>,
+    state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
@@ -1668,6 +1937,7 @@ pub fn run() {
             manual_envs: Mutex::new(manual_envs),
             scan_dirs: Mutex::new(scan_dirs),
             running: Mutex::new(HashMap::new()),
+            starting: Mutex::new(std::collections::HashSet::new()),
         })
         .invoke_handler(tauri::generate_handler![
             scan_envs,
@@ -1725,6 +1995,7 @@ pub fn run() {
             remove_plugin_cmd,
             allow_version_cmd,
             disallow_version_cmd,
+            stop_all_dsh_cmd,
         ])
         .setup(|app| {
             // 按物理像素设置窗口初始尺寸：避免高 DPI 缩放下逻辑尺寸被放大
@@ -1745,7 +2016,7 @@ mod tests {
     #[ignore]
     fn real_check_update_no_panic() {
         // 真实网络调用：走镜像失败时回退 VERSION 文件；无论仓库是否有 release，都不 panic、返回结构完整
-        let r = check_update_cmd();
+        let r = tauri::async_runtime::block_on(check_update_cmd());
         assert!(r.is_ok());
         let v = r.unwrap();
         assert!(v.get("current").is_some());
@@ -1757,14 +2028,58 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn real_list_dsh_versions_no_panic() {
+        // 真实拉取 npm 索引：验证 async + spawn_blocking 后不再 tokio panic、能正常返回版本列表
+        let r = tauri::async_runtime::block_on(list_dsh_versions_cmd());
+        assert!(r.is_ok(), "列表应返回成功: {r:?}");
+        let v = r.unwrap();
+        assert!(!v.is_empty(), "应能拿到版本列表");
+        println!("拿到的版本数: {}，最新: {:?}", v.len(), v.first().map(|x| x.version.clone()));
+    }
+
+    #[test]
+    fn stop_all_key_parse() {
+        // run_key = env_id::profiles_dir::profile，splitn(3) 后三段齐全
+        let key = "env1::C:/users/x/profiles::base";
+        let parts: Vec<&str> = key.splitn(3, "::").collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "env1");
+        assert_eq!(parts[1], "C:/users/x/profiles");
+        assert_eq!(parts[2], "base");
+        // profile 名含 :: 时第三段应保留剩余全部
+        let key2 = "e::p::a::b";
+        let parts2: Vec<&str> = key2.splitn(3, "::").collect();
+        assert_eq!(parts2[2], "a::b");
+    }
+
+    #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.0_x64-setup.exe", "0.3.0"));
-        assert!(asset_matches("dsh-manager_0.3.0_x64-setup.exe", "0.3.0"));
-        assert!(asset_matches("任意名_0.3.0_x64-setup.exe", "0.3.0"));
-        assert!(!asset_matches("DSH-Manager-0.3.0-win-x64.exe", "0.3.0"));
-        assert!(!asset_matches("DSH Manager_0.3.0_x64-setup.exe.sha256", "0.3.0"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.0"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.0"));
+        assert!(asset_matches("DSH Manager_0.3.5_x64-setup.exe", "0.3.5"));
+        assert!(asset_matches("dsh-manager_0.3.5_x64-setup.exe", "0.3.5"));
+        assert!(asset_matches("任意名_0.3.5_x64-setup.exe", "0.3.5"));
+        assert!(!asset_matches("DSH-Manager-0.3.5-win-x64.exe", "0.3.5"));
+        assert!(!asset_matches("DSH Manager_0.3.5_x64-setup.exe.sha256", "0.3.5"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.5"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.5"));
+    }
+
+    #[test]
+    fn ensure_profile_deps_writes_workspace() {
+        let tmp = std::env::temp_dir().join(format!("dshpm-ens-{}", uuid_like("ens")));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pdir = tmp.join("profiles");
+        std::fs::create_dir_all(pdir.join("x")).unwrap();
+        let r = ensure_profile_deps("x", &pdir);
+        assert!(r.is_ok());
+        let ws = pdir.join("x").join("pnpm-workspace.yaml");
+        assert!(ws.is_file());
+        let content = std::fs::read_to_string(&ws).unwrap();
+        assert!(content.contains("nodeLinker: hoisted"));
+        // 已存在时不重复写
+        let r2 = ensure_profile_deps("x", &pdir);
+        assert!(r2.is_ok());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -1864,7 +2179,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.0", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.5", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }
@@ -2020,6 +2335,7 @@ mod tests {
         }
         let scan_pd = r"C:\Users\xiaolei\.dsh-packs\better-deepseek-harness\profiles";
         let state = AppState {
+            starting: std::sync::Mutex::new(std::collections::HashSet::new()),
             manual_envs: std::sync::Mutex::new(Vec::new()),
             scan_dirs: std::sync::Mutex::new(vec![crate::models::ScanDirEntry {
                 id: "scan-test".into(),
