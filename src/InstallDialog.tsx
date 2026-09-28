@@ -303,6 +303,12 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
             ✕
           </button>
         </div>
+        {/* 安装目标：锁定为当前选中的 环境 × profile，明确展示版本与来源 */}
+        <div className="install-target">
+          <span className="tag bundle">目标 {env.name}（dsh {env.version}）</span>
+          <span className="tag">× {profile}</span>
+          <span className="install-target-src" title="该 profile 所在的 profiles 目录">{profilesDir}</span>
+        </div>
 
         {/* 标签页 */}
         <div className="tab-bar">
@@ -408,7 +414,7 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
                 onKeyDown={(e) => e.key === "Enter" && doInstall()}
               />
               <button className="btn primary" onClick={() => doInstall()} disabled={installing || !customSpec.trim()}>
-                {installing ? "执行中..." : "安装"}
+                {installing ? "执行中..." : `安装到 ${env.name} × ${profile}`}
               </button>
             </div>
             <div className="hit-meta dim-note">
@@ -443,7 +449,7 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
             )}
             <div className="row actions">
               <button className="btn primary" onClick={doInstallLocal} disabled={installing || !localPath}>
-                {installing ? "执行中..." : `安装到 ${profile}`}
+                {installing ? "执行中..." : `安装到 ${env.name} × ${profile}`}
               </button>
             </div>
           </>

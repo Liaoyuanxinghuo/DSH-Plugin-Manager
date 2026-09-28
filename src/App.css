@@ -97,10 +97,43 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .profile-buttons { display: flex; gap: 6px; margin-top: 6px; }
 .title-actions { display: flex; gap: 6px; }
 .check-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-dim); margin-bottom: 12px; cursor: pointer; }
+.modal label.check-row { display: flex; align-items: center; gap: 8px; color: var(--text-dim); margin-bottom: 12px; cursor: pointer; }
 .check-row input { accent-color: var(--accent); }
 .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; background: #2a3646; color: var(--text-dim); }
 .tag.bundle { background: #233d33; color: var(--accent); }
 .tag.off { background: #3a1d1d; color: #ffb3ad; }
+.tag.note { background: #27324a; color: #a8c6f0; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tag.hint { background: #3a3023; color: #e0b76e; }
+/* 导入对话框 */
+.import-choices { display: flex; flex-direction: column; gap: 12px; margin: 12px 0; }
+.choice-card { text-align: left; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-bg); cursor: pointer; transition: border-color .15s; }
+.choice-card:hover { border-color: var(--accent); }
+.choice-card:disabled { opacity: .5; cursor: default; }
+.choice-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: var(--text); }
+.choice-desc { font-size: 12px; color: var(--text-dim); }
+/* 整合包市场列表 */
+.pack-list { display: flex; flex-direction: column; gap: 10px; max-height: 420px; overflow: auto; margin: 12px 0; }
+.pack-item { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--panel-bg); }
+.pack-item-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pack-name { font-weight: 600; font-size: 13px; color: var(--text); }
+.pack-desc { font-size: 12px; color: var(--text-dim); margin: 6px 0; }
+.pack-meta { font-size: 11px; color: var(--text-dim); }
+.pack-actions { margin-top: 8px; }
+/* 导出类型分段控件 */
+.seg-row { display: flex; gap: 6px; margin-bottom: 12px; }
+.seg { flex: 1; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: transparent; color: var(--text-dim); font-size: 12px; cursor: pointer; }
+.seg.on { border-color: var(--accent); color: var(--accent); background: rgba(56, 132, 255, .08); }
+.pack-form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.field-row { display: flex; gap: 10px; }
+.field-row label { flex: 1; }
+.pack-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--text-dim); }
+.pack-form input { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--input-bg); color: var(--text); font-size: 13px; }
+.pack-form select { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--input-bg); color: var(--text); }
+/* profile 备注行 */
+.profile-notes { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.modal-head h3 { margin: 0; }
+
 
 /* 按钮 */
 .btn { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; font-size: 13px; cursor: pointer; transition: background 0.15s; white-space: nowrap; }
@@ -152,6 +185,11 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .switch-knob { position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #fff; transition: left 0.15s; }
 .switch.on .switch-knob { left: 18px; }
 
+/* 安装目标信息条 */
+.install-target { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 8px 12px; background: #12283f; border-bottom: 1px solid var(--border); font-size: 12px; }
+.install-target .tag { color: #9ec5fe; }
+.install-target-src { color: var(--text-dim); font-family: Consolas, monospace; word-break: break-all; margin-left: auto; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 /* 空态 */
 .empty { color: var(--text-dim); text-align: center; padding: 24px 12px; font-size: 13px; }
 
@@ -164,7 +202,12 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .scan-help-body code { font-family: Consolas, monospace; font-size: 11px; background: var(--bg); padding: 1px 4px; border-radius: 4px; }
 .modal-hint code { color: var(--accent); font-size: 11px; }
 .modal label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 10px; }
-.modal label input { display: block; width: 100%; margin-top: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 7px 9px; font-size: 13px; }
+.modal label input,
+.modal label textarea,
+.modal label select { display: block; width: 100%; margin-top: 4px; background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 7px 9px; font-size: 13px; }
+.modal label textarea { resize: vertical; font-family: inherit; line-height: 1.5; }
+.modal label select { cursor: pointer; }
+.modal label select option { background: var(--panel-2); color: var(--text); }
 .modal-err { color: #ffb3ad; font-size: 12px; margin-bottom: 10px; word-break: break-all; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
 

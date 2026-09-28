@@ -114,6 +114,8 @@ export interface StartResult {
 
 export interface EnvPaths {
   homeDir: string;
+  /** 当前选中 profile 的目录（不存在时为 null） */
+  profileDir: string | null;
   profilesDir: string;
   sessionsDir: string;
   logsDir: string;
@@ -208,3 +210,54 @@ export interface MarketCatalog {
   categories: string[];
   plugins: MarketPlugin[];
 }
+
+// ===== 整合包（DSH-PackForge .dspack v3 / manifest v5） =====
+export interface PackMarketEntry {
+  name: string;
+  version: string;
+  displayName: string;
+  description: string;
+  author: string;
+  category: string;
+  dshVersion: string;
+  profileName: string;
+  downloadUrl: string;
+  sha256: string;
+  size: number;
+  updatedAt: string;
+  id: string;
+  owner: string;
+  repo: string;
+  bundleCount: number;
+  depCount: number;
+  profileCount: number;
+  manifestVersion: number;
+  packType: string;
+}
+
+export interface PackExportResult {
+  fileCount: number;
+  zipSize: number;
+  sha256: string;
+  targetPath: string;
+}
+
+export interface PackImportResult {
+  packName: string;
+  packVersion: string;
+  packType: string;
+  /** 落盘的 profile 名（profile 形态 1 个，dshhome 形态多个） */
+  finalNames: string[];
+  renamed: boolean;
+  /** 写入 $DSH_HOME 的文件数 */
+  homeWritten: number;
+  backupDir: string;
+  targetPath: string;
+}
+
+export interface ProfileNote {
+  note: string;
+  hintVersion: string;
+}
+
+export type ProfileNotesMap = Record<string, ProfileNote>;

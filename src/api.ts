@@ -2,6 +2,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   DshEnv,
+  PackExportResult,
+  PackImportResult,
+  PackMarketEntry,
+  ProfileNotesMap,
   DshStatus,
   EnvPaths,
   ExportResult,
@@ -85,7 +89,8 @@ export const api = {
   /** 打开 DSH web 界面：后端实时从日志提取带 token 的地址 */
   openDshWeb: (envId: string, profile: string, profilesDir: string) =>
     invoke<void>("open_dsh_web_cmd", { envId, profile, profilesDirStr: profilesDir }),
-  getEnvPaths: (envId: string) => invoke<EnvPaths>("get_env_paths", { envId }),
+  getEnvPaths: (envId: string, profile: string, profilesDir: string) =>
+    invoke<EnvPaths>("get_env_paths", { envId, profile, profilesDirStr: profilesDir }),
   // profile 导出/导入
   exportProfile: (
     envId: string,
@@ -120,6 +125,25 @@ export const api = {
     invoke<DshInstallResult>("install_dsh_version_cmd", { version, targetDir }),
   profileNodeModulesSize: (envId: string, profile: string, profilesDir: string) =>
     invoke<number>("profile_node_modules_size", { envId, profile, profilesDirStr: profilesDir }),
+  // 整合包（DSH-PackForge）
+  exportPack: (
+    envId: string,
+    profile: string,
+    profilesDir: string,
+    targetPath: string,
+    packName: string,
+    packVersion: string,
+    displayName: string,
+  ) => invoke<PackExportResult>("export_pack_cmd", { envId, profile, profilesDirStr: profilesDir, targetPath, packName, packVersion, displayName }),
+  marketPacks: () => invoke<PackMarketEntry[]>("market_packs_cmd"),
+  downloadPack: (url: string, sha256: string, size: number) =>
+    invoke<string>("download_pack_cmd", { url, sha256, size }),
+  importPack: (envId: string, packPath: string, profilesDir: string) =>
+    invoke<PackImportResult>("import_pack_cmd", { envId, packPath, profilesDirStr: profilesDir }),
+  // profile 备注
+  getProfileNotes: () => invoke<ProfileNotesMap>("get_profile_notes_cmd"),
+  saveProfileNote: (profile: string, profilesDir: string, note: string, hintVersion: string) =>
+    invoke<void>("save_profile_note_cmd", { profile, profilesDirStr: profilesDir, note, hintVersion }),
 };
 
 /** 打开保存对话框，返回用户选择的路径（取消返回 null） */
@@ -163,6 +187,29 @@ export async function pickTgzFile(): Promise<string | null> {
     ],
   });
   return typeof path === "string" ? path : null;
+}
+
+/** 打开文件选择对话框选 .dspack 整合包 */
+export async function pickDspackFile(): Promise<string | null> {
+  const path = await openDialog({
+    title: "选择整合包（.dspack）",
+    multiple: false,
+    filters: [
+      { name: "整合包", extensions: ["dspack"] },
+      { name: "所有文件", extensions: ["*"] },
+    ],
+  });
+  return typeof path === "string" ? path : null;
+}
+
+/** 打开保存对话框选 .dspack 整合包位置 */
+export async function pickSavePackPath(defaultName: string): Promise<string | null> {
+  const path = await saveDialog({
+    title: "导出整合包",
+    defaultPath: defaultName,
+    filters: [{ name: "整合包", extensions: ["dspack"] }],
+  });
+  return path ?? null;
 }
 
 /** 格式化文件大小 */

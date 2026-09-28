@@ -86,6 +86,7 @@ function mockAll() {
       case "get_env_paths":
         return Promise.resolve({
           homeDir: "C:\\Users\\test\\.dsh",
+          profileDir: "C:\\Users\\test\\.dsh\\profiles\\web",
           profilesDir: "C:\\Users\\test\\.dsh\\profiles",
           sessionsDir: "C:\\Users\\test\\.dsh\\sessions",
           logsDir: "C:\\Users\\test\\.dsh\\logs",
@@ -166,6 +167,19 @@ describe("App 主界面", () => {
     await waitFor(() => {
       expect(screen.getByText(/已安装插件/)).toBeInTheDocument();
       expect(screen.getByText("@michengai/dsh-codex-ui")).toBeInTheDocument();
+    });
+  });
+
+  it("文件系统快捷入口显示「当前 Profile 目录」并点击调用 open_path", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    // 按钮文本带 📂 前缀 → 用正则匹配
+    await waitFor(() => {
+      expect(screen.getByText(/当前 Profile 目录/)).toBeInTheDocument();
+    });
+    await user.click(screen.getByText(/当前 Profile 目录/));
+    expect(mockInvoke).toHaveBeenCalledWith("open_path", {
+      path: "C:\\Users\\test\\.dsh\\profiles\\web",
     });
   });
 
@@ -265,6 +279,35 @@ describe("App 主界面", () => {
       profile: "web",
       profilesDirStr: "C:\\Users\\test\\.dsh\\profiles",
     });
+  });
+
+  it("安装插件对话框明确展示目标：当前环境版本 × profile 及来源目录", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_all_profiles") {
+        return Promise.resolve([
+          { name: "web", profilesDir: "C:\\Users\\test\\.dsh\\profiles", path: "C:\\Users\\test\\.dsh\\profiles\\web", pluginCount: 1, dataSize: 0, modified: "", hasPatch: false, hasLock: false, hasPackage: true },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/当前 Profile 目录/)).toBeInTheDocument();
+    });
+    // 插件列表卡片的安装按钮（注意排除"已安装插件（N）"标题，用精确按钮文本）
+    const installBtn = screen.getByText("＋安装插件");
+    await user.click(installBtn);
+    // env.name 含半角括号（如 "全局 CLI (dsh 0.1.0-rc.7)"），目标条追加全角括号版本信息
+    await waitFor(() => {
+      expect(screen.getByText(/目标 全局 CLI/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/× web/)).toBeInTheDocument();
+    expect(screen.getByText(/dsh 0.1.0-rc.7）/)).toBeInTheDocument();
+    // 切到"本地导入" tab，安装按钮明确标注目标组合
+    await user.click(screen.getByText("本地导入"));
+    expect(screen.getByText(/安装到 全局 CLI.* × web/)).toBeInTheDocument();
   });
 
   it("记住的 profile 不在当前合并列表时静默跳过插件加载，不报不存在", async () => {
@@ -845,6 +888,59 @@ describe("拖拽排序与箭头", () => {
 });
 
 
+describe("整合包导入导出与备注", () => {
+  it("导入按钮打开导入对话框：提供完整 zip 与整合包两个选项", async () => {
+    render(<App />);
+    // 等环境加载完成（selectedEnv 就绪，否则导入按钮 disabled 点击无效）
+    await waitFor(() => {
+      expect(screen.getByText(/全局 CLI/)).toBeInTheDocument();
+    });
+    const user = userEvent.setup();
+    await user.click(screen.getByText("⬇导入"));
+    // 选项卡片文本带 emoji 前缀，用正则匹配
+    expect(screen.getByText(/完整 profile zip/)).toBeInTheDocument();
+    expect(screen.getByText(/整合包（.dspack）/)).toBeInTheDocument();
+  });
+
+  it("导出弹窗提供整合包类型：填包名后出现导出整合包按钮", async () => {
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("⬆ 导出").length).toBeGreaterThan(0);
+    });
+    const user = userEvent.setup();
+    await user.click(screen.getAllByText("⬆ 导出")[0]);
+    expect(screen.getByText("完整 profile zip")).toBeInTheDocument();
+    await user.click(screen.getByText("整合包（.dspack）"));
+    expect(screen.getByText("选择位置并导出整合包")).toBeInTheDocument();
+    // 包名默认取 profile 名
+    const nameInput = screen.getByPlaceholderText("如 my-pack") as HTMLInputElement;
+    expect(nameInput.value).toBeTruthy();
+  });
+
+  it("右键 profile 打开备注弹窗，保存调用 save_profile_note_cmd", async () => {
+    mockInvoke.mockClear();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("web")).toBeInTheDocument();
+    });
+    const item = document.querySelector(".profile-item") as HTMLElement;
+    fireEvent.contextMenu(item);
+    expect(screen.getByText(/备注「web」/)).toBeInTheDocument();
+    const user = userEvent.setup();
+    await user.type(screen.getByPlaceholderText(/此 profile 用于/), "测试备注");
+    await user.selectOptions(screen.getByRole("combobox"), "0.1.0-rc.7");
+    await user.click(screen.getByText("保存备注"));
+    await waitFor(() => {
+      expect(
+        mockInvoke.mock.calls.some((c) => {
+          const args = c[1] as Record<string, unknown>;
+          return c[0] === "save_profile_note_cmd" && String(args.note).includes("测试备注") && args.hintVersion === "0.1.0-rc.7";
+        }),
+      ).toBe(true);
+    });
+  });
+});
+
 function mockAllDefault(cmd: string) {
   switch (cmd) {    case "scan_envs":
       return Promise.resolve([
@@ -897,6 +993,7 @@ function mockAllDefault(cmd: string) {
     case "get_env_paths":
       return Promise.resolve({
         homeDir: "C:\\Users\\test\\.dsh",
+        profileDir: "C:\\Users\\test\\.dsh\\profiles\\web",
         profilesDir: "C:\\Users\\test\\.dsh\\profiles",
         sessionsDir: "C:\\Users\\test\\.dsh\\sessions",
         logsDir: "C:\\Users\\test\\.dsh\\logs",

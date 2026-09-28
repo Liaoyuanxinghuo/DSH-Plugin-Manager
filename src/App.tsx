@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
-import { api, formatSize, pickFolder, pickSaveZipPath, pickZipFile } from "./api";
+import { api, formatSize, pickDspackFile, pickFolder, pickSavePackPath, pickSaveZipPath, pickZipFile } from "./api";
+import { listen } from "@tauri-apps/api/event";
 import { applyStoredOrder, moveItem, readStoredOrder } from "./reorder";
 import InstallDialog from "./InstallDialog";
 import type {
@@ -7,10 +8,15 @@ import type {
   EnvPaths,
   DepIssue,
   JunkEntry,
+  InstallDone,
   InstallLogLine,
+  PackMarketEntry,
+  PackImportResult,
   PluginInfo,
   PluginUpdate,
   ProfileInfo,
+  ProfileNote,
+  ProfileNotesMap,
   RunningProcess,
   DshVersionInfo,
   DshInstallResult,
@@ -116,7 +122,11 @@ export default function App() {
   const [info, setInfo] = useState<string>("");
   // 导出/导入状态
   const [exportTarget, setExportTarget] = useState<{ profile: string; profilesDir: string; nmSize: number } | null>(null);
-  const [importing, setImporting] = useState(false);
+  // 整合包导入对话框
+  const [showImportDialog, setShowImportDialog] = useState(false);
+  // profile 备注
+  const [notes, setNotes] = useState<ProfileNotesMap>({});
+  const [noteTarget, setNoteTarget] = useState<{ profile: string; profilesDir: string } | null>(null);
   // 在线安装对话框
   const [showInstall, setShowInstall] = useState(false);
   const [installTab, setInstallTab] = useState<"market" | "search" | "custom" | "local">("market");
@@ -142,6 +152,14 @@ export default function App() {
   // M5 设置 / DSH 下载
   const [showSettings, setShowSettings] = useState(false);
   const [showDshDownload, setShowDshDownload] = useState(false);
+
+  // 加载 profile 备注（仅提示，无任何约束）
+  useEffect(() => {
+    api
+      .getProfileNotes()
+      .then((m) => setNotes(m ?? {}))
+      .catch(() => {});
+  }, []);
 
   // 记住上次选择（环境 / profile / 端口）
   useEffect(() => {
@@ -221,11 +239,15 @@ export default function App() {
     setUpdates(null);
   }, [selectedEnv, selectedProfile, profiles]);
 
-  // 加载路径
+  // 加载路径（随环境 × profile 变化：文件入口对准当前选中的 profile 目录）
   useEffect(() => {
     if (!selectedEnv) return;
-    api.getEnvPaths(selectedEnv).then(setPaths).catch(() => {});
-  }, [selectedEnv]);
+    const pdir = profiles.find((x) => x.name === selectedProfile)?.profilesDir ?? "";
+    api
+      .getEnvPaths(selectedEnv, selectedProfile, pdir)
+      .then(setPaths)
+      .catch(() => {});
+  }, [selectedEnv, selectedProfile, profiles]);
 
   // 运行实例轮询（全局，跨环境跨 profile，3s 一次：进程退出后按钮/状态快速自动纠正）
   useEffect(() => {
@@ -465,30 +487,55 @@ export default function App() {
     }
   };
 
-  // 导入 profile：选 zip → 导入 → 刷新列表
+  // 导入 profile：打开导入对话框（完整 zip / 整合包）
   const handleImport = async () => {
     if (!selectedEnv) return;
-    setImporting(true);
+    setShowImportDialog(true);
+  };
+
+  // 导入完成后刷新 profile 列表
+  const refreshAfterImport = (finalNames: string[]) => {
+    return api.listAllProfiles()
+      .then((ps) => {
+        setProfiles(ps);
+        if (finalNames.length > 0) {
+          setSelectedProfile(finalNames[0]);
+          setSelectedProfilesDir("");
+        }
+      })
+      .catch(() => {});
+  };
+
+  // 导出整合包：.dspack v3（DSH-PackForge 规范）
+  const doExportPack = async (packName: string, packVersion: string, displayName: string) => {
+    if (!selectedEnv || !exportTarget) return;
+    setBusy(true);
     setError("");
     setInfo("");
     try {
-      const path = await pickZipFile();
-      if (!path) return;
-      const r = await api.importProfile(selectedEnv, path, "");
-      setInfo(
-        r.renamed
-          ? `导入成功：原 "${r.profileName}" 与现有重名，已改名为 "${r.finalName}"（${r.pluginCount} 个插件）`
-          : `导入成功：${r.finalName}（${r.pluginCount} 个插件）`,
+      const name = packName.trim() || exportTarget.profile;
+      const version = packVersion.trim() || "1.0.0";
+      const defaultName = `${name}-${version}.dspack`;
+      const path = await pickSavePackPath(defaultName);
+      if (!path) return; // 用户取消
+      const r = await api.exportPack(
+        selectedEnv,
+        exportTarget.profile,
+        exportTarget.profilesDir,
+        path,
+        name,
+        version,
+        displayName,
       );
-      // 刷新 profile 列表
-      const ps = await api.listAllProfiles().catch(() => []);
-      setProfiles(ps);
-      setSelectedProfile(r.finalName);
-      setSelectedProfilesDir("");
+      setInfo(
+        `整合包导出成功：${r.fileCount} 个文件，${formatSize(r.zipSize)}，SHA-256 ${r.sha256.slice(0, 12)}…`,
+      );
+      api.openPath(path).catch(() => {});
     } catch (e) {
       setError(String(e));
     } finally {
-      setImporting(false);
+      setBusy(false);
+      setExportTarget(null);
     }
   };
 
@@ -693,6 +740,7 @@ export default function App() {
 
   const fileButtons = paths
     ? [
+        ...(paths.profileDir ? [{ label: "当前 Profile 目录", path: paths.profileDir }] : []),
         { label: "DSH_HOME", path: paths.homeDir },
         { label: "Profiles 目录", path: paths.profilesDir },
         { label: "日志目录", path: paths.logsDir },
@@ -802,8 +850,8 @@ export default function App() {
               <button className="btn tiny" onClick={handleAddScanDir} disabled={busy} title="扫描本地 DSH_HOME 或 profiles 目录">
                 ＋扫Profile
               </button>
-              <button className="btn tiny" onClick={handleImport} disabled={importing || !selectedEnv}>
-                {importing ? "导入中..." : "⬇导入"}
+              <button className="btn tiny" onClick={handleImport} disabled={!selectedEnv}>
+                ⬇导入
               </button>
               <button className="help-btn" onClick={() => setHelpTopic("profiles")} title="Profiles 使用说明">?</button>
             </div>
@@ -819,8 +867,23 @@ export default function App() {
                   setSelectedProfile(p.name);
                   setSelectedProfilesDir(p.profilesDir);
                 }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setNoteTarget({ profile: p.name, profilesDir: p.profilesDir });
+                }}
+                title="右键可添加备注"
               >
                 <div className="profile-name"><span className="drag-handle" title="拖动排序">☰</span>{p.name}</div>
+                {(() => {
+                  const n = notes?.[`${p.name}::${p.profilesDir}`];
+                  if (!n || (!n.note && !n.hintVersion)) return null;
+                  return (
+                    <div className="profile-notes">
+                      {n.note && <span className="tag note">📝 {n.note}</span>}
+                      {n.hintVersion && <span className="tag hint">适配 {n.hintVersion}</span>}
+                    </div>
+                  );
+                })()}
                 <div className="profile-meta">
                   {p.pluginCount} 插件 · {formatSize(p.dataSize)}
                 </div>
@@ -1376,44 +1439,127 @@ export default function App() {
                 : ""}
             </p>
             <ExportOptions
+              profile={exportTarget.profile}
               nmSize={exportTarget.nmSize}
-              onConfirm={(exclude) => doExport(exclude)}
+              onConfirmZip={(exclude) => doExport(exclude)}
+              onConfirmPack={(name, version, displayName) => doExportPack(name, version, displayName)}
               onCancel={() => setExportTarget(null)}
               busy={busy}
             />
           </div>
         </div>
       )}
+
+      {/* 导入对话框（完整 zip / 整合包） */}
+      {showImportDialog && selectedEnv && (
+        <ImportDialog
+          envId={selectedEnv}
+          envName={envs.find((e) => e.id === selectedEnv)?.name ?? ""}
+          profilesDir={selectedProfilesDir}
+          onClose={() => setShowImportDialog(false)}
+          onImported={refreshAfterImport}
+          setGlobalError={(m) => setError(m)}
+          setGlobalInfo={(m) => setInfo(m)}
+        />
+      )}
+
+      {/* 备注对话框（右键 profile） */}
+      {noteTarget && (
+        <NoteDialog
+          profile={noteTarget.profile}
+          profilesDir={noteTarget.profilesDir}
+          versions={Array.from(new Set(envs.map((e) => e.version).filter((v) => v && v !== "—")))}
+          initial={notes?.[`${noteTarget.profile}::${noteTarget.profilesDir}`]}
+          onClose={() => setNoteTarget(null)}
+          onSaved={(note) => {
+            setNotes((prev) => {
+              const key = `${noteTarget.profile}::${noteTarget.profilesDir}`;
+              const next = { ...prev };
+              if (!note.note.trim() && !note.hintVersion.trim()) {
+                delete next[key];
+              } else {
+                next[key] = note;
+              }
+              return next;
+            });
+            setNoteTarget(null);
+          }}
+        />
+      )}
     </div>
   );
 }
 
-/** 导出选项（是否排除 node_modules） */
+/** 导出选项：完整 zip / 整合包 .dspack */
 function ExportOptions({
+  profile,
   nmSize,
-  onConfirm,
+  onConfirmZip,
+  onConfirmPack,
   onCancel,
   busy,
 }: {
+  profile: string;
   nmSize: number;
-  onConfirm: (exclude: boolean) => void;
+  onConfirmZip: (exclude: boolean) => void;
+  onConfirmPack: (name: string, version: string, displayName: string) => void;
   onCancel: () => void;
   busy: boolean;
 }) {
+  const [mode, setMode] = useState<"zip" | "pack">("zip");
   const [exclude, setExclude] = useState(nmSize > 20 * 1024 * 1024);
+  const [packName, setPackName] = useState(profile);
+  const [packVersion, setPackVersion] = useState("1.0.0");
+  const [displayName, setDisplayName] = useState("");
   return (
     <div>
-      <label className="check-row">
-        <input type="checkbox" checked={exclude} onChange={(e) => setExclude(e.target.checked)} />
-        排除 node_modules（压缩包更小；导入后可重建依赖）
-      </label>
+      <div className="seg-row">
+        <button className={`seg ${mode === "zip" ? "on" : ""}`} onClick={() => setMode("zip")} disabled={busy}>
+          完整 profile zip
+        </button>
+        <button className={`seg ${mode === "pack" ? "on" : ""}`} onClick={() => setMode("pack")} disabled={busy}>
+          整合包（.dspack）
+        </button>
+      </div>
+      {mode === "zip" ? (
+        <label className="check-row">
+          <input type="checkbox" checked={exclude} onChange={(e) => setExclude(e.target.checked)} />
+          排除 node_modules（压缩包更小；导入后可重建依赖）
+        </label>
+      ) : (
+        <div className="pack-form">
+          <div className="field-row">
+            <label>
+              包名（小写 slug）
+              <input value={packName} onChange={(e) => setPackName(e.target.value)} placeholder="如 my-pack" />
+            </label>
+            <label>
+              版本
+              <input value={packVersion} onChange={(e) => setPackVersion(e.target.value)} placeholder="1.0.0" />
+            </label>
+          </div>
+          <label>
+            显示名（可选）
+            <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="我的整合包" />
+          </label>
+          <p className="modal-hint">
+            按 DSH-PackForge 规范导出 .dspack v3（含 manifest v5；自动排除 node_modules / 运行数据 / 凭据）。
+          </p>
+        </div>
+      )}
       <div className="modal-actions">
         <button className="btn" onClick={onCancel} disabled={busy}>
           取消
         </button>
-        <button className="btn primary" onClick={() => onConfirm(exclude)} disabled={busy}>
-          {busy ? "导出中..." : "选择位置并导出"}
-        </button>
+        {mode === "zip" ? (
+          <button className="btn primary" onClick={() => onConfirmZip(exclude)} disabled={busy}>
+            {busy ? "导出中..." : "选择位置并导出"}
+          </button>
+        ) : (
+          <button className="btn primary" onClick={() => onConfirmPack(packName, packVersion, displayName)} disabled={busy}>
+            {busy ? "导出中..." : "选择位置并导出整合包"}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1670,6 +1816,323 @@ function DshDownloadDialog({ onClose, onInstalled }: { onClose: () => void; onIn
             </div>
           </>
         )}
+      </div>
+    </div>
+  );
+}
+
+
+// ==================== 导入对话框（完整 zip / 整合包） ====================
+function ImportDialog({
+  envId,
+  envName,
+  profilesDir,
+  onClose,
+  onImported,
+  setGlobalError,
+  setGlobalInfo,
+}: {
+  envId: string;
+  envName: string;
+  profilesDir: string;
+  onClose: () => void;
+  onImported: (finalNames: string[]) => void;
+  setGlobalError: (m: string) => void;
+  setGlobalInfo: (m: string) => void;
+}) {
+  const [step, setStep] = useState<"choose" | "pack-source" | "pack-online" | "busy">("choose");
+  const [marketPacks, setMarketPacks] = useState<PackMarketEntry[] | null>(null);
+  const [marketErr, setMarketErr] = useState("");
+  const [loadingMarket, setLoadingMarket] = useState(false);
+  const [logs, setLogs] = useState<InstallLogLine[]>([]);
+  const [installing, setInstalling] = useState(false);
+  const [done, setDone] = useState<{ success: boolean; summary: string } | null>(null);
+  const unsubsRef = useRef<Array<() => void>>([]);
+
+  // 监听依赖重建日志（dsh plugin install 流式输出）
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const unLog = await listen<InstallLogLine>("install-log", (e) => {
+        if (alive) setLogs((prev) => [...prev.slice(-400), e.payload]);
+      });
+      const unDone = await listen<InstallDone>("install-done", (e) => {
+        if (!alive) return;
+        if (e.payload.success) {
+          setLogs((prev) => [...prev, { line: "✅ 依赖重建完成", kind: "stdout" }]);
+        } else {
+          setLogs((prev) => [...prev, { line: "❌ 依赖重建失败（可稍后在插件管理中「修复依赖」重试）", kind: "stderr" }]);
+        }
+      });
+      if (alive) unsubsRef.current = [unLog, unDone];
+    })();
+    return () => {
+      alive = false;
+      unsubsRef.current.forEach((u) => u());
+      unsubsRef.current = [];
+    };
+  }, []);
+
+  const close = () => {
+    if (installing) return;
+    setDone(null);
+    setLogs([]);
+    onClose();
+  };
+
+  const finish = async (result: PackImportResult) => {
+    setGlobalInfo(
+      `整合包导入成功：${result.finalNames.join("、")}${result.renamed ? "（重名已自动改名）" : ""}${result.homeWritten ? `，写入全局文件 ${result.homeWritten} 个` : ""}`,
+    );
+    onImported(result.finalNames);
+    close();
+  };
+
+  // 导入整合包 + 逐个重建依赖（日志展示）
+  const importAndInstall = async (packPath: string) => {
+    if (installing) return;
+    setInstalling(true);
+    setLogs([]);
+    setDone(null);
+    setGlobalError("");
+    setStep("busy");
+    try {
+      const r = await api.importPack(envId, packPath, profilesDir);
+      setLogs((prev) => [...prev, { line: `已落盘：${r.finalNames.join("、")}，开始重建依赖…`, kind: "stdout" }]);
+      for (const name of r.finalNames) {
+        setLogs((prev) => [...prev, { line: `── 重建 ${name} 依赖（dsh plugin install）`, kind: "stdout" }]);
+        const out = await api.fixDeps(envId, name, profilesDir);
+        if (!out.success) {
+          setDone({ success: false, summary: `依赖重建失败（${name}）：${out.summary}` });
+          setInstalling(false);
+          return;
+        }
+      }
+      await finish(r);
+    } catch (e) {
+      setGlobalError(String(e));
+      setInstalling(false);
+    }
+  };
+
+  // 在线市场列表
+  const loadMarket = async () => {
+    if (loadingMarket) return;
+    setLoadingMarket(true);
+    setMarketErr("");
+    try {
+      const list = await api.marketPacks();
+      setMarketPacks(list);
+      setStep("pack-online");
+    } catch (e) {
+      setMarketErr(String(e));
+    } finally {
+      setLoadingMarket(false);
+    }
+  };
+
+  return (
+    <div className="modal-mask" onClick={close}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 620 }}>
+        <div className="modal-head">
+          <h3>导入 Profile（目标：{envName}）</h3>
+          <button className="btn tiny" onClick={close} disabled={installing}>✕</button>
+        </div>
+        <p className="modal-hint">导入到 profiles 目录：{profilesDir || "（当前环境默认）"}；重名自动改名。</p>
+
+        {step === "choose" && (
+          <div className="import-choices">
+            <button className="choice-card" onClick={async () => {
+              const path = await pickZipFile();
+              if (!path) return;
+              setInstalling(true);
+              try {
+                const r = await api.importProfile(envId, path, profilesDir);
+                setGlobalInfo(
+                  r.renamed
+                    ? `导入成功：原 "${r.profileName}" 与现有重名，已改名为 "${r.finalName}"（${r.pluginCount} 个插件）`
+                    : `导入成功：${r.finalName}（${r.pluginCount} 个插件）`,
+                );
+                onImported([r.finalName]);
+                setInstalling(false);
+                close();
+              } catch (e) {
+                setGlobalError(String(e));
+                setInstalling(false);
+              }
+            }} disabled={installing}>
+              <div className="choice-title">🗜 完整 profile zip</div>
+              <div className="choice-desc">整目录打包（含数据），原样恢复；兼容旧版备份。</div>
+            </button>
+            <button className="choice-card" onClick={() => setStep("pack-source")} disabled={installing}>
+              <div className="choice-title">📦 整合包（.dspack）</div>
+              <div className="choice-desc">DSH-PackForge 规范：配置 + 插件 + patch，导入后自动重建依赖。</div>
+            </button>
+          </div>
+        )}
+
+        {step === "pack-source" && (
+          <div className="import-choices">
+            <button className="choice-card" onClick={loadMarket} disabled={loadingMarket || installing}>
+              <div className="choice-title">🌐 在线下载整合包</div>
+              <div className="choice-desc">浏览 dsh-pack-market 整合包市场，下载并校验 SHA-256 后导入。</div>
+              {loadingMarket && <div className="dim">加载市场…</div>}
+            </button>
+            <button className="choice-card" onClick={async () => {
+              const path = await pickDspackFile();
+              if (!path) return;
+              importAndInstall(path);
+            }} disabled={installing}>
+              <div className="choice-title">💾 本地导入整合包</div>
+              <div className="choice-desc">选择本地 .dspack 文件（他人分享 / 已下载的整合包）。</div>
+            </button>
+            {marketErr && <div className="error">{marketErr}</div>}
+          </div>
+        )}
+
+        {step === "pack-online" && (
+          <div>
+            {marketErr && <div className="error">{marketErr}</div>}
+            {marketPacks && marketPacks.length === 0 && <div className="empty">市场暂无整合包</div>}
+            <div className="pack-list">
+              {marketPacks?.map((mp) => (
+                <div key={mp.id} className="pack-item">
+                  <div className="pack-item-head">
+                    <span className="pack-name">{mp.displayName || mp.name}</span>
+                    <span className="tag">v{mp.version}</span>
+                    {mp.packType === "dshhome" && <span className="tag">多 profile</span>}
+                    {mp.dshVersion && <span className="tag">dsh {mp.dshVersion}</span>}
+                  </div>
+                  <div className="pack-desc">
+                    {mp.description || "（无描述）"}
+                    {mp.author && <span className="dim"> — {mp.author}</span>}
+                  </div>
+                  <div className="pack-meta">
+                    {mp.bundleCount > 0 && `${mp.bundleCount} bundle`}
+                    {mp.depCount > 0 && ` · ${mp.depCount} 依赖`}
+                    {mp.updatedAt && ` · 更新于 ${mp.updatedAt}`}
+                    {mp.sha256 ? ` · ${formatSize(mp.size)}` : " · 无哈希（跳过校验）"}
+                  </div>
+                  <div className="pack-actions">
+                    <button
+                      className="btn tiny primary"
+                      disabled={installing}
+                      onClick={async () => {
+                        try {
+                          const local = await api.downloadPack(mp.downloadUrl, mp.sha256, mp.size);
+                          await importAndInstall(local);
+                        } catch (e) {
+                          setGlobalError(String(e));
+                        }
+                      }}
+                    >
+                      下载并导入
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {step === "busy" && (
+          <div>
+            <p className="modal-hint">正在导入并重建依赖（pnpm install），请稍候…</p>
+            {logs.length > 0 && (
+              <div className="log-box" style={{ maxHeight: 220 }}>
+                {logs.map((l, i) => (
+                  <div key={i} className={`log-line ${l.kind === "stderr" ? "log-err" : ""}`}>{l.line}</div>
+                ))}
+              </div>
+            )}
+            {done && (
+              <div className={done.success ? "info" : "error"}>{done.success ? `✅ ${done.summary}` : `❌ ${done.summary}`}</div>
+            )}
+          </div>
+        )}
+
+        {step !== "busy" && !installing && (
+          <div className="modal-actions">
+            <button className="btn" onClick={() => (step === "pack-source" ? setStep("choose") : setStep("pack-source"))}>
+              返回
+            </button>
+            <button className="btn" onClick={close}>关闭</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ==================== 备注对话框（右键 profile，仅提示无约束） ====================
+function NoteDialog({
+  profile,
+  profilesDir,
+  versions,
+  initial,
+  onClose,
+  onSaved,
+}: {
+  profile: string;
+  profilesDir: string;
+  versions: string[];
+  initial: ProfileNote | undefined;
+  onClose: () => void;
+  onSaved: (note: ProfileNote) => void;
+}) {
+  const [note, setNote] = useState(initial?.note ?? "");
+  const [hintVersion, setHintVersion] = useState(initial?.hintVersion ?? "");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState("");
+
+  const save = async (clear: boolean) => {
+    setSaving(true);
+    setErr("");
+    try {
+      await api.saveProfileNote(profile, profilesDir, clear ? "" : note, clear ? "" : hintVersion);
+      onSaved({ note: clear ? "" : note, hintVersion: clear ? "" : hintVersion });
+    } catch (e) {
+      setErr(String(e));
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="modal-mask" onClick={() => !saving && onClose()}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 480 }}>
+        <div className="modal-head">
+          <h3>备注「{profile}」</h3>
+          <button className="btn tiny" onClick={onClose} disabled={saving}>✕</button>
+        </div>
+        <p className="modal-hint">备注仅作提示，无任何约束；适配版本只用于提醒，不影响实际运行。</p>
+        <label>
+          备注内容
+          <textarea
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            rows={3}
+            placeholder="如：此 profile 用于日常网页浏览 / 专门跑 CodeX 工作流…"
+          />
+        </label>
+        <label>
+          适配版本（提示）
+          <select value={hintVersion} onChange={(e) => setHintVersion(e.target.value)}>
+            <option value="">（不指定）</option>
+            {versions.map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
+          </select>
+        </label>
+        {err && <div className="error">{err}</div>}
+        <div className="modal-actions">
+          <button className="btn" onClick={onClose} disabled={saving}>取消</button>
+          <button className="btn" onClick={() => save(true)} disabled={saving}>
+            清除备注
+          </button>
+          <button className="btn primary" onClick={() => save(false)} disabled={saving}>
+            {saving ? "保存中..." : "保存备注"}
+          </button>
+        </div>
       </div>
     </div>
   );

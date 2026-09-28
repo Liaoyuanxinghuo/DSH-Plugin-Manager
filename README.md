@@ -33,6 +33,13 @@
 
 * **导入 / 导出**为 zip 压缩包（可排除 `node_modules`；重名自动改名）
 
+* **整合包（.dspack）导入导出**：遵循 [DSH-PackForge](https://github.com/DSH-PackForge/DSH-PackForge) 规范（manifest v5 / 容器 v3）——
+  导出自动排除 `node_modules` / 运行数据 / 凭据，导入自动重建依赖（pnpm install 流式日志），重名自动改名
+
+* **整合包市场**：在线浏览 [dsh-pack-market](https://github.com/DSH-PackForge/dsh-pack-market) 索引，下载并校验 `SHA-256` + `size` 后导入
+
+* **右键备注**：给 Profile 添加备注与「适配版本」提示（下拉选择左栏 DSH 版本，仅作提示、无任何约束）
+
 * **扫描目录**：把本地任意 profiles 目录（如 DSH Desktop 的 `.dsh-packs`）加入列表
 
 ### DSH 环境管理

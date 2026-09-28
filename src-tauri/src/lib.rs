@@ -8,6 +8,7 @@ mod market;
 mod models;
 mod npm;
 mod health;
+mod packforge;
 mod patchfile;
 mod settings;
 mod profile_io;
@@ -923,6 +924,105 @@ fn profile_node_modules_size(
     Ok(profile_io::node_modules_size(&profile_dir))
 }
 
+// ==================== 命令：整合包（DSH-PackForge） ====================
+
+/// 导出整合包：profile → .dspack v3
+#[tauri::command]
+fn export_pack_cmd(
+    state: State<AppState>,
+    env_id: String,
+    profile: String,
+    profiles_dir_str: String,
+    target_path: String,
+    pack_name: String,
+    pack_version: String,
+    display_name: String,
+) -> Result<packforge::PackExportResult, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    let profile_dir = profiles_dir.join(&profile);
+    if !profile_dir.is_dir() {
+        return Err(format!("profile 不存在: {profile}"));
+    }
+    let name = if pack_name.trim().is_empty() { profile.clone() } else { pack_name };
+    let default_file = format!("{}-{}.dspack", name.trim(), if pack_version.trim().is_empty() { "1.0.0" } else { pack_version.trim() });
+    let target = if target_path.trim().is_empty() {
+        let backups = std::path::Path::new(&env.home_dir).join("backups");
+        let _ = std::fs::create_dir_all(&backups);
+        backups.join(default_file)
+    } else {
+        std::path::PathBuf::from(target_path)
+    };
+    packforge::export_pack(
+        &profile_dir,
+        &profiles_dir,
+        &target,
+        &name,
+        &pack_version,
+        &display_name,
+        &env.version,
+    )
+}
+
+/// 拉取整合包市场索引（dsh-pack-market index.json）
+#[tauri::command]
+fn market_packs_cmd() -> Result<Vec<packforge::MarketPackEntry>, String> {
+    packforge::read_market_index()
+}
+
+/// 下载整合包到缓存目录并校验 sha256 + size
+#[tauri::command]
+fn download_pack_cmd(
+    url: String,
+    sha256: String,
+    size: u64,
+) -> Result<String, String> {
+    let dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("dsh-plugin-manager")
+        .join("packs");
+    packforge::download_pack(&url, &sha256, size, &dir)
+}
+
+/// 导入整合包（本地 .dspack 文件）到目标 profiles 目录
+#[tauri::command]
+fn import_pack_cmd(
+    state: State<AppState>,
+    env_id: String,
+    pack_path: String,
+    profiles_dir_str: String,
+) -> Result<packforge::PackImportResult, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    packforge::import_pack(std::path::Path::new(&pack_path), &profiles_dir)
+}
+
+// ==================== 命令：profile 备注 ====================
+
+/// 读取全部 profile 备注
+#[tauri::command]
+fn get_profile_notes_cmd() -> Result<packforge::NotesMap, String> {
+    Ok(packforge::load_notes())
+}
+
+/// 保存 profile 备注（清空则删除）
+#[tauri::command]
+fn save_profile_note_cmd(
+    profile: String,
+    profiles_dir_str: String,
+    note: String,
+    hint_version: String,
+) -> Result<(), String> {
+    let key = packforge::note_key(&profile, &profiles_dir_str);
+    packforge::save_note(
+        &key,
+        &packforge::ProfileNote {
+            note,
+            hint_version,
+        },
+    )
+}
+
 fn timestamp_compact() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1144,21 +1244,39 @@ fn open_dsh_web_cmd(
     fsutil::open_url(&url)
 }
 
-/// 获取环境的关键路径集合（供前端文件按钮使用）
+/// 获取当前选中"环境 × Profile"的关键路径集合（供前端文件按钮使用）。
+/// 以选中 profile 的来源目录为基准：sessions/logs 位于其父目录（即注入的 DSH_HOME）。
 #[tauri::command]
-fn get_env_paths(state: State<AppState>, env_id: String) -> Result<serde_json::Value, String> {
+fn get_env_paths(
+    state: State<AppState>,
+    env_id: String,
+    profile: String,
+    profiles_dir_str: String,
+) -> Result<serde_json::Value, String> {
     let env = get_env_inner(&state, &env_id)?;
     let home = std::path::Path::new(&env.home_dir);
-    let profiles_dir = env
-        .scan_profiles_dir
-        .as_ref()
-        .map(|s| s.clone())
-        .unwrap_or_else(|| home.join("profiles").to_string_lossy().to_string());
+    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    // 当前选中 profile 的目录（存在才返回，不存在返回 null）
+    let profile_dir = if profile.is_empty() {
+        None
+    } else {
+        let d = std::path::Path::new(&profiles_dir).join(&profile);
+        if d.is_dir() {
+            Some(d.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    };
+    // DSH_HOME = profiles_dir 的父目录（与启动注入语义一致）
+    let dsh_home = std::path::Path::new(&profiles_dir)
+        .parent()
+        .unwrap_or(home);
     Ok(serde_json::json!({
         "homeDir": env.home_dir,
+        "profileDir": profile_dir,
         "profilesDir": profiles_dir,
-        "sessionsDir": home.join("sessions").to_string_lossy().to_string(),
-        "logsDir": home.join("logs").to_string_lossy().to_string(),
+        "sessionsDir": dsh_home.join("sessions").to_string_lossy().to_string(),
+        "logsDir": dsh_home.join("logs").to_string_lossy().to_string(),
         "binPath": env.bin_path,
     }))
 }
@@ -1211,6 +1329,12 @@ pub fn run() {
             export_profile_cmd,
             import_profile_cmd,
             profile_node_modules_size,
+            export_pack_cmd,
+            market_packs_cmd,
+            download_pack_cmd,
+            import_pack_cmd,
+            get_profile_notes_cmd,
+            save_profile_note_cmd,
             npm_search_cmd,
             npm_package_info_cmd,
             check_compat_cmd,
