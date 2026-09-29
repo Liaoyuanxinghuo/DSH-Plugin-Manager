@@ -1,12 +1,25 @@
-# DSH Manager
+﻿# DSH Manager
 
-面向 **本地 CLI 版 DSH** 的桌面管理工具（Tauri 2 + React 19 + TypeScript）。在图形界面中完成 DSH 多版本管理、Profile 管理、插件安装与管理、整合包安装与管理、多实例独立启动，无需手敲命令行。
+面向 **本地 CLI 版 DSH** 的桌面管理工具（Tauri 2 + React 19 + TypeScript）。在图形界面中完成 DSH 多版本管理、Profile 管理、插件安装与管理、**整合包（.dspack）导出 / 导入 / 市场**、多实例独立启动，无需手敲命令行。
 
 > 仅管理本地 CLI 版 DSH，不包含、不依赖 DSH Desktop。
 
 
 
 ***
+
+## 界面布局
+
+![三栏界面布局](docs/images/layout.png)
+
+
+
+
+| 区域 | 内容                                                   |
+| -- | ---------------------------------------------------- |
+| 左栏 | DSH 环境（每个 = 一个 DSH 程序本体，可多版本共存）                      |
+| 中栏 | Profiles（合并默认 `~/.dsh/profiles` + 扫描目录，不绑定任何 DSH 版本） |
+| 右栏 | 当前 Profile 的插件列表与操作、运行控制（启动 / 停止 / 重启 / 打开界面）        |
 
 ## 功能特性
 
@@ -84,73 +97,73 @@
 
 ![整合包导入导出与包结构](docs/images/modpack.png)
 
-像 Minecraft 整合包一样，把 DSH AI 智能体配置**一键导出、分享、安装**。本应用遵循开源规范 [DSH-PackForge](https://github.com/DSH-PackForge/DSH-PackForge)（`.dspack` 容器 v3 + `manifest` v5），与生态内其他启动器互通。
+像 Minecraft 整合包一样，把 DSH AI 智能体配置**一键导出、分享、安装**。遵循开源规范 [DSH-PackForge](https://github.com/DSH-PackForge/DSH-PackForge)（`.dspack` **容器 v3** + **manifest v5**），可与生态内其他启动器互通。
 
-### 什么是整合包
+### 总体功能
 
-* 一个 `.dspack` 文件 = 一个 Profile 的**完整配置快照**：插件组合（bundles）、依赖（dependencies）、补丁（patch）、所需 DSH 版本（dshVersion）
+| 能力 | 说明 |
+| --- | --- |
+| **导出** | 把当前 Profile 打成 `.dspack`：插件组合、依赖、补丁、适配 DSH 版本；自动排除 `node_modules` / 运行数据 / 凭据 |
+| **导入** | 本地 `.dspack` 或在线市场下载；校验容器与 SHA-256 后落盘，**自动重建依赖** |
+| **市场** | 浏览 [dsh-pack-market](https://github.com/DSH-PackForge/dsh-pack-market) 索引，按需下载安装 |
+| **备注** | 导入时自动写入「适配 DSH 版本」到 Profile 右键备注，便于识别 |
 
-* **不含** `node_modules` / 运行数据 / 凭据 / 压缩包 —— 体积小、可安全分享
+一个 `.dspack` = 一个 Profile 的**配置快照**（或整个 `DSH_HOME`）：
 
-* 支持两种形态：
-  * **profile**：单个 Profile 的整合包（可额外携带全局 skill / preset）
-  * **dshhome**：整个 DSH_HOME 快照（多 Profile + 全局 preset / skill / 指令）
+* **profile 形态**：单个 Profile（可额外携带全局 skill / preset）
+* **dshhome 形态**：多 Profile + 全局 preset / skill / 指令
 
-### 导出（Pack）
+**不含** `node_modules`、运行数据、凭据、嵌套压缩包 —— 体积小、可安全分享。
 
-1. 点击 Profile 行的 **⬆ 导出** → 弹窗切换为 **「整合包（.dspack）」**
+---
 
-2. 填写**包名**（小写 slug）、**版本**（默认 `1.0.0`）、**显示名**（可选）
+### 1. 导出整合包（Pack）
 
-3. 选择保存位置 → 生成 `.dspack` v3，并返回 **SHA-256** 校验值
+![导出到整合包](docs/images/modpack.png)
 
-导出时自动执行五类安全过滤：精确名（`node_modules` / `data` / `sessions` / `.env` / 凭据…）、密钥扩展名（`.key` `.pem`…）、凭据文件名、嵌套压缩包（`.zip` `.tgz` `.dspack`）、home 级运行时目录。
+1. 中栏 Profile 行点击 **⬆ 导出**，在弹窗中切换到 **「整合包（.dspack）」**
+2. 填写：
+   * **包名**：小写 slug（如 `my-pack`）
+   * **版本**：默认 `1.0.0`
+   * **显示名**：可选
+   * **适配版本**：下拉选择 DSH 版本（也可自定义；写入 `manifest.dshVersion`）
+3. 选择保存位置 → 生成 `.dspack`，并显示 **SHA-256** 校验值
 
-### 导入（Install）
+导出时自动执行安全过滤（精确名 / 密钥扩展名 / 凭据文件名 / 嵌套压缩包 / home 级运行时目录），不会把敏感内容打进包里。
 
-1. 点击 **⬇ 导入** → 第一步选择：**完整 profile zip**（含数据，原样恢复）或 **整合包（.dspack）**
+---
 
-2. 选整合包 → 第二步选择来源：**在线下载整合包** 或 **本地导入整合包**
+### 2. 导入整合包（Install）
 
-3. 导入流程全自动：
+1. 中栏点击 **⬇ 导入** → 选择 **「整合包（.dspack）」**
+2. 来源二选一：
+   * **本地导入整合包**：选择本机 `.dspack` 文件
+   * **在线下载整合包**：从市场选择（见下一节）
+3. 导入全自动：
+   * 校验容器（`dspack.json` 的 format/version）→ 解析 manifest v5
+   * 落盘 `overrides/` → Profile 根；`home/` → `DSH_HOME`
+   * **自动重建依赖**（pnpm install，日志实时滚动）
+   * 重名自动改名（`xxx-import-1`…）；覆盖全局文件前备份到 `~/.dshpm-import-bak-<ts>/`，失败整体回滚
+   * 若包内声明了依赖的 DSH 版本，会写入该 Profile 的**备注「适配版本」**
 
-   * 校验容器（`dspack.json` format/version）→ 解析 manifest v5 → 落盘 `overrides/`（→ profile 根）与 `home/`（→ DSH_HOME）
+---
 
-   * **自动重建依赖**：逐 Profile 执行 `dsh plugin install`（pnpm install），日志实时滚动显示
+### 3. 在线市场（Market）
 
-   * **重名自动改名**（`xxx-import-1`…）；全局文件覆盖前自动备份到 `~/.dshpm-import-bak-<ts>/`，失败整体回滚
+1. **⬇ 导入** → **整合包** → **在线下载整合包**
+2. 列表展示：显示名 / 描述 / 作者 / bundle 数 / 依赖数 / **所需 DSH 版本** / 更新时间
+3. 选择后下载：逐字节校验 **size + SHA-256**，不完整或篡改直接拒绝、不落盘
+4. 校验通过后走与本地导入相同的落盘 + 重建依赖流程
 
-### 市场（Market）
+---
 
-* 「在线下载整合包」内置 [dsh-pack-market](https://github.com/DSH-PackForge/dsh-pack-market) 索引浏览
+### 4. Profile 备注（配合整合包）
 
-* 列表展示：显示名 / 描述 / 作者 / bundle 数 / 依赖数 / 所需 DSH 版本 / 更新时间
+* **右键**任意 Profile → 添加备注 / **适配版本**（下拉可选左栏 DSH 版本）
+* 适配版本**仅作提示**，不影响实际运行
+* 同名不同来源目录的 Profile 可各自备注
 
-* 下载后逐字节校验 **size + SHA-256**，包不完整或篡改直接拒绝，不落盘
-
-### Profile 备注（配合整合包使用）
-
-* **右键**任意 Profile 即可添加备注与**适配版本**提示
-
-* 适配版本下拉直接选择左栏 DSH 版本 —— **仅作提示，无任何约束**，不影响实际运行
-
-* 同名不同来源目录的 Profile 可独立备注；可一键清除
-
-***
-
-## 界面布局
-
-![三栏界面布局](docs/images/layout.png)
-
-
-
-
-| 区域 | 内容                                                   |
-| -- | ---------------------------------------------------- |
-| 左栏 | DSH 环境（每个 = 一个 DSH 程序本体，可多版本共存）                      |
-| 中栏 | Profiles（合并默认 `~/.dsh/profiles` + 扫描目录，不绑定任何 DSH 版本） |
-| 右栏 | 当前 Profile 的插件列表与操作、运行控制（启动 / 停止 / 重启 / 打开界面）        |
-
+---
 ## 核心概念
 
 ![任意 DSH 版本 × 任意 Profile 独立进程](docs/images/concept.png)
@@ -252,7 +265,7 @@ pnpm test
 cd src-tauri && cargo test --lib
 ```
 
-当前基线：前端 47 项测试、后端 73 项测试（持续更新）。
+当前基线：前端 51 项测试、后端 107+ 项测试（持续更新）。
 
 ### 项目结构
 
