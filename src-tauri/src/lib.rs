@@ -463,7 +463,9 @@ fn list_all_profiles_inner(scans: &[ScanDirEntry]) -> Vec<ProfileInfo> {
 #[tauri::command]
 async fn list_all_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileInfo>, String> {
     let scans = state.scan_dirs.lock().unwrap().clone();
-    Ok(list_all_profiles_inner(&scans))
+    tauri::async_runtime::spawn_blocking(move || list_all_profiles_inner(&scans))
+        .await
+        .map_err(|e| format!("扫描 profiles 失败: {e}"))
 }
 
 /// 列出某环境的全部 profile
@@ -478,6 +480,13 @@ async fn list_profiles(state: State<'_, AppState>, env_id: String) -> Result<Vec
 }
 
 fn get_env_inner(state: &State<'_, AppState>, env_id: &str) -> Result<DshEnv, String> {
+    // 快路径：手动/扫描目录环境已在 state 中，避免每次全盘 scan_envs（会探测版本，卡 UI）
+    {
+        let manual = state.manual_envs.lock().unwrap();
+        if let Some(e) = manual.iter().find(|e| e.id == env_id) {
+            return Ok(e.clone());
+        }
+    }
     let scans = state.scan_dirs.lock().unwrap().clone();
     scanner::scan_envs(&state.manual_envs.lock().unwrap(), &scans)
         .into_iter()
@@ -485,7 +494,7 @@ fn get_env_inner(state: &State<'_, AppState>, env_id: &str) -> Result<DshEnv, St
         .ok_or_else(|| format!("环境不存在: {env_id}"))
 }
 
-/// 读取 profile 的插件清单
+/// 读取 profile 的插件清单（含 dump-config，耗时）→ 阻塞线程池
 #[tauri::command]
 async fn list_plugins(
     state: State<'_, AppState>,
@@ -495,33 +504,37 @@ async fn list_plugins(
 ) -> Result<Vec<PluginInfo>, String> {
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    let profile_dir = profiles_dir.join(&profile);
-    if !profile_dir.exists() {
-        return Err(format!("profile 不存在: {profile}"));
-    }
-    let pkg = scanner::read_profile_package_full(&profile_dir)
-        .ok_or_else(|| "无法读取 profile 的 package.json".to_string())?;
-    // 读取 cordis.patch.yml 中的禁用列表；服务 id 以 dump-config 为准
-    let disabled_ids = read_disabled_ids(&profile_dir);
-    let service_map = load_service_map(&env, &profile);
-    let mut plugins: Vec<PluginInfo> = pkg
-        .dependencies
-        .into_iter()
-        .map(|(name, spec)| {
-            let is_bundle = pkg.bundles.contains(&name);
-            let sid = service_id_for(&service_map, &name);
-            PluginInfo {
-                name,
-                spec,
-                is_bundle,
-                compatible: None,
-                incompatible_reason: None,
-                is_disabled: disabled_ids.contains(&sid),
-            }
-        })
-        .collect();
-    plugins.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(plugins)
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile_dir = profiles_dir.join(&profile);
+        if !profile_dir.exists() {
+            return Err(format!("profile 不存在: {profile}"));
+        }
+        let pkg = scanner::read_profile_package_full(&profile_dir)
+            .ok_or_else(|| "无法读取 profile 的 package.json".to_string())?;
+        // 读取 cordis.patch.yml 中的禁用列表；服务 id 以 dump-config 为准
+        let disabled_ids = read_disabled_ids(&profile_dir);
+        let service_map = load_service_map(&env, &profile);
+        let mut plugins: Vec<PluginInfo> = pkg
+            .dependencies
+            .into_iter()
+            .map(|(name, spec)| {
+                let is_bundle = pkg.bundles.contains(&name);
+                let sid = service_id_for(&service_map, &name);
+                PluginInfo {
+                    name,
+                    spec,
+                    is_bundle,
+                    compatible: None,
+                    incompatible_reason: None,
+                    is_disabled: disabled_ids.contains(&sid),
+                }
+            })
+            .collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(plugins)
+    })
+    .await
+    .map_err(|e| format!("加载插件列表失败: {e}"))?
 }
 
 /// 读取 profile 的 cordis.patch.yml 中禁用的插件 id
@@ -937,21 +950,16 @@ async fn stop_all_dsh_cmd(state: State<'_, AppState>) -> Result<Vec<String>, Str
 }
 
 /// 查询指定 env×profile 的运行状态（自动清理已退出进程）
+/// 轮询频繁：**不做 scan_envs**，只查 running 表，避免卡 UI。
 #[tauri::command]
 fn dsh_status(state: State<'_, AppState>, env_id: String, profile: String, profiles_dir_str: String) -> DshStatus {
     let mut running = state.running.lock().unwrap();
     prune_dead(&mut running);
-    let key = match get_env_inner(&state, &env_id) {
-        Ok(e) => {
-            let pd = profiles_dir_arg(&profiles_dir_str, &e);
-            run_key(&env_id, &pd, &profile)
-        }
-        Err(_) => run_key(
-            &env_id,
-            std::path::Path::new(profiles_dir_str.trim()),
-            &profile,
-        ),
-    };
+    let key = run_key(
+        &env_id,
+        std::path::Path::new(profiles_dir_str.trim()),
+        &profile,
+    );
     let proc = running.get(&key).cloned().or_else(|| {
         running
             .values()
@@ -2065,9 +2073,9 @@ async fn remove_plugin_cmd(
     .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
-/// 豁免版本校验
+/// 豁免版本校验（跑 dsh 子进程）→ 阻塞线程池
 #[tauri::command]
-fn allow_version_cmd(
+async fn allow_version_cmd(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     env_id: String,
@@ -2080,12 +2088,16 @@ fn allow_version_cmd(
         return Err("该环境未绑定 dsh 运行时，无法执行豁免".to_string());
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    Ok(installer::allow_version(&app, &env, &pkg_spec, &profiles_dir))
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(installer::allow_version(&app, &env, &pkg_spec, &profiles_dir))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
-/// 撤销豁免
+/// 撤销豁免（跑 dsh 子进程）→ 阻塞线程池
 #[tauri::command]
-fn disallow_version_cmd(
+async fn disallow_version_cmd(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     env_id: String,
@@ -2098,7 +2110,11 @@ fn disallow_version_cmd(
         return Err("该环境未绑定 dsh 运行时，无法撤销豁免".to_string());
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    Ok(installer::disallow_version(&app, &env, &pkg_spec, &profiles_dir))
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(installer::disallow_version(&app, &env, &pkg_spec, &profiles_dir))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
 // ==================== 命令：文件/URL ====================
@@ -2116,45 +2132,46 @@ fn open_url_cmd(url: String) -> Result<(), String> {
 }
 
 /// 打开指定 env×profile 的 DSH web 界面。
-/// 运行时实时从日志提取最新带 token 的访问地址（服务就绪后 token 一定已打印），
-/// 避免启动早期抓不到 token 导致"连接中"。
+/// **不调用 get_env_inner/scan_envs**（全盘扫描会卡住 UI）；只查 running 表 + 读日志取 token。
 #[tauri::command]
-fn open_dsh_web_cmd(
+async fn open_dsh_web_cmd(
     state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
 ) -> Result<(), String> {
-    let key = match get_env_inner(&state, &env_id) {
-        Ok(e) => {
-            let pd = profiles_dir_arg(&profiles_dir_str, &e);
-            run_key(&env_id, &pd, &profile)
-        }
-        Err(_) => run_key(
+    // 1) 在 running 里定位实例（精确 key 或 env×profile 宽松匹配），锁不跨 await
+    let log_path = {
+        let running = state.running.lock().unwrap();
+        let key = run_key(
             &env_id,
             std::path::Path::new(profiles_dir_str.trim()),
             &profile,
-        ),
+        );
+        let proc = running
+            .get(&key)
+            .cloned()
+            .or_else(|| {
+                running
+                    .values()
+                    .find(|p| p.env_id == env_id && p.profile == profile)
+                    .cloned()
+            })
+            .ok_or_else(|| format!("「{profile}」在该环境未在运行"))?;
+        proc
     };
-    let running = state.running.lock().unwrap();
-    let proc = running
-        .get(&key)
-        .cloned()
-        .or_else(|| {
-            running
-                .values()
-                .find(|p| p.env_id == env_id && p.profile == profile)
-                .cloned()
-        })
-        .ok_or_else(|| format!("「{profile}」在该环境未在运行"))?;
-    let url = if proc.log_path.is_empty() {
-        format!("http://127.0.0.1:{}", proc.port)
-    } else {
-        runner::find_auth_url(&proc.log_path)
-            .unwrap_or_else(|| format!("http://127.0.0.1:{}", proc.port))
-    };
-    drop(running);
-    fsutil::open_url(&url)
+    // 2) 读日志 + 打开浏览器放阻塞池，避免读大日志/拉起进程卡 IPC
+    tauri::async_runtime::spawn_blocking(move || {
+        let url = if log_path.log_path.is_empty() {
+            format!("http://127.0.0.1:{}", log_path.port)
+        } else {
+            runner::find_auth_url(&log_path.log_path)
+                .unwrap_or_else(|| format!("http://127.0.0.1:{}", log_path.port))
+        };
+        fsutil::open_url(&url)
+    })
+    .await
+    .map_err(|e| format!("打开浏览器失败: {e}"))?
 }
 
 /// 获取当前选中"环境 × Profile"的关键路径集合（供前端文件按钮使用）。
@@ -2344,13 +2361,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.8_x64-setup.exe", "0.3.8"));
-        assert!(asset_matches("dsh-manager_0.3.8_x64-setup.exe", "0.3.8"));
-        assert!(asset_matches("任意名_0.3.8_x64-setup.exe", "0.3.8"));
-        assert!(!asset_matches("DSH-Manager-0.3.8-win-x64.exe", "0.3.8"));
-        assert!(!asset_matches("DSH Manager_0.3.8_x64-setup.exe.sha256", "0.3.8"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.8"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.8"));
+        assert!(asset_matches("DSH Manager_0.3.9_x64-setup.exe", "0.3.9"));
+        assert!(asset_matches("dsh-manager_0.3.9_x64-setup.exe", "0.3.9"));
+        assert!(asset_matches("任意名_0.3.9_x64-setup.exe", "0.3.9"));
+        assert!(!asset_matches("DSH-Manager-0.3.9-win-x64.exe", "0.3.9"));
+        assert!(!asset_matches("DSH Manager_0.3.9_x64-setup.exe.sha256", "0.3.9"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.9"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.9"));
     }
 
     #[test]
@@ -2483,10 +2500,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.8_x64-setup.exe", "0.3.8"));
+        assert!(asset_matches("DSH.Manager_0.3.9_x64-setup.exe", "0.3.9"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.8_x64-setup.exe", "0.3.8"));
-        assert!(asset_matches("DSH.MANAGER_0.3.8_X64-SETUP.EXE", "0.3.8"));
+        assert!(asset_matches("dsh.manager_0.3.9_x64-setup.exe", "0.3.9"));
+        assert!(asset_matches("DSH.MANAGER_0.3.9_X64-SETUP.EXE", "0.3.9"));
     }
 
     #[test]
@@ -2494,7 +2511,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.8", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.9", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }
