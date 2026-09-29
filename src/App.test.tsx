@@ -15,7 +15,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { save as mockSave } from "@tauri-apps/plugin-dialog";
+import { save as mockSave, open as mockOpen } from "@tauri-apps/plugin-dialog";
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -94,6 +94,10 @@ function mockAll() {
         });
       case "get_env":
         return Promise.resolve(null);
+      case "check_portable_runtime_cmd":
+        return Promise.resolve(true);
+      case "init_portable_runtime_cmd":
+        return Promise.resolve("便携运行时已就绪");
       default:
         return Promise.resolve(null);
     }
@@ -104,6 +108,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   // mockReset: true 会清掉 vi.mock 工厂设置的实现，需重新设置
   vi.mocked(mockSave).mockResolvedValue("C:\\diag.zip");
+  vi.mocked(mockOpen).mockResolvedValue(null);
   mockAll();
 });
 
@@ -168,6 +173,46 @@ describe("App 主界面", () => {
       expect(screen.getByText(/已安装插件/)).toBeInTheDocument();
       expect(screen.getByText("@michengai/dsh-codex-ui")).toBeInTheDocument();
     });
+  });
+
+  it("点击刷新会立刻重扫 Profiles 并与新增/删除同步", async () => {
+    let listCalls = 0;
+    const web = {
+      name: "web",
+      profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+      path: "C:\\Users\\test\\.dsh\\profiles\\web",
+      pluginCount: 1,
+      dataSize: 0,
+      modified: "",
+      hasPatch: false,
+      hasLock: false,
+      hasPackage: true,
+    };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_all_profiles") {
+        listCalls += 1;
+        // 第一次：只有 web；刷新后：多出 newone（模拟外部新建）
+        if (listCalls === 1) return Promise.resolve([web]);
+        return Promise.resolve([
+          web,
+          { ...web, name: "newone", path: "C:\\Users\\test\\.dsh\\profiles\\newone" },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("web").length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText("newone")).toBeNull();
+    await user.click(screen.getByRole("button", { name: /刷新/ }));
+    // 刷新后 list_all_profiles 再次拉取，新增 profile 出现在列表
+    await waitFor(() => {
+      expect(screen.getByText("newone")).toBeInTheDocument();
+    });
+    expect(listCalls).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/已刷新/)).toBeInTheDocument();
   });
 
   it("文件系统快捷入口显示「当前 Profile 目录」并点击调用 open_path", async () => {
@@ -502,14 +547,16 @@ describe("M3 插件管理", () => {
 });
 
 describe("新建/删除 Profile", () => {
-  it("点击＋新建弹出表单，输入名称后调用 create_profile_cmd 并选中新 profile", async () => {
+  it("点击＋新建弹出表单，选择 profiles 目录后调用 create_profile_cmd 并选中新 profile", async () => {
+    const profilesDir = "C:\\Users\\test\\.dsh\\profiles";
+    vi.mocked(mockOpen).mockResolvedValue(profilesDir);
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "create_profile_cmd") {
         return Promise.resolve({ name: "dev", path: "C:\\Users\\test\\.dsh\\profiles\\dev" });
       }
       if (cmd === "list_all_profiles") {
         return Promise.resolve([
-          { name: "dev", profilesDir: "C:\\Users\\test\\.dsh\\profiles", path: "", pluginCount: 0, dataSize: 0, modified: "", hasPatch: false, hasLock: false, hasPackage: true },
+          { name: "dev", profilesDir, path: "", pluginCount: 0, dataSize: 0, modified: "", hasPatch: false, hasLock: false, hasPackage: true },
         ]);
       }
       return mockAllDefault(cmd);
@@ -523,13 +570,17 @@ describe("新建/删除 Profile", () => {
     await waitFor(() => {
       expect(screen.getByText("新建 Profile")).toBeInTheDocument();
     });
+    await user.click(screen.getByText("选择目录"));
+    await waitFor(() => {
+      expect(screen.getByDisplayValue(profilesDir)).toBeInTheDocument();
+    });
     await user.type(screen.getByPlaceholderText("如：dev / test / 0.1.7-rc.2"), "dev");
     await user.click(screen.getByText("创建"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("create_profile_cmd", {
         envId: "global",
         name: "dev",
-        profilesDirStr: "",
+        profilesDirStr: profilesDir,
       });
     });
     await waitFor(() => {
@@ -538,17 +589,39 @@ describe("新建/删除 Profile", () => {
   });
 
   it("新建表单校验非法字符", async () => {
+    const profilesDir = "C:\\Users\\test\\.dsh\\profiles";
+    vi.mocked(mockOpen).mockResolvedValue(profilesDir);
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
       expect(screen.getByText("＋新建")).toBeInTheDocument();
     });
     await user.click(screen.getByText("＋新建"));
+    await user.click(screen.getByText("选择目录"));
+    await waitFor(() => {
+      expect(screen.getByDisplayValue(profilesDir)).toBeInTheDocument();
+    });
     await user.type(screen.getByPlaceholderText("如：dev / test / 0.1.7-rc.2"), "a/b");
     await user.click(screen.getByText("创建"));
     await waitFor(() => {
       expect(screen.getByText(/不能包含/)).toBeInTheDocument();
     });
+    expect(mockInvoke).not.toHaveBeenCalledWith("create_profile_cmd", expect.anything());
+  });
+
+  it("新建时选到非 profiles 目录须重新选择", async () => {
+    vi.mocked(mockOpen).mockResolvedValue("C:\\Users\\test\\Downloads");
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("＋新建")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("＋新建"));
+    await user.click(screen.getByText("选择目录"));
+    await waitFor(() => {
+      expect(screen.getByText(/不是 profiles 文件夹/)).toBeInTheDocument();
+    });
+    expect(screen.getByText("创建")).toBeDisabled();
     expect(mockInvoke).not.toHaveBeenCalledWith("create_profile_cmd", expect.anything());
   });
 
@@ -575,6 +648,67 @@ describe("新建/删除 Profile", () => {
         name: "web",
         profilesDirStr: "C:\\Users\\test\\.dsh\\profiles",
       });
+    });
+  });
+
+  it("删除非选中项时，profilesDir 用该项自己的来源（回归：勿传空/选中项目录）", async () => {
+    const dirA = "C:\\Users\\test\\.dsh\\profiles";
+    const dirB = "C:\\scan\\other\\profiles";
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_all_profiles") {
+        return Promise.resolve([
+          {
+            name: "web",
+            profilesDir: dirA,
+            path: `${dirA}\\web`,
+            pluginCount: 0,
+            dataSize: 0,
+            modified: "",
+            hasPatch: false,
+            hasLock: false,
+            hasPackage: true,
+          },
+          {
+            name: "from-scan",
+            profilesDir: dirB,
+            path: `${dirB}\\from-scan`,
+            pluginCount: 0,
+            dataSize: 0,
+            modified: "",
+            hasPatch: false,
+            hasLock: false,
+            hasPackage: true,
+          },
+        ]);
+      }
+      if (cmd === "delete_profile_cmd") {
+        return Promise.resolve(null);
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("from-scan")).toBeInTheDocument();
+    });
+    // 删除第二项（from-scan，来源 dirB），而不是选中的 web
+    const delBtns = screen.getAllByText("🗑 删除");
+    await user.click(delBtns[1]);
+    await waitFor(() => {
+      expect(screen.getByText(/删除 profile「from-scan」/)).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("确认删除"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("delete_profile_cmd", {
+        envId: "global",
+        name: "from-scan",
+        profilesDirStr: dirB,
+      });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("delete_profile_cmd", {
+      envId: "global",
+      name: "from-scan",
+      profilesDirStr: "",
     });
   });
 });
@@ -802,7 +936,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.6", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.7", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -829,27 +963,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.6", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.7", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.6_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.7_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.6"));
+    await user.click(screen.getByText("⬇ 下载 v0.3.7"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.6" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.7" });
     // 打开所在文件夹
     await user.click(screen.getByText("📂 打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.6_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.7_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("🔄 关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.6_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.7_x64-setup.exe" });
     });
   });
 });
@@ -1001,7 +1135,12 @@ describe("整合包导入导出与备注", () => {
 });
 
 function mockAllDefault(cmd: string) {
-  switch (cmd) {    case "scan_envs":
+  switch (cmd) {
+    case "check_portable_runtime_cmd":
+      return Promise.resolve(true);
+    case "init_portable_runtime_cmd":
+      return Promise.resolve("便携运行时已就绪");
+    case "scan_envs":
       return Promise.resolve([
         {
           id: "global",

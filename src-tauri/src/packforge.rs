@@ -71,6 +71,8 @@ pub struct PackImportResult {
     /// 覆盖前备份目录（home/.dshpm-import-bak-<ts>/）
     pub backup_dir: String,
     pub target_path: String,
+    /// 从 manifest.dshVersion / 描述解析的依赖 DSH 版本（已写入 profile 备注适配版本）
+    pub dsh_hint: String,
 }
 
 /// manifest v5 解析（profile / dshhome 两形态）
@@ -85,6 +87,8 @@ struct PackManifest {
     version: String,
     #[serde(default)]
     display_name: Option<serde_json::Value>,
+    #[serde(default)]
+    description: Option<serde_json::Value>,
     #[serde(default)]
     profile_name: Option<String>,
     #[serde(default)]
@@ -250,6 +254,83 @@ fn display_str(v: Option<&serde_json::Value>, fallback: &str) -> String {
         }
         _ => fallback.to_string(),
     }
+}
+
+/// 从文本中提取第一个「形如 x.y.z / x.y.z-rc.1 / 0.2.0」的版本号
+fn first_version_like(s: &str) -> Option<String> {
+    let b: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        // 不从单词中间起算（如 x0.1.2）；但允许 v0.1.2 的 v 前缀
+        if i > 0 && b[i - 1].is_ascii_alphanumeric() {
+            let prev = b[i - 1].to_ascii_lowercase();
+            let ok_v = prev == 'v' && (i < 2 || !b[i - 2].is_ascii_alphanumeric());
+            if !ok_v {
+                i += 1;
+                continue;
+            }
+        }
+        let start = i;
+        let mut j = i;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        // 至少再跟两段 .数字 → x.y.z
+        let mut groups = 1;
+        while groups < 3 && j < b.len() && b[j] == '.' {
+            let k = j + 1;
+            if k < b.len() && b[k].is_ascii_digit() {
+                let mut m = k;
+                while m < b.len() && b[m].is_ascii_digit() {
+                    m += 1;
+                }
+                j = m;
+                groups += 1;
+            } else {
+                break;
+            }
+        }
+        if groups < 3 {
+            i = j.max(i + 1);
+            continue;
+        }
+        // 预发布：-rc.1 / -beta.2 等
+        if j < b.len() && b[j] == '-' {
+            let mut m = j + 1;
+            let mut any = false;
+            while m < b.len() && (b[m].is_ascii_alphanumeric() || b[m] == '.') {
+                m += 1;
+                any = true;
+            }
+            if any {
+                j = m;
+            }
+        }
+        return Some(b[start..j].iter().collect());
+    }
+    None
+}
+
+/// 从 manifest.dshVersion 优先，否则从描述中提取依赖 DSH 版本（如「需要 dsh 0.1.7-rc.2」）。
+/// **不校验本机是否已下载该 DSH**——仅作备注「适配版本」提示。
+pub fn extract_dsh_hint(dsh_version: &str, description: &str) -> String {
+    let dv = dsh_version.trim().trim_start_matches('v');
+    if !dv.is_empty() {
+        return dv.to_string();
+    }
+    let lower = description.to_lowercase();
+    // 描述里 “dsh” 后的版本号优先（避免抓到无关版本）
+    if let Some(pos) = lower.find("dsh") {
+        let rest = &description[pos + 3..];
+        if let Some(v) = first_version_like(rest) {
+            return v;
+        }
+    }
+    first_version_like(description).unwrap_or_default()
 }
 
 /// slug 化（小写，非 [a-z0-9-] 转 -）
@@ -829,6 +910,24 @@ pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportRe
         .map(|n| profiles_dir.join(n).to_string_lossy().to_string())
         .unwrap_or_default();
     let _ = fs::remove_dir_all(&work);
+
+    // 依赖 DSH 版本 → 自动写入 profile 右键备注「适配版本」（不要求本机已下载该 DSH）
+    let desc = display_str(manifest.description.as_ref(), "");
+    let name_desc = display_str(manifest.display_name.as_ref(), "");
+    let mut dsh_hint = extract_dsh_hint(manifest.dsh_version.as_deref().unwrap_or(""), &desc);
+    if dsh_hint.is_empty() {
+        dsh_hint = extract_dsh_hint("", &name_desc);
+    }
+    if !dsh_hint.is_empty() {
+        let pd = profiles_dir.to_string_lossy().to_string();
+        for name in &final_names {
+            let key = note_key(name, &pd);
+            let mut n = load_notes().get(&key).cloned().unwrap_or_default();
+            n.hint_version = dsh_hint.clone();
+            let _ = save_note(&key, &n);
+        }
+    }
+
     Ok(PackImportResult {
         pack_name: manifest.name,
         pack_version: manifest.version,
@@ -838,6 +937,7 @@ pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportRe
         home_written,
         backup_dir: backup_dir.to_string_lossy().to_string(),
         target_path,
+        dsh_hint,
     })
 }
 
@@ -893,6 +993,35 @@ pub fn note_key(name: &str, profiles_dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_dsh_hint_prefers_manifest_field() {
+        assert_eq!(extract_dsh_hint("0.1.7-rc.2", "需要 dsh 0.2.0"), "0.1.7-rc.2");
+        assert_eq!(extract_dsh_hint("v0.2.0-rc.1", ""), "0.2.0-rc.1");
+    }
+
+    #[test]
+    fn extract_dsh_hint_from_description() {
+        assert_eq!(
+            extract_dsh_hint("", "本包依赖 dsh 0.1.7-rc.2，其他随意"),
+            "0.1.7-rc.2"
+        );
+        assert_eq!(
+            extract_dsh_hint("", "requires DSH v0.2.0-rc.1"),
+            "0.2.0-rc.1"
+        );
+        // 无 dsh 关键字时取第一个版本样 token
+        assert_eq!(extract_dsh_hint("", "适配 0.1.5 与插件"), "0.1.5");
+        assert_eq!(extract_dsh_hint("", "没有任何版本"), "");
+    }
+
+    #[test]
+    fn first_version_like_parses_semver() {
+        assert_eq!(first_version_like("abc 0.1.7-rc.2 x"), Some("0.1.7-rc.2".into()));
+        assert_eq!(first_version_like("1.2.3"), Some("1.2.3".into()));
+        assert_eq!(first_version_like("12.3"), None);
+        assert_eq!(first_version_like(""), None);
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("dshpm-pf-{tag}-{}", std::process::id()));

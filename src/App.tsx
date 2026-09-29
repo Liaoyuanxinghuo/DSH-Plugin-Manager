@@ -140,6 +140,8 @@ export default function App() {
   // profile 备注
   const [notes, setNotes] = useState<ProfileNotesMap>({});
   const [noteTarget, setNoteTarget] = useState<{ profile: string; profilesDir: string } | null>(null);
+  const [showInitHint, setShowInitHint] = useState(false);
+  const [initRunning, setInitRunning] = useState(false);
   // 在线安装对话框
   const [showInstall, setShowInstall] = useState(false);
   const [installTab, setInstallTab] = useState<"market" | "search" | "custom" | "local">("market");
@@ -170,6 +172,26 @@ export default function App() {
   // M5 设置 / DSH 下载
   const [showSettings, setShowSettings] = useState(false);
   const [showDshDownload, setShowDshDownload] = useState(false);
+  // 便携运行时（%AppData%\dsh-plugin-manager\runtime）是否就绪；未就绪时「下载DSH」变红色「初始化环境」
+  const [portableReady, setPortableReady] = useState<boolean | null>(null);
+  const [initingPortable, setInitingPortable] = useState(false);
+  const [portableBannerOpen, setPortableBannerOpen] = useState(true);
+
+  // 检测便携运行时
+  useEffect(() => {
+    api
+      .checkPortableRuntime()
+      .then((ok) => setPortableReady(!!ok))
+      .catch(() => setPortableReady(false));
+  }, []);
+
+  // 「便携运行时就绪」横幅 2s 后自动关闭
+  useEffect(() => {
+    if (portableReady === true && portableBannerOpen) {
+      const t = setTimeout(() => setPortableBannerOpen(false), 2000);
+      return () => clearTimeout(t);
+    }
+  }, [portableReady, portableBannerOpen]);
 
   // 加载 profile 备注（仅提示，无任何约束）
   useEffect(() => {
@@ -218,7 +240,10 @@ export default function App() {
     try {
       const ps = (await api.listAllProfiles()) ?? [];
       setProfiles(applyStoredOrder(ps, (x) => x.name, readStoredOrder("dshpm-prof-order")));
-      setSelectedProfile((cur) => (cur && ps.some((p) => p.name === cur) ? cur : ps[0]?.name ?? ""));
+      setSelectedProfile((cur) => {
+        if (cur && ps.some((p) => p.name === cur)) return cur;
+        return ps[0]?.name ?? "";
+      });
     } catch (e) {
       setError(String(e));
     } finally {
@@ -230,11 +255,25 @@ export default function App() {
     loadProfiles();
   }, [loadProfiles]);
 
-  // 选中 profile 变化 → 同步其来源目录（用于启动注入 DSH_HOME）
+  // 选中 profile 变化 → 同步其来源目录（同名多来源时保留已选目录，不回退到第一项）
   useEffect(() => {
-    const p = profiles.find((x) => x.name === selectedProfile);
-    setSelectedProfilesDir(p?.profilesDir ?? "");
+    setSelectedProfilesDir((cur) => {
+      const exact = profiles.find((x) => x.name === selectedProfile && x.profilesDir === cur);
+      if (exact) return cur;
+      return profiles.find((x) => x.name === selectedProfile)?.profilesDir ?? cur ?? "";
+    });
   }, [selectedProfile, profiles]);
+
+  /** 按 profile 名（可带目录提示）取来源目录，避免同名多来源时指到第一项 */
+  const profileDirOf = useCallback(
+    (name: string, dirHint?: string): string => {
+      const hint = dirHint ?? selectedProfilesDir;
+      const exact = profiles.find((x) => x.name === name && x.profilesDir === hint);
+      if (exact) return exact.profilesDir;
+      return profiles.find((x) => x.name === name)?.profilesDir ?? hint;
+    },
+    [profiles, selectedProfilesDir],
+  );
 
   // 加载插件列表（来源目录直接按当前 profile 推导，避免选中瞬间 state 未同步的竞态）
   useEffect(() => {
@@ -243,7 +282,9 @@ export default function App() {
       setUpdates(null);
       return;
     }
-    const p = profiles.find((x) => x.name === selectedProfile);
+    const p =
+      profiles.find((x) => x.name === selectedProfile && x.profilesDir === selectedProfilesDir) ??
+      profiles.find((x) => x.name === selectedProfile);
     if (!p) {
       // 记住的 profile 不在当前合并列表中（来源目录未扫到）：静默跳过，不报错
       setPlugins([]);
@@ -255,17 +296,18 @@ export default function App() {
       .then(setPlugins)
       .catch((e) => setError(String(e)));
     setUpdates(null);
-  }, [selectedEnv, selectedProfile, profiles]);
+  }, [selectedEnv, selectedProfile, selectedProfilesDir, profiles]);
 
   // 加载路径（随环境 × profile 变化：文件入口对准当前选中的 profile 目录）
   useEffect(() => {
     if (!selectedEnv) return;
-    const pdir = profiles.find((x) => x.name === selectedProfile)?.profilesDir ?? "";
+    const pdir = profileDirOf(selectedProfile);
     api
       .getEnvPaths(selectedEnv, selectedProfile, pdir)
       .then(setPaths)
       .catch(() => {});
-  }, [selectedEnv, selectedProfile, profiles]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedEnv, selectedProfile, selectedProfilesDir, profiles]);
 
   // 运行实例轮询（全局，跨环境跨 profile，3s 一次：进程退出后按钮/状态快速自动纠正）
   useEffect(() => {
@@ -384,12 +426,13 @@ export default function App() {
     setError("");
     setInfo(`正在重启 ${pname}...`);
     try {
-      await api.stopDsh(eid, pname, selectedProfilesDir);
+      // 停止用运行中实例自己的目录，启动用列表项解析出的目录
+      await api.stopDsh(eid, pname, curRun.profilesDir || profileDirOf(pname));
       // 等旧进程完全退出后再启动（taskkill 异步生效）
       await new Promise((r) => setTimeout(r, 600));
       const list = await api.listRunning().catch(() => []);
       setRunnings(list);
-      await startAndPoll(eid, pname, selectedProfilesDir);
+      await startAndPoll(eid, pname, profileDirOf(pname));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -406,7 +449,7 @@ export default function App() {
       const dir =
         pdirArg ??
         runnings.find((r) => r.envId === eid && r.profile === pname)?.profilesDir ??
-        selectedProfilesDir;
+        profileDirOf(pname);
       await api.stopDsh(eid, pname, dir);
       const list = await api.listRunning().catch(() => []);
       setRunnings(list);
@@ -428,10 +471,12 @@ export default function App() {
     localStorage.setItem("dshpm-prof-order", JSON.stringify(next.map((x) => x.name)));
   });
 
-  const refreshAll = () => {
-    loadEnvs();
+  // 刷新：环境 + Profiles 都立刻重扫，列表与增删保持同步
+  const refreshAll = async () => {
     setError("");
     setInfo("");
+    await Promise.all([loadEnvs(), loadProfiles()]);
+    setInfo("已刷新：环境与 Profile 列表已重新扫描");
   };
 
   // M3：检查插件更新（并行查询 npm）
@@ -441,7 +486,7 @@ export default function App() {
     setError("");
     setInfo("");
     try {
-      const list = await api.checkUpdates(selectedEnv, selectedProfile, selectedProfilesDir);
+      const list = await api.checkUpdates(selectedEnv, selectedProfile, profileDirOf(selectedProfile));
       setUpdates(list);
       const n = list.filter((u) => u.updatable).length;
       setInfo(n > 0 ? `发现 ${n} 个插件有新版本` : "所有插件均为最新版本");
@@ -459,9 +504,9 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      await api.setPluginEnabled(selectedEnv, selectedProfile, selectedProfilesDir, p.name, enabled);
+      await api.setPluginEnabled(selectedEnv, selectedProfile, profileDirOf(selectedProfile), p.name, enabled);
       // 刷新列表
-      const list = await api.listPlugins(selectedEnv, selectedProfile, selectedProfilesDir).catch(() => null);
+      const list = await api.listPlugins(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).catch(() => null);
       if (list) setPlugins(list);
       setInfo(enabled ? `已启用 ${p.name}` : `已停用 ${p.name}`);
     } catch (e) {
@@ -478,16 +523,16 @@ export default function App() {
     setError("");
     setInfo(`正在更新 ${p.name} → ${latest}...`);
     try {
-      const r = await api.installPlugin(selectedEnv, selectedProfile, selectedProfilesDir, `${p.name}@${latest}`);
+      const r = await api.installPlugin(selectedEnv, selectedProfile, profileDirOf(selectedProfile), `${p.name}@${latest}`);
       if (r.success) {
         setInfo(`已更新 ${p.name} → ${latest}`);
       } else {
         setError(`更新失败（退出码 ${r.exitCode ?? "?"}）：${r.summary}`);
       }
       // 刷新插件列表与更新信息
-      const list = await api.listPlugins(selectedEnv, selectedProfile, selectedProfilesDir).catch(() => null);
+      const list = await api.listPlugins(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).catch(() => null);
       if (list) setPlugins(list);
-      const up = await api.checkUpdates(selectedEnv, selectedProfile, selectedProfilesDir).catch(() => null);
+      const up = await api.checkUpdates(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).catch(() => null);
       if (up) setUpdates(up);
     } catch (e) {
       setError(String(e));
@@ -505,13 +550,13 @@ export default function App() {
     setError("");
     setInfo(`正在卸载 ${name}...`);
     try {
-      const r = await api.removePlugin(selectedEnv, selectedProfile, selectedProfilesDir, name);
+      const r = await api.removePlugin(selectedEnv, selectedProfile, profileDirOf(selectedProfile), name);
       if (r.success) {
         setInfo(`已卸载 ${name}`);
       } else {
         setError(`卸载失败（退出码 ${r.exitCode ?? "?"}）：${r.summary}`);
       }
-      const list = await api.listPlugins(selectedEnv, selectedProfile, selectedProfilesDir).catch(() => null);
+      const list = await api.listPlugins(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).catch(() => null);
       if (list) setPlugins(list);
       setUpdates(null);
     } catch (e) {
@@ -561,21 +606,21 @@ export default function App() {
     setShowImportDialog(true);
   };
 
-  // 导入完成后刷新 profile 列表
-  const refreshAfterImport = (finalNames: string[]) => {
-    return api.listAllProfiles()
-      .then((ps) => {
-        setProfiles(ps);
-        if (finalNames.length > 0) {
-          setSelectedProfile(finalNames[0]);
-          setSelectedProfilesDir("");
-        }
-      })
-      .catch(() => {});
+  // 导入完成后刷新 profile 列表（与「刷新」同一套重扫逻辑）
+  const refreshAfterImport = async (finalNames: string[]) => {
+    await loadProfiles();
+    if (finalNames.length > 0) {
+      setSelectedProfile(finalNames[0]);
+    }
   };
 
   // 导出整合包：.dspack v3（DSH-PackForge 规范）
-  const doExportPack = async (packName: string, packVersion: string, displayName: string) => {
+  const doExportPack = async (
+    packName: string,
+    packVersion: string,
+    displayName: string,
+    dshHint?: string,
+  ) => {
     if (!selectedEnv || !exportTarget) return;
     setBusy(true);
     setError("");
@@ -594,9 +639,11 @@ export default function App() {
         name,
         version,
         displayName,
+        dshHint?.trim() || undefined,
       );
       setInfo(
-        `整合包导出成功：${r.fileCount} 个文件，${formatSize(r.zipSize)}，SHA-256 ${r.sha256.slice(0, 12)}…`,
+        `整合包导出成功：${r.fileCount} 个文件，${formatSize(r.zipSize)}，SHA-256 ${r.sha256.slice(0, 12)}…` +
+          (dshHint ? ` · 适配 DSH ${dshHint}` : ""),
       );
       api.openPath(path).catch(() => {});
     } catch (e) {
@@ -640,20 +687,19 @@ export default function App() {
     }
   };
 
-  // 新建 profile
-  const handleCreateProfile = async (name: string) => {
+  // 新建 profile（目标目录必须是 profiles 文件夹，由表单校验）
+  const handleCreateProfile = async (name: string, profilesDir: string) => {
     if (!selectedEnv) return;
     setCreatingProfile(true);
     setError("");
     setInfo("");
     try {
-      const r = await api.createProfile(selectedEnv, name, "");
-      setInfo(`已创建 profile「${r.name}」（含默认 base + web-app bundle，可直接启动）`);
+      const r = await api.createProfile(selectedEnv, name, profilesDir);
+      setInfo(`已创建 profile「${r.name}」于 ${profilesDir}（含默认 bundle，可直接启动）`);
       setShowCreateProfile(false);
-      const ps = await api.listAllProfiles().catch(() => []);
-      setProfiles(ps);
+      await loadProfiles();
       setSelectedProfile(r.name);
-      setSelectedProfilesDir("");
+      setSelectedProfilesDir(profilesDir);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -661,23 +707,107 @@ export default function App() {
     }
   };
 
+  // 初始化按钮出现 >=5s 仍无 profile 时横幅提示（可点叉关闭；有 profile 后自动消失）
+  useEffect(() => {
+    if (envs.length > 0 && profiles.length === 0) {
+      const t = setTimeout(() => setShowInitHint(true), 5000);
+      return () => clearTimeout(t);
+    }
+    setShowInitHint(false);
+  }, [envs.length, profiles.length]);
+
+  // 初始化便携运行时（完整下载 Node LTS + pnpm 到 %AppData%\dsh-plugin-manager\runtime）
+  const handleInitPortable = async () => {
+    setInitingPortable(true);
+    setError("");
+    setInfo("正在初始化便携运行时（下载 Node.js LTS + pnpm，约 40MB，请稍候）...");
+    try {
+      const msg = await api.initPortableRuntime();
+      setPortableReady(true);
+      setPortableBannerOpen(true);
+      setInfo(`✅ 便携运行时就绪 — ${msg}`);
+    } catch (e) {
+      setPortableReady(false);
+      setError(`初始化便携运行时失败：${e}`);
+    } finally {
+      setInitingPortable(false);
+    }
+  };
+
+  // 打开「下载 DSH」前强制检查便携包；缺失则走初始化
+  const openDshDownload = async () => {
+    try {
+      const ok = await api.checkPortableRuntime();
+      setPortableReady(!!ok);
+      if (!ok) {
+        await handleInitPortable();
+        return;
+      }
+    } catch {
+      /* 检测失败按缺失处理 */
+    }
+    setShowDshDownload(true);
+  };
+
+  // 一键初始化：用本地 dsh 启动内置 web profile（dsh 首次运行自动创建并初始化，
+  // 等价 npx @deepseek-ai/dsh web，但全部走本地 dsh 本体 + 本地 node/npx 工具链）
+  const handleInitProfile = async () => {
+    if (!selectedEnv) return;
+    setCreatingProfile(true);
+    setError("");
+    setInfo("正在初始化并启动默认 web profile（dsh 首次运行会自动创建）...");
+    try {
+      const r = await api.startDsh(selectedEnv, "web", "", undefined);
+      setInfo(`${r.message} — web profile 初始化并启动中（首次运行 dsh 自动创建）`);
+      api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
+      const ps = await api.listAllProfiles().catch(() => []);
+      setProfiles(ps);
+      setSelectedProfile("web");
+      setShowInitHint(false);
+      setInitRunning(true);
+      startAndPoll(selectedEnv, "web", "");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreatingProfile(false);
+    }
+  };
+
+  // 结束初始化：停止 web 启动进程；结束后按钮按实际状态恢复（有 profile -> ＋新建，否则 -> 初始化）
+  const handleStopInit = async () => {
+    if (!selectedEnv) return;
+    setError("");
+    setInfo("正在结束初始化进程...");
+    try {
+      await api.stopDsh(selectedEnv, "web", "");
+      setInfo("初始化进程已停止");
+      api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
+      const ps = await api.listAllProfiles().catch(() => []);
+      setProfiles(ps);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreatingProfile(false);
+      setShowInitHint(false);
+      setInitRunning(false);
+    }
+  };
+
   // 删除 profile（二次确认后执行）
   const doDeleteProfile = async () => {
     if (!selectedEnv || !confirmDeleteProfile) return;
     const name = confirmDeleteProfile.name;
+    // 必须用该 profile 自己的来源目录；selectedProfilesDir 可能为空（新建/导入后曾被置空）
+    const pdir = confirmDeleteProfile.profilesDir;
     setConfirmDeleteProfile(null);
     setDeletingProfile(true);
     setError("");
     setInfo(`正在删除 profile「${name}」...`);
     try {
-      await api.deleteProfile(selectedEnv, name, selectedProfilesDir);
+      await api.deleteProfile(selectedEnv, name, pdir);
       setInfo(`已删除 profile「${name}」`);
-      if (selectedProfile === name) {
-        setSelectedProfile("");
-        setSelectedProfilesDir("");
-      }
-      const ps = await api.listAllProfiles().catch(() => []);
-      setProfiles(ps);
+      // 重扫列表；loadProfiles 会把失效选中项自动切到剩余第一个
+      await loadProfiles();
     } catch (e) {
       setError(String(e));
     } finally {
@@ -692,7 +822,7 @@ export default function App() {
     setError("");
     setInfo("");
     try {
-      const list = await api.checkDeps(selectedEnv, selectedProfile, selectedProfilesDir);
+      const list = await api.checkDeps(selectedEnv, selectedProfile, profileDirOf(selectedProfile));
       setDeps(list);
       const missing = list.filter((d) => !d.installed).length;
       setInfo(missing > 0 ? `发现 ${missing} 个依赖缺失` : "依赖完整，全部已安装");
@@ -711,13 +841,13 @@ export default function App() {
     setError("");
     setInfo("正在修复依赖（pnpm install）...");
     try {
-      const r = await api.fixDeps(selectedEnv, selectedProfile, selectedProfilesDir);
+      const r = await api.fixDeps(selectedEnv, selectedProfile, profileDirOf(selectedProfile));
       if (r.success) {
         setInfo("依赖修复完成");
       } else {
         setError(`修复失败（退出码 ${r.exitCode ?? "?"}）：${r.summary}`);
       }
-      const list = await api.checkDeps(selectedEnv, selectedProfile, selectedProfilesDir).catch(() => null);
+      const list = await api.checkDeps(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).catch(() => null);
       if (list) setDeps(list);
     } catch (e) {
       setError(String(e));
@@ -733,7 +863,7 @@ export default function App() {
     setError("");
     setInfo("");
     try {
-      const list = await api.scanJunk(selectedEnv, selectedProfile, selectedProfilesDir);
+      const list = await api.scanJunk(selectedEnv, selectedProfile, profileDirOf(selectedProfile));
       setJunk(list);
       if (list.length === 0) setInfo("未发现可清理的残留缓存");
     } catch (e) {
@@ -752,7 +882,7 @@ export default function App() {
     setInfo("正在清理残留缓存...");
     try {
       const names = junk.map((j) => j.name);
-      const removed = await api.cleanJunk(selectedEnv, selectedProfile, selectedProfilesDir, names);
+      const removed = await api.cleanJunk(selectedEnv, selectedProfile, profileDirOf(selectedProfile), names);
       setInfo(`已清理 ${removed.length} 项`);
       setJunk(null);
     } catch (e) {
@@ -813,13 +943,14 @@ export default function App() {
     const e = envs.find((x) => x.id === envId);
     return !!e && !!e.runCommand.trim();
   };
-  // 当前选中 env×profile 的运行实例
+  // 当前选中 env×profile 的运行实例（目录以列表解析为准，避免 selectedProfilesDir 为空时匹配失败）
+  const curPdir = profileDirOf(selectedProfile);
   const curRun =
     runnings.find(
       (r) =>
         r.envId === selectedEnv &&
         r.profile === selectedProfile &&
-        r.profilesDir === selectedProfilesDir,
+        (!curPdir || r.profilesDir === curPdir),
     ) ?? null;
 
   const fileButtons = paths
@@ -862,6 +993,37 @@ export default function App() {
           <button className="btn tiny" onClick={() => setInfo("")}>×</button>
         </div>
       )}
+      {portableReady === false && (
+        <div className="banner warn">
+          <span>
+            ⚡ 尚未初始化便携运行时（Node.js LTS + pnpm）。请点
+            <b>「初始化环境」</b>
+            自动下载安装到 <code>%AppData%\dsh-plugin-manager\runtime\</code>
+            ，不改动系统 PATH。
+          </span>
+          <button
+            className="btn tiny danger"
+            disabled={initingPortable}
+            onClick={handleInitPortable}
+          >
+            {initingPortable ? "初始化中…" : "⚡ 初始化环境"}
+          </button>
+        </div>
+      )}
+      {portableReady === true && portableBannerOpen && (
+        <div className="banner ready">
+          <span>✅ 便携运行时就绪：%AppData%\dsh-plugin-manager\runtime\</span>
+          <button className="btn tiny" onClick={() => setPortableBannerOpen(false)}>×</button>
+        </div>
+      )}
+      {showInitHint && envs.length > 0 && profiles.length === 0 && (
+        <div className="banner info">
+          <span>
+            ℹ 当前没有 profile，请点击中栏「初始化」按钮完成初始化（dsh 会自动创建默认 web profile）
+          </span>
+          <button className="btn tiny" onClick={() => setShowInitHint(false)} title="关闭提示">×</button>
+        </div>
+      )}
 
       <main className="layout">
         {/* 左：环境列表 */}
@@ -869,9 +1031,24 @@ export default function App() {
           <div className="panel-title">
             <h2>DSH 环境</h2>
             <div className="title-actions">
-              <button className="btn tiny" onClick={() => setShowDshDownload(true)} title="下载并安装 DSH 多版本到指定目录">
-                ⬇ 下载DSH
-              </button>
+              {portableReady === false || initingPortable ? (
+                <button
+                  className="btn tiny danger"
+                  disabled={initingPortable}
+                  onClick={handleInitPortable}
+                  title="下载并安装便携运行时（Node.js LTS + pnpm）到 %AppData%\dsh-plugin-manager\runtime"
+                >
+                  {initingPortable ? "初始化中…" : "⚡ 初始化环境"}
+                </button>
+              ) : (
+                <button
+                  className="btn tiny"
+                  onClick={openDshDownload}
+                  title="下载并安装 DSH 多版本到指定目录（需已初始化便携运行时）"
+                >
+                  ⬇ 下载DSH
+                </button>
+              )}
               <button className="btn tiny" onClick={handleAddDshScan} disabled={busy} title="把电脑上已安装的 dsh（CLI / DSH Desktop 内置 / 本地项目）添加为可启动、可装插件的环境">
                 ＋扫本体
               </button>
@@ -927,9 +1104,19 @@ export default function App() {
           <div className="panel-title">
             <h2>Profiles</h2>
             <div className="title-actions">
-              <button className="btn tiny" onClick={() => setShowCreateProfile(true)} disabled={!selectedEnv} title="新建空白 profile（含默认 bundle）">
-                ＋新建
-              </button>
+              {initRunning ? (
+                <button className="btn tiny init-btn" onClick={handleStopInit} disabled={creatingProfile || !selectedEnv} title="停止初始化启动的 DSH 进程">
+                  结束初始化
+                </button>
+              ) : envs.length > 0 && profiles.length === 0 ? (
+                <button className="btn tiny init-btn" onClick={handleInitProfile} disabled={creatingProfile || !selectedEnv} title="用本地 dsh 启动内置 web profile（首次自动创建并初始化）">
+                  初始化
+                </button>
+              ) : (
+                <button className="btn tiny" onClick={() => setShowCreateProfile(true)} disabled={creatingProfile || !selectedEnv} title="新建空白 profile（含默认 bundle）">
+                  ＋新建
+                </button>
+              )}
               <button className="btn tiny" onClick={handleAddScanDir} disabled={busy} title="扫描本地 DSH_HOME 或 profiles 目录">
                 ＋扫Profile
               </button>
@@ -1400,11 +1587,11 @@ export default function App() {
         <InstallDialog
           env={selectedEnvObj}
           profile={selectedProfile}
-          profilesDir={selectedProfilesDir}
+          profilesDir={profileDirOf(selectedProfile)}
           initialTab={installTab}
           onClose={() => setShowInstall(false)}
           onInstalled={() => {
-            api.listPlugins(selectedEnv, selectedProfile, selectedProfilesDir).then(setPlugins).catch(() => {});
+            api.listPlugins(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).then(setPlugins).catch(() => {});
           }}
         />
       )}
@@ -1524,8 +1711,11 @@ export default function App() {
             <ExportOptions
               profile={exportTarget.profile}
               nmSize={exportTarget.nmSize}
+              versions={Array.from(new Set(envs.map((e) => e.version).filter((v) => v && v !== "—")))}
               onConfirmZip={(exclude) => doExport(exclude)}
-              onConfirmPack={(name, version, displayName) => doExportPack(name, version, displayName)}
+              onConfirmPack={(name, version, displayName, dshHint) =>
+                doExportPack(name, version, displayName, dshHint)
+              }
               onClone={doClone}
               onCancel={() => setExportTarget(null)}
               busy={busy}
@@ -1605,7 +1795,7 @@ export default function App() {
         <ImportDialog
           envId={selectedEnv}
           envName={envs.find((e) => e.id === selectedEnv)?.name ?? ""}
-          profilesDir={selectedProfilesDir}
+          profilesDir={profileDirOf(selectedProfile)}
           onClose={() => setShowImportDialog(false)}
           onImported={refreshAfterImport}
           setGlobalError={(m) => setError(m)}
@@ -1644,6 +1834,7 @@ export default function App() {
 function ExportOptions({
   profile,
   nmSize,
+  versions,
   onConfirmZip,
   onConfirmPack,
   onClone,
@@ -1652,8 +1843,9 @@ function ExportOptions({
 }: {
   profile: string;
   nmSize: number;
+  versions: string[];
   onConfirmZip: (exclude: boolean) => void;
-  onConfirmPack: (name: string, version: string, displayName: string) => void;
+  onConfirmPack: (name: string, version: string, displayName: string, dshHint: string) => void;
   onClone: () => void;
   onCancel: () => void;
   busy: boolean;
@@ -1663,6 +1855,8 @@ function ExportOptions({
   const [packName, setPackName] = useState(profile);
   const [packVersion, setPackVersion] = useState("1.0.0");
   const [displayName, setDisplayName] = useState("");
+  const [dshHint, setDshHint] = useState("");
+  const [customHint, setCustomHint] = useState("");
   return (
     <div>
       <div className="seg-row">
@@ -1694,8 +1888,29 @@ function ExportOptions({
             显示名（可选）
             <input value={displayName} onChange={(e) => setDisplayName(e.target.value)} placeholder="我的整合包" />
           </label>
+          <label>
+            适配版本（写入 manifest.dshVersion）
+            <select value={dshHint} onChange={(e) => setDshHint(e.target.value)}>
+              <option value="">（使用当前环境版本）</option>
+              {versions.map((v) => (
+                <option key={v} value={v}>{v}</option>
+              ))}
+              <option value="__custom__">自定义…</option>
+            </select>
+          </label>
+          {dshHint === "__custom__" && (
+            <label>
+              自定义 DSH 版本
+              <input
+                value={customHint}
+                onChange={(e) => setCustomHint(e.target.value)}
+                placeholder="如 0.1.7-rc.2（不要求本机已安装）"
+              />
+            </label>
+          )}
           <p className="modal-hint">
             按 DSH-PackForge 规范导出 .dspack v3（含 manifest v5；自动排除 node_modules / 运行数据 / 凭据）。
+            适配版本仅作提示，导入方会写入 profile 备注。
           </p>
         </div>
       )}
@@ -1711,7 +1926,18 @@ function ExportOptions({
             {busy ? "导出中..." : "选择位置并导出"}
           </button>
         ) : (
-          <button className="btn primary" onClick={() => onConfirmPack(packName, packVersion, displayName)} disabled={busy}>
+          <button
+            className="btn primary"
+            onClick={() =>
+              onConfirmPack(
+                packName,
+                packVersion,
+                displayName,
+                dshHint === "__custom__" ? customHint : dshHint,
+              )
+            }
+            disabled={busy || (dshHint === "__custom__" && !customHint.trim())}
+          >
             {busy ? "导出中..." : "选择位置并导出整合包"}
           </button>
         )}
@@ -1720,7 +1946,7 @@ function ExportOptions({
   );
 }
 
-/** 新建 profile 表单 */
+/** 新建 profile 表单：必选 profiles 目录（不是则要求重新选） */
 function CreateProfileForm({
   busy,
   onCancel,
@@ -1728,10 +1954,23 @@ function CreateProfileForm({
 }: {
   busy: boolean;
   onCancel: () => void;
-  onCreate: (name: string) => void;
+  onCreate: (name: string, profilesDir: string) => void;
 }) {
   const [name, setName] = useState("");
+  const [dir, setDir] = useState("");
   const [err, setErr] = useState("");
+  const pick = async () => {
+    setErr("");
+    const p = await pickFolder("选择 profiles 目录（文件夹名须为 profiles）");
+    if (!p) return;
+    // 严格：必须是 profiles 文件夹本体，否则要求重新选
+    const leaf = p.split(/[\\/]/).filter(Boolean).pop() ?? "";
+    if (leaf.toLowerCase() !== "profiles") {
+      setErr("所选目录不是 profiles 文件夹（文件夹名须为 profiles），请重新选择");
+      return;
+    }
+    setDir(p);
+  };
   const submit = () => {
     const n = name.trim();
     if (!n) {
@@ -1742,7 +1981,11 @@ function CreateProfileForm({
       setErr("名称不能包含 < > : \" / \\ | ? * 字符");
       return;
     }
-    onCreate(n);
+    if (!dir.trim()) {
+      setErr("请选择 profiles 目录");
+      return;
+    }
+    onCreate(n, dir.trim());
   };
   return (
     <div>
@@ -1756,12 +1999,26 @@ function CreateProfileForm({
           onKeyDown={(e) => e.key === "Enter" && submit()}
         />
       </label>
+      <label>
+        目标 profiles 目录（必选）
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <input
+            value={dir}
+            readOnly
+            placeholder="点击「选择目录」指定 profiles 文件夹"
+            style={{ flex: 1 }}
+          />
+          <button type="button" className="btn tiny" onClick={pick} disabled={busy}>
+            选择目录
+          </button>
+        </div>
+      </label>
       {err && <div className="modal-err">{err}</div>}
       <div className="modal-actions">
         <button className="btn" onClick={onCancel} disabled={busy}>
           取消
         </button>
-        <button className="btn primary" onClick={submit} disabled={busy || !name.trim()}>
+        <button className="btn primary" onClick={submit} disabled={busy || !name.trim() || !dir.trim()}>
           {busy ? "创建中..." : "创建"}
         </button>
       </div>
@@ -1930,7 +2187,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.6</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.7</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -2286,7 +2543,7 @@ function ImportDialog({
 
   const finish = async (result: PackImportResult) => {
     setGlobalInfo(
-      `整合包导入成功：${result.finalNames.join("、")}${result.renamed ? "（重名已自动改名）" : ""}${result.homeWritten ? `，写入全局文件 ${result.homeWritten} 个` : ""}`,
+      `整合包导入成功：${result.finalNames.join("、")}${result.renamed ? "（重名已自动改名）" : ""}${result.homeWritten ? `，写入全局文件 ${result.homeWritten} 个` : ""}${result.dshHint ? ` · 已写入备注适配版本 DSH ${result.dshHint}` : ""}`,
     );
     onImported(result.finalNames);
     close();

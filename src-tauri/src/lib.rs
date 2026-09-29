@@ -657,6 +657,12 @@ fn pick_port(requested: Option<u16>, used: &[u16]) -> Result<u16, String> {
     }
 }
 
+/// 内置模板名且目录尚不存在 → 放行（dsh 首次运行自举创建并初始化）
+fn builtin_profile_allowed(profile: &str, profiles_dir: &std::path::Path) -> bool {
+    let builtin = ["web", "headless", "acp", "sdk", "sdk-minimal"];
+    builtin.contains(&profile) && !profiles_dir.join(profile).is_dir()
+}
+
 /// 启动前补齐 profile 关键文件：pnpm-workspace.yaml（dsh 模块解析依赖它；
 /// 旧版创建 / 部分导入的 profile 可能缺失，缺它会导致启动失败）。
 /// dsh 启动时自行处理 bundles 依赖，无需预装 node_modules。
@@ -728,9 +734,13 @@ async fn start_dsh_cmd(
 
     // profile 来源目录（任意 dsh × 任意来源 profile 组合：注入 DSH_HOME）
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    // 启动前兜底：profile 缺依赖（新建未装/导入未装）时自动 pnpm install（日志流式）
-    if let Err(e) = ensure_profile_deps(&profile, &profiles_dir) {
-        return Err(format!("profile 依赖检查失败：{e}"));
+    // 启动前兜底：profile 缺依赖（新建未装/导入未装）时自动 pnpm install（日志流式）；
+    // 内置模板名（web/headless/acp/sdk/sdk-minimal）目录不存在时跳过——
+    // 让 dsh 首次运行自行创建并初始化（官方自举行为，等价 npx @deepseek-ai/dsh web）
+    if !builtin_profile_allowed(&profile, &profiles_dir) {
+        if let Err(e) = ensure_profile_deps(&profile, &profiles_dir) {
+            return Err(format!("profile 依赖检查失败：{e}"));
+        }
     }
     let key = run_key(&env_id, &profiles_dir_str, &profile);
     // per-key 启动互斥：并发双击同一组合时，第二次直接拒绝（防双开/抢端口）
@@ -931,24 +941,31 @@ fn list_running_cmd(state: State<'_, AppState>) -> Vec<RunningProcess> {
 
 // ==================== 命令：Profile 导出/导入 ====================
 
-/// 新建 profile
+/// 新建 profile（目标目录必须是 profiles 文件夹，不满足报错）
 #[tauri::command]
 fn create_profile_cmd(
-    app: tauri::AppHandle,
     state: State<'_, AppState>,
     env_id: String,
     name: String,
     profiles_dir_str: String,
 ) -> Result<profile_io::CreateProfileResult, String> {
     let env = get_env_inner(&state, &env_id)?;
-    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    if !profiles_dir.is_dir() {
-        return Err(format!("profiles 目录不存在: {}", profiles_dir.display()));
-    }
-    let result = profile_io::create_profile(&profiles_dir, &name)?;
-    // dsh 启动时会自行处理 bundles（dsh-base / dsh-web-app 由运行时解析），
-    // 无需预先 pnpm install；关键文件 pnpm-workspace.yaml 已在 create_profile 中写入。
-    Ok(result)
+    let profiles_dir = if profiles_dir_str.trim().is_empty() {
+        profiles_dir_of(&env)
+    } else {
+        let p = std::path::Path::new(profiles_dir_str.trim());
+        // 仅接受 profiles 目录本体（文件夹名须为 profiles）
+        let leaf = p
+            .file_name()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if leaf != "profiles" {
+            return Err("目标目录不是 profiles 文件夹（文件夹名须为 profiles），请重新选择".to_string());
+        }
+        p.to_path_buf()
+    };
+    // 目录不存在也允许（create_profile 内部 create_dir_all 递归创建 profiles 目录）
+    profile_io::create_profile(&profiles_dir, &name)
 }
 
 /// 删除 profile（running 时拒绝）
@@ -1003,6 +1020,36 @@ fn set_settings_cmd(npm_registry: String, dsh_download_dir: String, github_mirro
 
 /// 项目仓库信息（关于 / 检查更新用）
 const PROJECT_REPO: &str = "Liaoyuanxinghuo/DSH-Plugin-Manager";
+
+/// 检测便携运行时是否已就绪（%AppData%\dsh-plugin-manager\runtime\ 内 Node≥24 + npm + pnpm）
+#[tauri::command]
+fn check_portable_runtime_cmd() -> bool {
+    toolchain::runtime_toolchain().is_some()
+}
+
+/// 初始化便携运行时：完整下载 Node LTS 到 runtime 并安装 pnpm（已就绪则直接返回）。
+/// 不改系统 PATH；子进程一律用绝对路径。
+#[tauri::command]
+async fn init_portable_runtime_cmd(app: tauri::AppHandle) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Some(t) = toolchain::runtime_toolchain() {
+            return Ok(format!("便携运行时已就绪：{}", t.node.display()));
+        }
+        let registry = settings::load_settings().npm_registry;
+        let tc = toolchain::ensure_force(&app, &registry)?;
+        Ok(format!(
+            "便携运行时安装完成：node {}（{}）· pnpm {}",
+            tc.node.display(),
+            tc.node_dir.display(),
+            tc.pnpm
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "—".into())
+        ))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
+}
 
 /// 版本号数值化（v 前缀与 rc 后缀忽略，取前 3 段数字）
 fn ver_nums(v: &str) -> Vec<u32> {
@@ -1627,6 +1674,7 @@ async fn profile_node_modules_size(
 // ==================== 命令：整合包（DSH-PackForge） ====================
 
 /// 导出整合包：profile → .dspack v3
+/// `dsh_hint`：下拉选择的「适配版本」写入 manifest.dshVersion；空则用当前环境版本
 #[tauri::command]
 async fn export_pack_cmd(
     state: State<'_, AppState>,
@@ -1637,6 +1685,7 @@ async fn export_pack_cmd(
     pack_name: String,
     pack_version: String,
     display_name: String,
+    dsh_hint: Option<String>,
 ) -> Result<packforge::PackExportResult, String> {
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
@@ -1653,7 +1702,17 @@ async fn export_pack_cmd(
     } else {
         std::path::PathBuf::from(target_path)
     };
-    let env_ver = env.version.clone();
+    // 适配版本：下拉指定优先，否则当前环境版本
+    let hint = dsh_hint
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('v')
+        .to_string();
+    let env_ver = if hint.is_empty() {
+        env.version.clone()
+    } else {
+        hint
+    };
     // zip 打包放阻塞线程池
     tauri::async_runtime::spawn_blocking(move || {
         packforge::export_pack(
@@ -2119,6 +2178,8 @@ pub fn run() {
             allow_version_cmd,
             disallow_version_cmd,
             stop_all_dsh_cmd,
+            check_portable_runtime_cmd,
+            init_portable_runtime_cmd,
         ])
         .setup(|app| {
             // 按物理像素设置窗口初始尺寸：避免高 DPI 缩放下逻辑尺寸被放大
@@ -2196,13 +2257,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.6_x64-setup.exe", "0.3.6"));
-        assert!(asset_matches("dsh-manager_0.3.6_x64-setup.exe", "0.3.6"));
-        assert!(asset_matches("任意名_0.3.6_x64-setup.exe", "0.3.6"));
-        assert!(!asset_matches("DSH-Manager-0.3.6-win-x64.exe", "0.3.6"));
-        assert!(!asset_matches("DSH Manager_0.3.6_x64-setup.exe.sha256", "0.3.6"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.6"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.6"));
+        assert!(asset_matches("DSH Manager_0.3.7_x64-setup.exe", "0.3.7"));
+        assert!(asset_matches("dsh-manager_0.3.7_x64-setup.exe", "0.3.7"));
+        assert!(asset_matches("任意名_0.3.7_x64-setup.exe", "0.3.7"));
+        assert!(!asset_matches("DSH-Manager-0.3.7-win-x64.exe", "0.3.7"));
+        assert!(!asset_matches("DSH Manager_0.3.7_x64-setup.exe.sha256", "0.3.7"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.7"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.7"));
     }
 
     #[test]
@@ -2220,6 +2281,20 @@ mod tests {
         // 已存在时不重复写
         let r2 = ensure_profile_deps("x", &pdir);
         assert!(r2.is_ok());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn builtin_profile_allowed_rules() {
+        let tmp = std::env::temp_dir().join(format!("dshpm-t-builtin-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        assert!(builtin_profile_allowed("web", &tmp));
+        assert!(builtin_profile_allowed("headless", &tmp));
+        assert!(builtin_profile_allowed("sdk-minimal", &tmp));
+        assert!(!builtin_profile_allowed("custom", &tmp));
+        assert!(!builtin_profile_allowed("init", &tmp));
+        std::fs::create_dir_all(tmp.join("web")).unwrap();
+        assert!(!builtin_profile_allowed("web", &tmp));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2320,7 +2395,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.6", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.7", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

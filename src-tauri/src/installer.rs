@@ -14,7 +14,7 @@ pub struct InstallOutcome {
     pub summary: String,
 }
 
-/// 执行 dsh 命令并流式推送日志事件
+/// 执行 dsh 命令并流式推送日志事件（**绝对路径 node + bin.js**，不依赖 PATH、不弹黑框）
 /// 事件: install-log (line, kind), install-done (success, exitCode)
 pub fn run_dsh_with_logs(
     app: &tauri::AppHandle,
@@ -22,33 +22,53 @@ pub fn run_dsh_with_logs(
     args: &[String],
     dsh_home: Option<&str>,
 ) -> InstallOutcome {
-    let mut full = format!("chcp 65001 >nul && {}", env.run_command);
-    for a in args {
-        full.push(' ');
-        full.push_str(a);
-    }
-    let mut cmd = Command::new("cmd");
-    cmd.args(["/C", &full]);
+    // 1) 便携运行时（缺则自动下载；绝不动 PATH，子进程只带 NODE 等运行时变量）
+    let registry = crate::settings::load_settings().npm_registry;
+    let tc = match crate::toolchain::ensure(app, &registry) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = app.emit(
+                "install-log",
+                serde_json::json!({ "line": format!("工具链检查失败: {e}"), "kind": "stderr" }),
+            );
+            return InstallOutcome {
+                success: false,
+                exit_code: None,
+                summary: format!("工具链不可用：{e}"),
+            };
+        }
+    };
+
+    // 2) 优先：绝对路径 node.exe + bin.js（绕开 dsh.cmd shim 对 PATH 的依赖）
+    let mut cmd = match crate::runner::resolve_dsh_launcher(env) {
+        Ok((node, binjs)) => {
+            let mut c = Command::new(&node);
+            c.arg(&binjs);
+            for a in args {
+                c.arg(a);
+            }
+            c
+        }
+        Err(_) => {
+            // 3) 兜底：环境自带 run_command（如全局 dsh.cmd，本机自洽时才可用）
+            let mut full = env.run_command.clone();
+            for a in args {
+                full.push(' ');
+                full.push_str(a);
+            }
+            let mut c = Command::new("cmd");
+            c.args(["/C", &format!("chcp 65001 >nul && {full}")]);
+            c
+        }
+    };
     if let Some(home) = dsh_home {
         cmd.env("DSH_HOME", home);
     }
-    // 注入 node 目录到 PATH（dsh.cmd shim / pnpm 依赖 node；PATH 可能没有）。
-    // 电脑未装 node 时先自动下载安装（失败不阻断，日志如实展示）。
-    let mut tc = crate::toolchain::probe();
-    if !tc.node.is_file() {
-        let registry = crate::settings::load_settings().npm_registry;
-        match crate::toolchain::ensure(app, &registry) {
-            Ok(t) => tc = t,
-            Err(e) => {
-                let _ = app.emit("install-log", serde_json::json!({ "line": format!("自动安装 Node.js 失败: {e}"), "kind": "stderr" }));
-            }
-        }
-    }
-    tc.inject_path(&mut cmd);
+    tc.apply_runtime_env(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：禁止弹出控制台黑框
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
 
@@ -212,5 +232,49 @@ mod tests {
         assert_eq!(args[3], "add");
         assert_eq!(args[4], "dshmarket");
         let _ = &env;
+    }
+
+    /// 真实验证：绝对路径 node 启动 dsh，**PATH 清空也能跑**（不靠 PATH、不置顶）。
+    /// `cargo test --lib real_absolute_dsh_without_path -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_absolute_dsh_without_path() {
+        let registry = "https://registry.npmmirror.com";
+        // 不触发下载：仅当 runtime 已就绪才测；否则用本机可解析的 node+bin.js
+        let env = {
+            // 任选一个本机 dsh 布局（download 或 DSH Desktop）
+            let candidates = [
+                r"C:\dsh-versions\dsh-0.1.7-rc.1\node_modules\.bin\dsh.cmd",
+                r"C:\dsh-versions\dsh-0.2.0-rc.1\node_modules\.bin\dsh.cmd",
+            ];
+            let hit = candidates.iter().find(|p| std::path::Path::new(p).is_file());
+            let Some(cmd) = hit else {
+                eprintln!("SKIP: 本机无 dsh 安装");
+                return;
+            };
+            DshEnv {
+                id: "real".into(),
+                name: "real".into(),
+                source: crate::models::EnvSource::Manual,
+                version: "test".into(),
+                home_dir: ".".into(),
+                run_command: cmd.to_string(),
+                bin_path: None,
+                scan_profiles_dir: None,
+            }
+        };
+        let _ = registry;
+        let (node, binjs) = crate::runner::resolve_dsh_launcher(&env).expect("应解析出 node+bin.js");
+        println!("node={node}\nbinjs={binjs}");
+        // PATH 置空 + 只带 NODE 运行时变量 → 仍应输出版本
+        let mut c = Command::new(&node);
+        c.arg(&binjs).arg("-V");
+        c.env("PATH", "");
+        c.env("NODE", &node);
+        let out = c.output().expect("spawn node bin.js -V");
+        let s = String::from_utf8_lossy(&out.stdout);
+        let e = String::from_utf8_lossy(&out.stderr);
+        println!("stdout=[{s}] stderr=[{e}]");
+        assert!(!s.trim().is_empty(), "绝对路径启动 dsh -V 应有输出，PATH 为空也要能跑");
     }
 }

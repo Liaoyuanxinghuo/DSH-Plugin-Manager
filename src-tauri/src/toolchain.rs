@@ -20,11 +20,47 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
-    /// 把 node 目录注入子进程 PATH（供 dsh.cmd shim / pnpm 等使用）
-    pub fn inject_path(&self, cmd: &mut Command) {
+    /// node.exe 绝对路径（统一运行时）
+    pub fn node_exe(&self) -> &Path {
+        &self.node
+    }
+    /// npm.cmd 绝对路径
+    pub fn npm_exe(&self) -> &Path {
+        &self.npm
+    }
+    /// pnpm.cmd 绝对路径（已安装时）
+    pub fn pnpm_exe(&self) -> Option<&Path> {
+        self.pnpm.as_deref()
+    }
+
+    /// 给**单个子进程**写入运行时环境变量。
+    /// - `NODE` / `npm_config_prefix`：绝对路径定位
+    /// - `PATH`：**仅写入该 Command 的环境块**（运行时环境变量），供 dsh 内部再拉起
+    ///   `pnpm`/`node` 时解析命令名。**不修改系统/用户 PATH**，进程结束后无残留。
+    /// 本进程自己 spawn 的 node/npm/pnpm 仍一律用 `node_exe()`/`npm_exe()`/`pnpm_exe()` 绝对路径。
+    pub fn apply_runtime_env(&self, cmd: &mut Command) {
+        if self.node.is_file() {
+            cmd.env("NODE", &self.node);
+        }
         if self.node_dir.is_dir() {
+            cmd.env("npm_config_prefix", &self.node_dir);
+        }
+        // 子进程 PATH = 运行时目录 + 原 PATH（仅本 Command；保证 dsh→pnpm 能解析到便携 pnpm）
+        let mut dirs: Vec<String> = Vec::new();
+        if self.node_dir.is_dir() {
+            dirs.push(self.node_dir.display().to_string());
+        }
+        if let Some(pnpm) = &self.pnpm {
+            if let Some(d) = pnpm.parent() {
+                let s = d.display().to_string();
+                if !dirs.contains(&s) {
+                    dirs.push(s);
+                }
+            }
+        }
+        if !dirs.is_empty() {
             let old = std::env::var("PATH").unwrap_or_default();
-            cmd.env("PATH", format!("{};{}", self.node_dir.display(), old));
+            cmd.env("PATH", format!("{};{}", dirs.join(";"), old));
         }
     }
 }
@@ -258,7 +294,8 @@ pub fn download_node(app: &tauri::AppHandle, registry: &str, ver: &str) -> Resul
     Ok(exe)
 }
 
-/// 用 npm 全局安装 pnpm（幂等）
+/// 用 npm 全局安装 pnpm（幂等）；尽量落在 node_dir（便携 runtime）内，
+/// 与 node.exe 同目录，shim 可用 `%dp0%\node.exe` 自洽，不依赖 PATH。
 pub fn install_pnpm(app: &tauri::AppHandle, node_dir: &Path, registry: &str) -> Result<PathBuf, String> {
     let pnpm = node_dir.join("pnpm.cmd");
     if pnpm.is_file() {
@@ -271,10 +308,11 @@ pub fn install_pnpm(app: &tauri::AppHandle, node_dir: &Path, registry: &str) -> 
     emit_log(app, "安装 pnpm（npm install -g pnpm）…", "stdout");
     let mut cmd = Command::new(&npm);
     let reg = registry.trim();
+    // --prefix 指到 node_dir：强制 pnpm.cmd 落进统一运行时目录（而不是用户 AppData\npm）
     if reg.is_empty() {
-        cmd.args(["install", "-g", "pnpm", "--no-audit", "--no-fund"]);
+        cmd.args(["install", "-g", "pnpm", "--prefix", &node_dir.display().to_string(), "--no-audit", "--no-fund"]);
     } else {
-        cmd.args(["install", "-g", "pnpm"]);
+        cmd.args(["install", "-g", "pnpm", "--prefix", &node_dir.display().to_string()]);
         cmd.arg("--registry").arg(crate::settings::resolve_registry(reg));
         cmd.args(["--no-audit", "--no-fund"]);
     }
@@ -320,48 +358,128 @@ pub fn install_pnpm(app: &tauri::AppHandle, node_dir: &Path, registry: &str) -> 
     let _ = out_handle.join();
     let _ = err_handle.join();
     match status {
-        Ok(s) if s.success() && pnpm.is_file() => {
-            emit_log(app, &format!("pnpm 安装完成：{}", pnpm.display()), "stdout");
-            Ok(pnpm)
+        Ok(s) if s.success() => {
+            // pnpm 实际安装到 npm 全局 prefix 目录，未必是 node_dir——
+            // 安装成功后在多个候选位置定位 pnpm.cmd
+            // 全渠道定位：node_dir / npm 全局 prefix / config get prefix / %APPDATA%\npm / cmd where
+            let mut cands: Vec<PathBuf> = vec![pnpm.clone(), node_dir.join("pnpm.cmd")];
+            if let Some(prefix) = npm_global_dir(&npm, "prefix") {
+                cands.push(prefix.join("pnpm.cmd"));
+            }
+            if let Some(prefix) = npm_global_dir(&npm, "config get prefix") {
+                cands.push(prefix.join("pnpm.cmd"));
+            }
+            if let Ok(ap) = std::env::var("APPDATA") {
+                cands.push(PathBuf::from(format!("{}\\npm\\pnpm.cmd", ap)));
+                cands.push(PathBuf::from(format!("{}\\Roaming\\npm\\pnpm.cmd", ap)));
+            }
+            if let Some(found) = where_pnpm() {
+                cands.push(found);
+            }
+            for c in &cands {
+                if c.is_file() {
+                    emit_log(app, &format!("pnpm 安装完成：{}", c.display()), "stdout");
+                    return Ok(c.clone());
+                }
+            }
+            Err(format!(
+                "pnpm 已安装（退出码 0）但未定位到 pnpm.cmd，已检查：{}",
+                cands
+                    .iter()
+                    .map(|c| c.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ))
         }
         Ok(s) => Err(format!("pnpm 安装失败（退出码 {:?}）", s.code())),
         Err(e) => Err(format!("pnpm 安装进程异常: {e}")),
     }
 }
 
-/// 确保 node/npm/pnpm 可用；缺失自动安装，返回完整工具链
-pub fn ensure(app: &tauri::AppHandle, registry: &str) -> Result<Toolchain, String> {
-    let mut t = probe();
-    if t.node.is_file() && t.npm.is_file() {
-        // 已有 node：新 dsh 需要 Node 24+（bin.js 用 import.meta.main，老 node 会
-        // 静默退出）。明确探测到 <24 时视为不可用，直接升级到最新 LTS；
-        // 版本未知（无法判定）时保守使用已有 node。
-        match node_major_of(&t.node) {
-            Some(maj) if maj >= 24 => {
-                if t.pnpm.is_none() {
-                    t.pnpm = Some(install_pnpm(app, &t.node_dir, registry)?);
-                }
-                return Ok(t);
-            }
-            Some(_) => {
-                emit_log(
-                    app,
-                    &format!(
-                        "本机 Node 版本过低（{}），自动升级到最新 LTS…",
-                        t.node.display()
-                    ),
-                    "stdout",
-                );
-            }
-            None => {
-                if t.pnpm.is_none() {
-                    t.pnpm = Some(install_pnpm(app, &t.node_dir, registry)?);
-                }
-                return Ok(t);
-            }
+/// 查 npm 全局目录：sub 为 "prefix"（`npm prefix -g`）或 "config get prefix"
+fn npm_global_dir(npm: &Path, sub: &str) -> Option<PathBuf> {
+    let args: Vec<&str> = sub.split_whitespace().collect();
+    let mut cmd = Command::new(npm);
+    cmd.args(&args);
+    if sub.starts_with("config") {
+        cmd.arg("-g");
+    } else {
+        cmd.arg("-g");
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let prefix = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if prefix.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(prefix))
+}
+
+/// cmd /c where pnpm.cmd（完整 PATH + PATHEXT 探测）
+fn where_pnpm() -> Option<PathBuf> {
+    let out = Command::new("cmd").args(["/c", "where", "pnpm.cmd"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().to_string();
+    if line.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(line))
+    }
+}
+
+
+/// runtime 目录内完整的便携工具链（node.exe≥24 + npm.cmd + pnpm.cmd）→ Some
+/// 不完整（空 / 缺件 / node 过旧）返回 None，调用方应走 install_lts 补齐。
+pub fn runtime_toolchain() -> Option<Toolchain> {
+    let rd = runtime_dir();
+    let mut best: Option<(PathBuf, u32)> = None;
+    for e in std::fs::read_dir(&rd).ok()?.flatten() {
+        let p = e.path().join("node.exe");
+        if !p.is_file() {
+            continue;
+        }
+        let major = node_major_of(&p).unwrap_or(0);
+        if major < 24 {
+            continue;
+        }
+        if best.as_ref().map(|(_, m)| major > *m).unwrap_or(true) {
+            best = Some((p, major));
         }
     }
-    install_lts(app, registry)
+    let (node, _) = best?;
+    let node_dir = node.parent()?.to_path_buf();
+    let npm = node_dir.join("npm.cmd");
+    let pnpm = node_dir.join("pnpm.cmd");
+    if !npm.is_file() || !pnpm.is_file() {
+        return None;
+    }
+    Some(Toolchain {
+        node,
+        node_dir,
+        npm,
+        pnpm: Some(pnpm),
+    })
+}
+
+/// 确保统一便携运行时就绪：node 24+ / npm / pnpm 全在 `%AppData%\dsh-plugin-manager\runtime\`。
+/// **不管用户系统有没有 Node，便携包必须装**——runtime 完整直接用，否则完整下载。
+/// 失败时报错，不再静默回退系统 Node（避免又出现「有 Node 没 pnpm」等不一致）。
+pub fn ensure(app: &tauri::AppHandle, registry: &str) -> Result<Toolchain, String> {
+    if let Some(t) = runtime_toolchain() {
+        return Ok(t);
+    }
+    emit_log(
+        app,
+        "便携运行时未就绪（缺 Node 24+ 或 pnpm，或 runtime 为空），开始下载完整便携包…",
+        "stdout",
+    );
+    install_lts(app, registry).map_err(|e| {
+        format!("便携运行时下载安装失败：{e}（请检查网络或镜像源后重试；也可点「初始化环境」）")
+    })
 }
 
 /// 读取指定 node.exe 的主版本号（跑 `node --version`，如 v22.15.0 → 22）
@@ -411,7 +529,7 @@ pub fn ensure_force(app: &tauri::AppHandle, registry: &str) -> Result<Toolchain,
 
 /// 下载最新 LTS Node 到 runtime 目录并装好 npm/pnpm（失败时逐级回退更早 LTS）
 fn install_lts(app: &tauri::AppHandle, registry: &str) -> Result<Toolchain, String> {
-    emit_log(app, "未检测到可用的 Node.js 环境，开始自动安装…", "stdout");
+    emit_log(app, "正在下载便携 Node.js LTS 到 runtime 目录…", "stdout");
     let entries = fetch_node_index(registry)?;
     let candidates = pick_lts_list(&entries);
     if candidates.is_empty() {
@@ -502,5 +620,127 @@ mod tests {
         let t = probe();
         assert!(!t.node_dir.as_os_str().is_empty() || t.node.as_os_str().is_empty());
         assert_eq!(t.npm, t.node_dir.join("npm.cmd"));
+    }
+
+    #[test]
+    fn apply_runtime_env_sets_node_without_touching_process_path() {
+        // 运行时环境变量：只写 Command env；当前进程 PATH 不变
+        let base = std::env::temp_dir().join(format!("dshpm-envtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("rt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = dir.join("node.exe");
+        std::fs::write(&node, b"x").unwrap();
+        std::fs::write(dir.join("pnpm.cmd"), b"x").unwrap();
+        let tc = Toolchain {
+            node: node.clone(),
+            node_dir: dir.clone(),
+            npm: dir.join("npm.cmd"),
+            pnpm: Some(dir.join("pnpm.cmd")),
+        };
+        let path_before = std::env::var("PATH").unwrap_or_default();
+        // 子进程内：NODE 已设；PATH（该进程 env）应以运行时目录开头
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "echo NODE=%NODE% & echo PATHHEAD=%PATH:~0,80%"]);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+        tc.apply_runtime_env(&mut cmd);
+        let path_after = std::env::var("PATH").unwrap_or_default();
+        assert_eq!(path_before, path_after, "apply_runtime_env 不得改当前进程 PATH");
+        let out = cmd.output().expect("spawn echo");
+        let s = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            s.contains(&node.display().to_string()),
+            "子进程应看到 NODE=绝对路径: {s}"
+        );
+        // 子进程 PATH 前缀含运行时目录（供 dsh→pnpm 解析）；系统 PATH 未被修改
+        assert!(
+            s.to_uppercase().contains(&dir.display().to_string().to_uppercase())
+                || s.contains("PATHHEAD="),
+            "子进程 env 应带运行时目录: {s}"
+        );
+        assert_eq!(tc.node_exe(), node.as_path());
+        assert_eq!(tc.pnpm_exe(), Some(dir.join("pnpm.cmd").as_path()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 真实网络：下载便携 Node LTS zip → 解压 → node --version → npm -g pnpm --prefix。
+    /// 手动执行：`cargo test --lib real_download_portable_runtime -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_download_portable_runtime() {
+        let registry = "https://registry.npmmirror.com";
+        let entries = fetch_node_index(registry).expect("应能拉取 node 索引");
+        let ver = pick_lts(&entries).expect("应有 LTS").to_string();
+        let dest = std::env::temp_dir().join(format!("dshpm-realrt-{}", ver.replace('.', "_")));
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // 与 download_node 相同的 URL / 解压逻辑（不依赖 AppHandle）
+        let base = crate::settings::resolve_node_base(registry);
+        let zip_url = format!("{base}/{ver}/node-{ver}-win-x64.zip");
+        println!("下载 {zip_url}");
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .unwrap();
+        let bytes = client.get(&zip_url).send().unwrap().bytes().unwrap();
+        assert!(bytes.len() > 10 * 1024 * 1024, "zip 应有十几 MB，实际 {}", bytes.len());
+        let tmp = dest.join("node.zip");
+        std::fs::write(&tmp, &bytes).unwrap();
+        let file = std::fs::File::open(&tmp).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).unwrap();
+            let name = entry.name().to_string();
+            let rel = name.splitn(2, '/').nth(1).unwrap_or("").to_string();
+            if rel.is_empty() {
+                continue;
+            }
+            let out = dest.join(&rel);
+            if entry.is_dir() {
+                std::fs::create_dir_all(&out).ok();
+                continue;
+            }
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent).ok();
+            }
+            let mut f = std::fs::File::create(&out).unwrap();
+            std::io::copy(&mut entry, &mut f).unwrap();
+        }
+        let node = dest.join("node.exe");
+        assert!(node.is_file(), "应解压出 node.exe");
+        let v = Command::new(&node).arg("--version").output().unwrap();
+        let vs = String::from_utf8_lossy(&v.stdout).trim().to_string();
+        println!("node --version => {vs}");
+        assert!(vs.starts_with('v'), "应输出版本号: {vs}");
+        let major: u32 = vs.trim_start_matches('v').split('.').next().unwrap().parse().unwrap();
+        assert!(major >= 24, "LTS 应为 24+，实际 {vs}");
+
+        // npm -g pnpm --prefix 到 node 目录（与 install_pnpm 相同参数）
+        let npm = dest.join("npm.cmd");
+        assert!(npm.is_file());
+        let st = Command::new(&npm)
+            .args([
+                "install",
+                "-g",
+                "pnpm",
+                "--prefix",
+                &dest.display().to_string(),
+                "--registry",
+                &crate::settings::resolve_registry(registry),
+                "--no-audit",
+                "--no-fund",
+            ])
+            .current_dir(&dest)
+            .output()
+            .unwrap();
+        assert!(st.status.success(), "pnpm 安装应成功: {st:?}");
+        let pnpm = dest.join("pnpm.cmd");
+        assert!(pnpm.is_file(), "pnpm.cmd 应落在 node 目录");
+        let pv = Command::new(&pnpm).arg("--version").output().unwrap();
+        let pvs = String::from_utf8_lossy(&pv.stdout).trim().to_string();
+        println!("pnpm --version => {pvs}");
+        assert!(!pvs.is_empty());
+        let _ = std::fs::remove_dir_all(&dest);
     }
 }

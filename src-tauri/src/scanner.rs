@@ -1,4 +1,4 @@
-//! 环境扫描器：探测 DSH 版本、解析 profile 与插件清单
+﻿//! 环境扫描器：探测 DSH 版本、解析 profile 与插件清单
 
 use crate::models::*;
 use std::fs;
@@ -40,7 +40,7 @@ pub fn probe_version_cmd(bin: &str) -> CommandOutput {
     cmd.args(["/C", bin.trim().trim_matches('"')]);
     cmd.arg("--version");
     let tc = crate::toolchain::probe();
-    tc.inject_path(&mut cmd);
+    tc.apply_runtime_env(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

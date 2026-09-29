@@ -264,6 +264,8 @@ export interface PackImportResult {
   homeWritten: number;
   backupDir: string;
   targetPath: string;
+  /** 从包解析的依赖 DSH 版本（已写入 profile 备注「适配版本」） */
+  dshHint: string;
 }
 
 export interface ProfileNote {

@@ -30,6 +30,8 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .banner { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; font-size: 13px; flex-shrink: 0; }
 .banner.error { background: #3a1d1d; color: #ffb3ad; border-bottom: 1px solid #5c2a28; }
 .banner.info { background: #12283f; color: #9ec5fe; border-bottom: 1px solid #1e3a5f; }
+.banner.warn { background: #3a2e12; color: #ffd479; border-bottom: 1px solid #5c4a1e; }
+.banner.ready { background: #14301f; color: #7fd6a2; border-bottom: 1px solid #1e4a2e; }
 
 /* 主布局 */
 .layout { display: grid; grid-template-columns: 260px 300px 1fr; gap: 10px; padding: 10px; flex: 1; min-height: 0; overflow: hidden; }
@@ -322,3 +324,7 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 /* 日志：warn 黄色 / error 红色 */
 .log-warn { color: #e6c85c; }
 .log-err { color: #ffb3ad; }
+
+/* 初始化按钮（无 profile 时红色提示） */
+.panel-title .init-btn { color: #ff5c5c; font-weight: 600; }
+.panel-title .init-btn:hover { color: #ff8080; }

@@ -80,8 +80,9 @@ pub fn install_dsh_version(
     // 1) 下载前确保 node/npm/pnpm 环境（缺失自动安装）
     let _ = app.emit(
         "install-log",
-        serde_json::json!({ "line": "正在检查工具链（node/npm/pnpm；缺失时自动下载安装）…", "kind": "stdout" }),
+        serde_json::json!({ "line": "正在检查便携运行时（必须：Node LTS + pnpm → %AppData%\\dsh-plugin-manager\\runtime）…", "kind": "stdout" }),
     );
+    // 下载 DSH 前强制保证便携包就绪（不管系统是否已有 Node；失败则中止，不混用系统环境）
     let tc = match crate::toolchain::ensure(app, registry) {
         Ok(t) => t,
         Err(e) => {
@@ -115,7 +116,7 @@ pub fn install_dsh_version(
     let mut cmd = Command::new(&tc.npm);
     cmd.args(&args);
     cmd.current_dir(&ver_dir);
-    tc.inject_path(&mut cmd);
+    tc.apply_runtime_env(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -318,59 +319,6 @@ pub fn ensure_profile_npmrc(profile_dir: &Path, registry: &str) -> Result<(), St
     }
     let content = lines.join("\n") + "\n";
     std::fs::write(&npmrc, content).map_err(|e| format!("写入 .npmrc 失败: {e}"))
-}
-
-/// 在指定目录运行 `pnpm install`（走该目录 .npmrc 的镜像源），
-/// stdout/stderr 逐行 emit "install-log"，返回退出码。
-pub fn run_pnpm_install(app: &tauri::AppHandle, cwd: &std::path::Path) -> Result<i32, String> {
-    let tc = crate::toolchain::probe();
-    let pnpm = tc.pnpm.as_ref().ok_or_else(|| "未找到 pnpm（工具链会自动安装，请稍后重试）".to_string())?;
-    let mut cmd = std::process::Command::new(pnpm);
-    cmd.arg("install").arg("--no-frozen-lockfile").current_dir(cwd);
-    tc.inject_path(&mut cmd);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW：禁止弹出控制台黑框
-    }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
-
-    let mut child = cmd.spawn().map_err(|e| format!("启动 pnpm 失败: {e}"))?;
-    let out_handle = {
-        let app = app.clone();
-        let stdout = child.stdout.take();
-        std::thread::spawn(move || {
-            if let Some(stdout) = stdout {
-                let reader = std::io::BufReader::new(stdout);
-                for line in reader.lines() {
-                    if let Ok(l) = line {
-                        let _ = app.emit("install-log", serde_json::json!({ "line": l, "kind": "stdout" }));
-                    }
-                }
-            }
-        })
-    };
-    let err_handle = {
-        let app = app.clone();
-        let stderr = child.stderr.take();
-        std::thread::spawn(move || {
-            if let Some(stderr) = stderr {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(l) = line {
-                        let _ = app.emit("install-log", serde_json::json!({ "line": l, "kind": "stderr" }));
-                    }
-                }
-            }
-        })
-    };
-    let status = child.wait();
-    let _ = out_handle.join();
-    let _ = err_handle.join();
-    match status {
-        Ok(s) => Ok(s.code().unwrap_or(-1)),
-        Err(e) => Err(format!("等待 pnpm 退出失败: {e}")),
-    }
 }
 
 #[cfg(test)]

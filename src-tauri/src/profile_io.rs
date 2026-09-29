@@ -418,6 +418,12 @@ pub fn create_profile(profiles_dir: &Path, name: &str) -> Result<CreateProfileRe
         "packages:\n  - .\n\nnodeLinker: hoisted\nautoInstallPeers: false\n",
     )
     .map_err(|e| format!("写入 pnpm-workspace.yaml 失败: {e}"))?;
+    // 对齐官方 initProfile：空用户补丁层（注释 + 空数组）
+    fs::write(
+        target.join("cordis.patch.yml"),
+        "# Your patch layer for this dsh profile, applied after every bundle layer:\n# a top-level YAML array of loader patch entries (id-targeted config\n# overrides, disables, and insert lists; `!!js` expressions allowed).\n[]\n",
+    )
+    .map_err(|e| format!("写入 cordis.patch.yml 失败: {e}"))?;
     Ok(CreateProfileResult {
         name: safe,
         path: target.to_string_lossy().to_string(),
@@ -572,6 +578,10 @@ mod tests {
         let pkg: serde_json::Value = serde_json::from_str(&pkg_raw).unwrap();
         assert_eq!(pkg["name"], "dsh-profile-my-new");
         assert!(pkg["dsh"]["profile"]["bundles"][0].as_str().unwrap().contains("dsh-base"));
+        // 对齐官方 initProfile：三件套
+        assert!(profiles.join("my-new").join("pnpm-workspace.yaml").exists());
+        let patch = fs::read_to_string(profiles.join("my-new").join("cordis.patch.yml")).unwrap();
+        assert!(patch.trim().ends_with(']'), "应写入空补丁层: {patch}");
 
         // 重名报错
         assert!(create_profile(&profiles, "my-new").is_err());

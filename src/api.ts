@@ -124,6 +124,10 @@ export const api = {
   // M5 设置 / DSH 下载
   getSettings: () => invoke<Settings>("get_settings_cmd"),
   checkUpdate: () => invoke<UpdateInfo>("check_update_cmd"),
+  /** 便携运行时是否已就绪（runtime 内 Node24+ + pnpm） */
+  checkPortableRuntime: () => invoke<boolean>("check_portable_runtime_cmd"),
+  /** 初始化便携运行时（完整下载 Node LTS + pnpm，不改系统 PATH） */
+  initPortableRuntime: () => invoke<string>("init_portable_runtime_cmd"),
   downloadUpdate: (version: string) => invoke<string>("download_update_cmd", { version }),
   launchInstallerAndExit: (path: string) => invoke<void>("launch_installer_and_exit_cmd", { path }),
   setSettings: (npmRegistry: string, dshDownloadDir: string, githubMirror: string) =>
@@ -142,7 +146,8 @@ export const api = {
     packName: string,
     packVersion: string,
     displayName: string,
-  ) => invoke<PackExportResult>("export_pack_cmd", { envId, profile, profilesDirStr: profilesDir, targetPath, packName, packVersion, displayName }),
+    dshHint?: string,
+  ) => invoke<PackExportResult>("export_pack_cmd", { envId, profile, profilesDirStr: profilesDir, targetPath, packName, packVersion, displayName, dshHint }),
   marketPacks: () => invoke<PackMarketEntry[]>("market_packs_cmd"),
   downloadPack: (url: string, sha256: string, size: number) =>
     invoke<string>("download_pack_cmd", { url, sha256, size }),
