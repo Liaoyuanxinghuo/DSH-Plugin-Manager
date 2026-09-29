@@ -2074,9 +2074,10 @@ const NPM_REGISTRY_PRESETS: { value: string; label: string }[] = [
 /** GitHub 下载镜像下拉预设（空 = 直连 GitHub） */
 const GITHUB_MIRROR_PRESETS: { value: string; label: string }[] = [
   { value: "", label: "直连 GitHub（不做代理）" },
-  { value: "https://ghfast.top", label: "ghfast.top（默认推荐）" },
+  { value: "https://gh-proxy.com", label: "gh-proxy.com（推荐）" },
   { value: "https://ghproxy.net", label: "ghproxy.net" },
-  { value: "https://gh-proxy.com", label: "gh-proxy.com" },
+  { value: "https://gh.ddlc.top", label: "gh.ddlc.top" },
+  { value: "https://ghfast.top", label: "ghfast.top" },
   { value: "__custom__", label: "自定义…" },
 ];
 
@@ -2085,6 +2086,8 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
   const [registry, setRegistry] = useState("");
   const [downloadDir, setDownloadDir] = useState("");
   const [githubMirror, setGithubMirror] = useState("");
+  const [customMirrors, setCustomMirrors] = useState<string[]>([]);
+  const [newMirror, setNewMirror] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [aboutOpen, setAboutOpen] = useState(false);
@@ -2117,6 +2120,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
       setRegistry(typeof s?.npmRegistry === "string" ? s.npmRegistry : "");
       setDownloadDir(typeof s?.dshDownloadDir === "string" ? s.dshDownloadDir : "");
       setGithubMirror(typeof s?.githubMirror === "string" ? s.githubMirror : "");
+      setCustomMirrors(Array.isArray(s?.githubMirrors) ? s.githubMirrors : []);
     }).catch((e) => setErr(String(e)));
   }, []);
 
@@ -2124,13 +2128,29 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
     setBusy(true);
     setErr("");
     try {
-      await api.setSettings(registry, downloadDir, githubMirror);
+      await api.setSettings(registry, downloadDir, githubMirror, customMirrors);
       onSaved();
     } catch (e) {
       setErr(String(e));
     } finally {
       setBusy(false);
     }
+  };
+
+  const addCustomMirror = () => {
+    const t = newMirror.trim().replace(/\/+$/, "");
+    if (!t) return;
+    if (!/^https?:\/\//i.test(t)) {
+      setErr("镜像需以 http:// 或 https:// 开头");
+      return;
+    }
+    if (customMirrors.includes(t) || t === githubMirror.trim().replace(/\/+$/, "")) {
+      setErr("该镜像已在列表中");
+      return;
+    }
+    setCustomMirrors([...customMirrors, t]);
+    setNewMirror("");
+    setErr("");
   };
 
   // 当前值是否在预设内（决定下拉显示与是否出现自定义输入框）
@@ -2192,9 +2212,45 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
             <input
               value={githubMirror}
               onChange={(e) => setGithubMirror(e.target.value)}
-              placeholder="https://ghfast.top"
+              placeholder="https://gh-proxy.com"
             />
           </label>
+        )}
+        <label>
+          额外 GitHub 镜像源（可添加多个，失败时自动切换）
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <input
+              value={newMirror}
+              onChange={(e) => setNewMirror(e.target.value)}
+              placeholder="https://your-mirror.example"
+              style={{ flex: 1 }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  addCustomMirror();
+                }
+              }}
+            />
+            <button type="button" className="btn tiny" onClick={addCustomMirror}>
+              ＋ 添加
+            </button>
+          </div>
+        </label>
+        {customMirrors.length > 0 && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 10 }}>
+            {customMirrors.map((m) => (
+              <div key={m} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12 }}>
+                <code style={{ flex: 1, wordBreak: "break-all" }}>{m}</code>
+                <button
+                  type="button"
+                  className="btn tiny"
+                  onClick={() => setCustomMirrors(customMirrors.filter((x) => x !== m))}
+                >
+                  删除
+                </button>
+              </div>
+            ))}
+          </div>
         )}
         <div className="modal-hint" style={{ marginTop: 6 }}>
           <b>关于 / 更新</b>
@@ -2223,7 +2279,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.9</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.10</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

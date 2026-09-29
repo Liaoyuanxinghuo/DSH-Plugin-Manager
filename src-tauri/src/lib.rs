@@ -3,6 +3,7 @@
 mod buildpermit;
 mod dsh_install;
 mod fsutil;
+mod ghnet;
 mod installer;
 mod market;
 mod models;
@@ -1055,7 +1056,12 @@ fn get_settings_cmd() -> settings::Settings {
 
 /// 保存设置
 #[tauri::command]
-fn set_settings_cmd(npm_registry: String, dsh_download_dir: String, github_mirror: String) -> Result<(), String> {
+fn set_settings_cmd(
+    npm_registry: String,
+    dsh_download_dir: String,
+    github_mirror: String,
+    github_mirrors: Option<Vec<String>>,
+) -> Result<(), String> {
     settings::validate_registry(&npm_registry)?;
     settings::validate_github_mirror(&github_mirror)?;
     if dsh_download_dir.trim().is_empty() {
@@ -1064,7 +1070,8 @@ fn set_settings_cmd(npm_registry: String, dsh_download_dir: String, github_mirro
     let mut s = settings::load_settings();
     s.npm_registry = settings::normalize_registry(&npm_registry);
     s.dsh_download_dir = dsh_download_dir.trim().to_string();
-    s.github_mirror = github_mirror.trim().trim_end_matches('/').to_string();
+    s.github_mirror = settings::normalize_github_mirror(&github_mirror);
+    s.github_mirrors = settings::normalize_github_mirrors(&github_mirrors.unwrap_or_default())?;
     settings::save_settings(&s)
 }
 
@@ -1124,11 +1131,23 @@ fn compare_versions(a: &str, b: &str) -> i32 {
     0
 }
 
-/// 走 GitHub 镜像拉取文本（raw 文件 / API），返回 (HTTP 状态码, 响应文本)
+/// 走 GitHub 镜像拉取文本（raw 文件 / API），返回 (HTTP 状态码, 响应文本)。
+/// 单请求最长 8s，且不超过总截止时间。
 fn github_get_text(fetch_url: &str) -> (u16, String) {
+    github_get_text_deadline(fetch_url, std::time::Instant::now() + std::time::Duration::from_secs(8))
+}
+
+/// 带总截止时间的 GET；剩余时间不足则直接放弃（视为超时）。
+fn github_get_text_deadline(fetch_url: &str, deadline: std::time::Instant) -> (u16, String) {
+    use std::time::{Duration, Instant};
+    let now = Instant::now();
+    if now >= deadline {
+        return (0, "已达检查更新总超时（30s）".to_string());
+    }
+    let timeout = (deadline - now).min(Duration::from_secs(8));
     match reqwest::blocking::Client::new()
         .get(fetch_url)
-        .timeout(std::time::Duration::from_secs(25))
+        .timeout(timeout)
         .send()
     {
         Ok(r) => {
@@ -1140,72 +1159,74 @@ fn github_get_text(fetch_url: &str) -> (u16, String) {
     }
 }
 
-/// 检查更新（走 GitHub 镜像，大陆无 VPN 可用）：
-/// 1) 优先 GitHub releases/latest API；2) 回退仓库根 VERSION 文件（main / master）。
+/// 检查更新（统一走 ghnet 镜像轮询，无总时限；每镜像约 10s 自动切换）：
+/// 1) 仓库根 VERSION（main / master）；2) GitHub API releases/latest。
 #[tauri::command]
 async fn check_update_cmd() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        let repo_url = format!("https://github.com/{PROJECT_REPO}");
+        let mirror = settings::load_settings().github_mirror;
 
-    let current = env!("CARGO_PKG_VERSION").to_string();
-    let repo_url = format!("https://github.com/{PROJECT_REPO}");
-    let mirror = settings::load_settings().github_mirror;
+        let mut latest = String::new();
+        let mut err_hint = String::new();
 
-    let mut latest = String::new();
-    let mut err_hint = String::new();
-
-    // 1) 主通道：仓库根 VERSION 文件（raw 走镜像；镜像被限流(403/0)时直连兜底）
-    for branch in ["main", "master"] {
-        let raw_url = format!("https://raw.githubusercontent.com/{PROJECT_REPO}/{branch}/VERSION");
-        let (status, body) = github_get_text(&settings::github_proxy(&raw_url, &mirror));
-        let (status, body) = if status == 403 || status == 0 {
-            github_get_text(&raw_url)
-        } else {
-            (status, body)
-        };
-        if status == 200 {
-            let v = body.trim().trim_start_matches('v').to_string();
-            if !v.is_empty() && v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-                latest = v;
-                break;
+        // 1) VERSION 文件（镜像轮询）
+        for branch in ["main", "master"] {
+            let raw_url = format!("https://raw.githubusercontent.com/{PROJECT_REPO}/{branch}/VERSION");
+            match ghnet::fetch_text(&raw_url) {
+                Ok((used, body)) => {
+                    let v = body.trim().trim_start_matches('v').to_string();
+                    if !v.is_empty() && v.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                        latest = v;
+                        let _ = used;
+                        break;
+                    }
+                }
+                Err(e) => err_hint = e,
             }
         }
-    }
-    if latest.is_empty() {
-        err_hint = "未获取到 VERSION 文件（raw 走镜像失败或仓库尚无该文件）".to_string();
-    }
 
-    // 2) 补充通道：GitHub API releases/latest（走镜像，失败静默）。
-    //    API 常被镜像代理 IP 限流返回 403，故仅作补充，成功则覆盖并清空错误。
-    if latest.is_empty() {
-        let api_url = format!("https://api.github.com/repos/{PROJECT_REPO}/releases/latest");
-        let (status, body) = github_get_text(&settings::github_proxy(&api_url, &mirror));
-        let (status, body) = if status == 0 {
-            // 镜像不通时直连（大陆实测 api.github.com 可直连）
-            github_get_text(&api_url)
-        } else {
-            (status, body)
-        };
-        if status == 200 {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                if let Some(tag) = json.get("tag_name").and_then(|t| t.as_str()) {
-                    latest = tag.trim_start_matches('v').to_string();
+        // 2) GitHub API（镜像轮询）
+        if latest.is_empty() {
+            let api_url = format!("https://api.github.com/repos/{PROJECT_REPO}/releases/latest");
+            match ghnet::fetch_text(&api_url) {
+                Ok((_, body)) => {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                        if let Some(tag) = json.get("tag_name").and_then(|t| t.as_str()) {
+                            latest = tag.trim_start_matches('v').to_string();
+                        }
+                    }
+                    if latest.is_empty() {
+                        err_hint = "API 响应中无 tag_name".to_string();
+                    }
+                }
+                Err(e) => {
+                    if err_hint.is_empty() {
+                        err_hint = e;
+                    }
                 }
             }
         }
+
         if latest.is_empty() {
-            err_hint = format!("VERSION 与 GitHub API 均不可用（API 状态 {status}）");
+            return Ok(serde_json::json!({
+                "current": current,
+                "latest": "",
+                "hasUpdate": false,
+                "url": repo_url,
+                "error": format!("网络有问题，检查更新失败：{err_hint}。可更换 GitHub 镜像后重试。"),
+            }));
         }
-    }
 
-    let has_update = !latest.is_empty() && compare_versions(&latest, &current) > 0;
-    Ok(serde_json::json!({
-        "current": current,
-        "latest": latest,
-        "hasUpdate": has_update,
-        "url": repo_url,
-        "error": if err_hint.is_empty() { String::new() } else { format!("检查更新失败：{err_hint}（请检查网络或 GitHub 镜像设置）") },
-    }))
-
+        let has_update = compare_versions(&latest, &current) > 0;
+        Ok(serde_json::json!({
+            "current": current,
+            "latest": latest,
+            "hasUpdate": has_update,
+            "url": repo_url,
+            "error": "",
+        }))
     })
     .await
     .map_err(|e| format!("后台任务失败: {e}"))?
@@ -1239,7 +1260,7 @@ fn asset_matches(name: &str, version: &str) -> bool {
     n.contains(&format!("_{version}_x64-setup").to_lowercase()) && n.ends_with(".exe")
 }
 
-/// 从 GitHub API 的 release assets 里模糊匹配安装包（latest 或指定 tag）。
+/// 从 GitHub API 的 release assets 里模糊匹配安装包（统一 ghnet 镜像轮询）
 fn find_setup_asset(version: &str) -> Result<(String, String), String> {
     let needle = format!("_{version}_x64-setup");
     let mirror = settings::load_settings().github_mirror;
@@ -1248,36 +1269,61 @@ fn find_setup_asset(version: &str) -> Result<(String, String), String> {
         format!("https://api.github.com/repos/{PROJECT_REPO}/releases/tags/V{version}"),
         format!("https://api.github.com/repos/{PROJECT_REPO}/releases/tags/v{version}"),
     ];
+    let mut last_err = String::new();
     for api_url in urls {
-        // 1) 走镜像；2) 失败时直连（大陆实测 api.github.com 可直连）
-        let (status, body) = github_get_text(&settings::github_proxy(&api_url, &mirror));
-        let (status, body) = if status == 0 {
-            github_get_text(&api_url)
-        } else {
-            (status, body)
-        };
-        if status != 200 {
-            continue;
-        }
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
-            continue;
-        };
-        if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
-            for a in assets {
-                let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let url = a
-                    .get("browser_download_url")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("");
-                if asset_matches(name, version) && !url.is_empty() {
-                    return Ok((name.to_string(), url.to_string()));
+        match ghnet::fetch_text(&api_url) {
+            Ok((_, body)) => {
+                let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+                    continue;
+                };
+                if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
+                    for a in assets {
+                        let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                        let url = a
+                            .get("browser_download_url")
+                            .and_then(|u| u.as_str())
+                            .unwrap_or("");
+                        if asset_matches(name, version) && !url.is_empty() {
+                            return Ok((name.to_string(), url.to_string()));
+                        }
+                    }
                 }
             }
+            Err(e) => last_err = e,
         }
     }
-    Err(format!(
-        "release 中未找到包含「{needle}」的安装包资产（请确认已上传安装包）"
-    ))
+    if last_err.is_empty() {
+        Err(format!(
+            "release 中未找到包含「{needle}」的安装包资产（请确认已上传安装包）"
+        ))
+    } else {
+        Err(format!("获取 release 资产失败：{last_err}"))
+    }
+}
+
+/// 同一资产的多下载通道（大陆无 VPN）：用户镜像 + 常见代理 + 直连，逐个短超时尝试。
+fn expand_download_urls(direct_url: &str, mirror: &str) -> Vec<String> {
+    let mut proxies: Vec<String> = vec![];
+    let m = mirror.trim().trim_end_matches('/').to_string();
+    if !m.is_empty() {
+        proxies.push(m);
+    }
+    for p in [
+        "https://ghfast.top",
+        "https://gh-proxy.com",
+        "https://ghproxy.net",
+        "https://ghp.ci",
+    ] {
+        if !proxies.iter().any(|x| x == p) {
+            proxies.push(p.to_string());
+        }
+    }
+    let mut out: Vec<String> = proxies
+        .iter()
+        .map(|p| format!("{p}/{direct_url}"))
+        .collect();
+    out.push(direct_url.to_string());
+    out
 }
 
 /// 下载新版本安装包（走 GitHub 镜像，大陆无 VPN 可用）：
@@ -1308,32 +1354,23 @@ async fn download_update_cmd(version: String, app: tauri::AppHandle) -> Result<S
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     std::fs::create_dir_all(&download_dir).map_err(|e| format!("无法创建下载目录: {e}"))?;
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-    let mut resp = None;
-    let mut fname = String::new();
+    // 统一 ghnet 镜像轮询下载（用户镜像优先，失败自动切内置镜像，最后直连）
     let mut last_err = String::new();
+    let mut fname = String::new();
+    let mut fetched: Option<reqwest::blocking::Response> = None;
     for (name, direct_url) in candidates {
-        let fetch_url = settings::github_proxy(&direct_url, &mirror);
-        match client.get(&fetch_url).send() {
-            Ok(r) if r.status().is_success() => {
+        match ghnet::send_get(&direct_url) {
+            Ok((_used_url, resp)) => {
                 fname = name;
-                resp = Some(r);
+                fetched = Some(resp);
                 break;
             }
-            Ok(r) => {
-                last_err = format!("HTTP {}（{name}）", r.status());
-            }
-            Err(e) => {
-                last_err = format!("{e}（{name}）");
-            }
+            Err(e) => last_err = e,
         }
     }
-    let Some(mut resp) = resp else {
+    let Some(mut resp) = fetched else {
         return Err(format!(
-            "下载失败：{last_err}。请确认 v{version} 的 release 已上传安装包（资产名含「_{version}_x64-setup」；注意 tag 可能是 V{version}）"
+            "网络有问题，下载失败：{last_err}。可手动下载安装包，或在设置中更换 GitHub 镜像后重试"
         ));
     };
     let out_path = download_dir.join(&fname);
@@ -2361,13 +2398,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.9_x64-setup.exe", "0.3.9"));
-        assert!(asset_matches("dsh-manager_0.3.9_x64-setup.exe", "0.3.9"));
-        assert!(asset_matches("任意名_0.3.9_x64-setup.exe", "0.3.9"));
-        assert!(!asset_matches("DSH-Manager-0.3.9-win-x64.exe", "0.3.9"));
-        assert!(!asset_matches("DSH Manager_0.3.9_x64-setup.exe.sha256", "0.3.9"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.9"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.9"));
+        assert!(asset_matches("DSH Manager_0.3.10_x64-setup.exe", "0.3.10"));
+        assert!(asset_matches("dsh-manager_0.3.10_x64-setup.exe", "0.3.10"));
+        assert!(asset_matches("任意名_0.3.10_x64-setup.exe", "0.3.10"));
+        assert!(!asset_matches("DSH-Manager-0.3.10-win-x64.exe", "0.3.10"));
+        assert!(!asset_matches("DSH Manager_0.3.10_x64-setup.exe.sha256", "0.3.10"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.10"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.10"));
     }
 
     #[test]
@@ -2500,10 +2537,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.9_x64-setup.exe", "0.3.9"));
+        assert!(asset_matches("DSH.Manager_0.3.10_x64-setup.exe", "0.3.10"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.9_x64-setup.exe", "0.3.9"));
-        assert!(asset_matches("DSH.MANAGER_0.3.9_X64-SETUP.EXE", "0.3.9"));
+        assert!(asset_matches("dsh.manager_0.3.10_x64-setup.exe", "0.3.10"));
+        assert!(asset_matches("DSH.MANAGER_0.3.10_X64-SETUP.EXE", "0.3.10"));
     }
 
     #[test]
@@ -2511,9 +2548,32 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.9", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.10", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
+    }
+
+    #[test]
+    fn github_get_text_respects_deadline() {
+        use std::time::{Duration, Instant};
+        // 已过期的截止时间：立即放弃，不发网络请求
+        let (status, msg) = github_get_text_deadline(
+            "https://example.invalid/x",
+            Instant::now() - Duration::from_millis(1),
+        );
+        assert_eq!(status, 0);
+        assert!(msg.contains("超时"), "{msg}");
+    }
+
+    #[test]
+    fn expand_download_urls_covers_mirror_and_direct() {
+        let urls = expand_download_urls(
+            "https://github.com/a/b/releases/download/V1/A_1_x64-setup.exe",
+            "https://ghfast.top",
+        );
+        assert!(urls.iter().any(|u| u.starts_with("https://ghfast.top/")));
+        assert!(urls.iter().any(|u| u.contains("gh-proxy.com")));
+        assert_eq!(urls.last().unwrap(), "https://github.com/a/b/releases/download/V1/A_1_x64-setup.exe");
     }
 
     #[test]

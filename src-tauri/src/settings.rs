@@ -19,6 +19,8 @@ pub struct Settings {
     pub dsh_download_dir: String,
     /// GitHub 下载镜像前缀（空 = 直连 GitHub）；用于整合包市场、raw 文件等
     pub github_mirror: String,
+    /// 用户自行添加的额外 GitHub 镜像（轮流尝试，与 github_mirror 一起优先于内置镜像）
+    pub github_mirrors: Vec<String>,
     /// 各 DSH 版本安装后的实际体积（学习式进度总量：首次安装记录，后续安装有准确百分比）
     pub dsh_install_sizes: std::collections::HashMap<String, u64>,
 }
@@ -29,6 +31,7 @@ impl Default for Settings {
             npm_registry: DEFAULT_REGISTRY.to_string(),
             dsh_download_dir: DEFAULT_DSH_DIR.to_string(),
             github_mirror: DEFAULT_GITHUB_MIRROR.to_string(),
+            github_mirrors: Vec::new(),
             dsh_install_sizes: std::collections::HashMap::new(),
         }
     }
@@ -96,6 +99,44 @@ pub fn validate_github_mirror(s: &str) -> Result<(), String> {
         return Err("GitHub 镜像需以 http:// 或 https:// 开头（留空 = 直连 GitHub）".to_string());
     }
     Ok(())
+}
+
+/// 规范化镜像前缀（去尾斜杠、去空白）
+pub fn normalize_github_mirror(s: &str) -> String {
+    s.trim().trim_end_matches('/').to_string()
+}
+
+/// 校验并规范化用户自定义镜像列表（去空、去重、逐条校验 http(s)）
+pub fn normalize_github_mirrors(list: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for (i, m) in list.iter().enumerate() {
+        let t = normalize_github_mirror(m);
+        if t.is_empty() {
+            continue;
+        }
+        validate_github_mirror(&t).map_err(|e| format!("第 {} 个镜像无效：{e}", i + 1))?;
+        if !out.iter().any(|x| x == &t) {
+            out.push(t);
+        }
+    }
+    Ok(out)
+}
+
+/// 用户配置的 GitHub 镜像链（主镜像 + 自定义列表，去重），供 ghnet 轮询
+pub fn github_mirror_list() -> Vec<String> {
+    let s = load_settings();
+    let mut out: Vec<String> = Vec::new();
+    let primary = normalize_github_mirror(&s.github_mirror);
+    if !primary.is_empty() {
+        out.push(primary);
+    }
+    for m in &s.github_mirrors {
+        let t = normalize_github_mirror(m);
+        if !t.is_empty() && !out.iter().any(|x| x == &t) {
+            out.push(t);
+        }
+    }
+    out
 }
 
 /// GitHub 域名是否应走镜像

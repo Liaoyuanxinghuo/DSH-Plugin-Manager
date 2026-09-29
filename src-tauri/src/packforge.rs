@@ -1,4 +1,4 @@
-//! DSH-PackForge 整合包（.dspack v3 / manifest v5）导出、市场、下载、导入
+﻿//! DSH-PackForge 整合包（.dspack v3 / manifest v5）导出、市场、下载、导入
 //! 契约来源：https://github.com/DSH-PackForge/DSH-PackForge
 //! - pack-structure v3：ZIP 根含 dspack.json（{format:"dspack", version:3}）+ manifest.json（v5）
 //! - profile 形态：overrides/ → profile 根，可选 home/ → $DSH_HOME
@@ -461,19 +461,13 @@ pub fn export_pack(
 const MARKET_INDEX_URL: &str =
     "https://raw.githubusercontent.com/DSH-PackForge/dsh-pack-market/main/index/index.json";
 
-/// 拉取整合包市场索引
+/// 拉取整合包市场索引（统一 ghnet 镜像轮询）
 pub fn read_market_index() -> Result<Vec<MarketPackEntry>, String> {
     let mirror = crate::settings::load_settings().github_mirror;
-    let index_url = crate::settings::github_proxy(MARKET_INDEX_URL, &mirror);
-    let resp = reqwest::blocking::Client::new()
-        .get(&index_url)
-        .timeout(std::time::Duration::from_secs(20))
-        .send()
+    let (_used, body) = crate::ghnet::fetch_text(MARKET_INDEX_URL)
         .map_err(|e| format!("拉取整合包市场失败: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("市场索引返回状态 {}", resp.status()));
-    }
-    let idx: MarketIndex = resp.json().map_err(|e| format!("解析市场索引失败: {e}"))?;
+    let idx: MarketIndex =
+        serde_json::from_str(&body).map_err(|e| format!("解析市场索引失败: {e}"))?;
     let mut out = Vec::new();
     for item in idx.modpacks {
         let e: serde_json::Value = item;
@@ -509,7 +503,7 @@ pub fn read_market_index() -> Result<Vec<MarketPackEntry>, String> {
     Ok(out)
 }
 
-/// 下载整合包到缓存目录，校验 sha256 + size
+/// 下载整合包到缓存目录，校验 sha256 + size（统一 ghnet 镜像轮询）
 pub fn download_pack(
     url: &str,
     sha256: &str,
@@ -518,7 +512,8 @@ pub fn download_pack(
 ) -> Result<String, String> {
     fs::create_dir_all(cache_dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
     let mirror = crate::settings::load_settings().github_mirror;
-    let url = crate::settings::github_proxy(url, &mirror);
+    let (_used, bytes) = crate::ghnet::fetch_bytes(url)
+        .map_err(|e| format!("下载整合包失败: {e}"))?;
     let file_name = url
         .rsplit('/')
         .next()
@@ -526,22 +521,11 @@ pub fn download_pack(
         .unwrap_or("pack.dspack")
         .to_string();
     let target = cache_dir.join(&file_name);
-    if target.exists() {
-        fs::remove_file(&target).map_err(|e| format!("清理旧包失败: {e}"))?;
-    }
-    let resp = reqwest::blocking::Client::new()
-        .get(url)
-        .timeout(std::time::Duration::from_secs(600))
-        .send()
-        .map_err(|e| format!("下载整合包失败: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("下载返回状态 {}", resp.status()));
-    }
-    let bytes = resp
-        .bytes()
-        .map_err(|e| format!("读取下载内容失败: {e}"))?;
     if size > 0 && bytes.len() as u64 != size {
-        return Err(format!("包大小不符：预期 {size} 字节，实际 {} 字节", bytes.len()));
+        return Err(format!(
+            "包大小不符：预期 {size} 字节，实际 {} 字节",
+            bytes.len()
+        ));
     }
     if !sha256.is_empty() && sha256_hex(&bytes) != sha256.to_lowercase() {
         return Err("包 SHA-256 校验失败：包不完整或已被篡改".to_string());

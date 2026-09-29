@@ -70,6 +70,8 @@ export interface Settings {
   npmRegistry: string;
   dshDownloadDir: string;
   githubMirror: string;
+  /** 用户自定义 GitHub 镜像列表（轮流尝试） */
+  githubMirrors: string[];
 }
 
 export interface UpdateInfo {
