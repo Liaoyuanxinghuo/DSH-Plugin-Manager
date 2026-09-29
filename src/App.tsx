@@ -176,6 +176,7 @@ export default function App() {
   const [portableReady, setPortableReady] = useState<boolean | null>(null);
   const [initingPortable, setInitingPortable] = useState(false);
   const [portableBannerOpen, setPortableBannerOpen] = useState(true);
+  const [portableLogs, setPortableLogs] = useState<string[]>([]);
 
   // 检测便携运行时
   useEffect(() => {
@@ -453,6 +454,11 @@ export default function App() {
       await api.stopDsh(eid, pname, dir);
       const list = await api.listRunning().catch(() => []);
       setRunnings(list);
+      // 初始化中的 web 一并结束初始化状态
+      if (pname === "web") {
+        setInitRunning(false);
+        setShowInitHint(false);
+      }
       setInfo(`已停止 ${pname}`);
     } catch (e) {
       setError(String(e));
@@ -717,10 +723,23 @@ export default function App() {
   }, [envs.length, profiles.length]);
 
   // 初始化便携运行时（完整下载 Node LTS + pnpm 到 %AppData%\dsh-plugin-manager\runtime）
+  // 通过 install-log 事件流显示进度，避免看起来像卡死
   const handleInitPortable = async () => {
     setInitingPortable(true);
     setError("");
-    setInfo("正在初始化便携运行时（下载 Node.js LTS + pnpm，约 40MB，请稍候）...");
+    setInfo("正在初始化便携运行时（下载 Node.js LTS + pnpm，约 40MB）…");
+    setPortableLogs([]);
+    let unLog: (() => void) | undefined;
+    try {
+      const { listen } = await import("@tauri-apps/api/event");
+      unLog = await listen<{ line: string; kind?: string }>("install-log", (e) => {
+        const line = e.payload?.line ?? "";
+        setPortableLogs((prev) => [...prev.slice(-30), line]);
+        setInfo(`便携环境初始化中：${line}`);
+      }).catch(() => undefined);
+    } catch {
+      /* 非 Tauri 环境忽略 */
+    }
     try {
       const msg = await api.initPortableRuntime();
       setPortableReady(true);
@@ -730,6 +749,7 @@ export default function App() {
       setPortableReady(false);
       setError(`初始化便携运行时失败：${e}`);
     } finally {
+      unLog?.();
       setInitingPortable(false);
     }
   };
@@ -749,37 +769,36 @@ export default function App() {
     setShowDshDownload(true);
   };
 
-  // 一键初始化：用本地 dsh 启动内置 web profile（dsh 首次运行自动创建并初始化，
-  // 等价 npx @deepseek-ai/dsh web，但全部走本地 dsh 本体 + 本地 node/npx 工具链）
+  // 一键初始化：用本地 dsh 启动内置 web profile（dsh 首次运行自动创建并初始化）
   const handleInitProfile = async () => {
     if (!selectedEnv) return;
     setCreatingProfile(true);
+    setInitRunning(true);
     setError("");
     setInfo("正在初始化并启动默认 web profile（dsh 首次运行会自动创建）...");
     try {
-      const r = await api.startDsh(selectedEnv, "web", "", undefined);
-      setInfo(`${r.message} — web profile 初始化并启动中（首次运行 dsh 自动创建）`);
+      // 只启动一次（勿再 startDsh + startAndPoll 双开）
+      await startAndPoll(selectedEnv, "web", "");
       api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
       const ps = await api.listAllProfiles().catch(() => []);
       setProfiles(ps);
       setSelectedProfile("web");
       setShowInitHint(false);
-      setInitRunning(true);
-      startAndPoll(selectedEnv, "web", "");
     } catch (e) {
+      setInitRunning(false);
       setError(String(e));
     } finally {
       setCreatingProfile(false);
     }
   };
 
-  // 结束初始化：停止 web 启动进程；结束后按钮按实际状态恢复（有 profile -> ＋新建，否则 -> 初始化）
+  // 停止初始化进程（与右栏「■ 停止」同一套逻辑）
   const handleStopInit = async () => {
     if (!selectedEnv) return;
     setError("");
-    setInfo("正在结束初始化进程...");
+    setInfo("正在停止初始化进程...");
     try {
-      await api.stopDsh(selectedEnv, "web", "");
+      await api.stopDsh(selectedEnv, "web", profileDirOf("web") || "");
       setInfo("初始化进程已停止");
       api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
       const ps = await api.listAllProfiles().catch(() => []);
@@ -1000,6 +1019,11 @@ export default function App() {
             <b>「初始化环境」</b>
             自动下载安装到 <code>%AppData%\dsh-plugin-manager\runtime\</code>
             ，不改动系统 PATH。
+            {initingPortable && portableLogs.length > 0 && (
+              <span style={{ display: "block", opacity: 0.85, marginTop: 4, fontFamily: "Consolas, monospace" }}>
+                {portableLogs[portableLogs.length - 1]}
+              </span>
+            )}
           </span>
           <button
             className="btn tiny danger"
@@ -1301,7 +1325,19 @@ export default function App() {
                       ▶ 启动 DSH
                     </button>
                   )}
-                  <button className="btn danger" onClick={() => handleStop()} disabled={busy || !curRun}>
+                  <button
+                    className="btn danger"
+                    onClick={() => {
+                      // 初始化中的 web：结束初始化与普通停止都走停进程
+                      if (initRunning && selectedProfile === "web") {
+                        void handleStopInit();
+                      } else {
+                        void handleStop();
+                      }
+                    }}
+                    disabled={busy || (!curRun && !initRunning)}
+                    title={initRunning ? "停止初始化进程" : "停止当前 DSH"}
+                  >
                     ■ 停止
                   </button>
                   {curRun && (
@@ -2187,7 +2223,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.7</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.8</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

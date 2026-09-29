@@ -632,9 +632,15 @@ async fn check_updates_cmd(
 
 // ==================== 命令：启动/停止（多实例） ====================
 
-/// 运行中进程的 key：env_id + "::" + profile（同一环境的不同 profile 可同时运行）
-fn run_key(env_id: &str, profiles_dir: &str, profile: &str) -> String {
-    format!("{}::{}::{}", env_id, profiles_dir, profile)
+/// 运行中进程的 key：env_id + 规范化 profiles 目录 + profile
+/// **必须用解析后的绝对/完整目录**，不能用前端传入的原始字符串（"" 与真实路径会键不一致导致停不掉）。
+fn run_key(env_id: &str, profiles_dir: &std::path::Path, profile: &str) -> String {
+    format!(
+        "{}::{}::{}",
+        env_id,
+        profiles_dir.to_string_lossy(),
+        profile
+    )
 }
 fn run_key_legacy(env_id: &str, profile: &str) -> String {
     format!("{env_id}::{profile}")
@@ -742,7 +748,7 @@ async fn start_dsh_cmd(
             return Err(format!("profile 依赖检查失败：{e}"));
         }
     }
-    let key = run_key(&env_id, &profiles_dir_str, &profile);
+    let key = run_key(&env_id, &profiles_dir, &profile);
     // per-key 启动互斥：并发双击同一组合时，第二次直接拒绝（防双开/抢端口）
     let _start_guard = {
         let mut starting = state.starting.lock().unwrap();
@@ -853,11 +859,31 @@ fn prune_dead(running: &mut HashMap<String, RunningProcess>) {
 }
 
 /// 停止指定 env×profile 的进程（每个停止按钮只结束特定进程）
+/// 用**解析后的 profiles 目录**做 key；键找不到时再按 env+profile 宽松匹配（避免目录字符串不一致停不掉）。
 #[tauri::command]
-async fn stop_dsh_cmd(state: State<'_, AppState>, env_id: String, profile: String, profiles_dir_str: String) -> Result<(), String> {
-    let key = run_key(&env_id, &profiles_dir_str, &profile);
+async fn stop_dsh_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    profile: String,
+    profiles_dir_str: String,
+) -> Result<(), String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    let key = run_key(&env_id, &profiles_dir, &profile);
     let mut running = state.running.lock().unwrap();
-    let proc = running.remove(&key);
+    let mut proc = running.remove(&key);
+    if proc.is_none() {
+        // 宽松：同一 env×profile 只有一个实例时直接停它
+        let alt = running
+            .iter()
+            .find(|(k, p)| {
+                p.env_id == env_id && p.profile == profile && k.ends_with(&format!("::{profile}"))
+            })
+            .map(|(k, _)| k.clone());
+        if let Some(k) = alt {
+            proc = running.remove(&k);
+        }
+    }
     if let Some(p) = proc {
         if !runner::is_pid_alive(p.pid) {
             // 进程已自行退出，视为停止成功
@@ -915,7 +941,23 @@ async fn stop_all_dsh_cmd(state: State<'_, AppState>) -> Result<Vec<String>, Str
 fn dsh_status(state: State<'_, AppState>, env_id: String, profile: String, profiles_dir_str: String) -> DshStatus {
     let mut running = state.running.lock().unwrap();
     prune_dead(&mut running);
-    let proc = running.get(&run_key(&env_id, &profiles_dir_str, &profile)).cloned();
+    let key = match get_env_inner(&state, &env_id) {
+        Ok(e) => {
+            let pd = profiles_dir_arg(&profiles_dir_str, &e);
+            run_key(&env_id, &pd, &profile)
+        }
+        Err(_) => run_key(
+            &env_id,
+            std::path::Path::new(profiles_dir_str.trim()),
+            &profile,
+        ),
+    };
+    let proc = running.get(&key).cloned().or_else(|| {
+        running
+            .values()
+            .find(|p| p.env_id == env_id && p.profile == profile)
+            .cloned()
+    });
     drop(running);
     match proc {
         Some(p) => DshStatus {
@@ -1161,58 +1203,73 @@ async fn check_update_cmd() -> Result<serde_json::Value, String> {
     .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
-/// 更新安装包资产文件名（Tauri NSIS 默认产物名，仅作兜底猜测）
-fn update_asset_filename(version: &str) -> String {
-    format!("DSH Manager_{version}_x64-setup.exe")
+/// 更新安装包资产候选（文件名/ tag 大小写写法不一，全部试一遍）：
+/// 点号写法 DSH.Manager_* 为当前 NSIS 实际产物；空格写法兼容旧 release。
+fn update_asset_url_candidates(version: &str) -> Vec<(String, String)> {
+    let names = [
+        format!("DSH.Manager_{version}_x64-setup.exe"),
+        format!("DSH Manager_{version}_x64-setup.exe"),
+    ];
+    let tags = [format!("V{version}"), format!("v{version}")];
+    let mut out = Vec::new();
+    for tag in &tags {
+        for name in &names {
+            let enc = name.replace(' ', "%20");
+            out.push((
+                name.clone(),
+                format!("https://github.com/{PROJECT_REPO}/releases/download/{tag}/{enc}"),
+            ));
+        }
+    }
+    out
 }
 
-/// 更新安装包下载 URL（空格做 URL 编码）
-fn update_asset_url(version: &str) -> String {
-    let fname = update_asset_filename(version);
-    format!(
-        "https://github.com/{PROJECT_REPO}/releases/download/v{version}/{}",
-        fname.replace(' ', "%20")
-    )
-}
-
-/// 资产名匹配规则：包含 "_{version}_x64-setup" 且以 .exe 结尾
+/// 资产名匹配规则：包含 "_{version}_x64-setup" 且以 .exe 结尾（大小写不敏感）
+/// （DSH.Manager_* / DSH Manager_* 均可命中；版本号中的点不能被替换掉）
 fn asset_matches(name: &str, version: &str) -> bool {
-    name.contains(&format!("_{version}_x64-setup")) && name.to_lowercase().ends_with(".exe")
+    let n = name.to_lowercase();
+    n.contains(&format!("_{version}_x64-setup").to_lowercase()) && n.ends_with(".exe")
 }
 
-/// 从 GitHub API releases/latest 的 assets 里模糊匹配安装包：
-/// 资产名包含 "_{version}_x64-setup" 且以 .exe 结尾即视为匹配。
-/// 返回 (资产名, 真实下载 URL)。
+/// 从 GitHub API 的 release assets 里模糊匹配安装包（latest 或指定 tag）。
 fn find_setup_asset(version: &str) -> Result<(String, String), String> {
     let needle = format!("_{version}_x64-setup");
-    let api_url = format!("https://api.github.com/repos/{PROJECT_REPO}/releases/latest");
     let mirror = settings::load_settings().github_mirror;
-    // 1) 走镜像；2) 失败时直连（大陆实测 api.github.com 可直连）
-    let (status, body) = github_get_text(&settings::github_proxy(&api_url, &mirror));
-    let (status, body) = if status == 0 {
-        github_get_text(&api_url)
-    } else {
-        (status, body)
-    };
-    if status == 200 {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-            if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
-                for a in assets {
-                    let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let url = a
-                        .get("browser_download_url")
-                        .and_then(|u| u.as_str())
-                        .unwrap_or("");
-                    if asset_matches(name, version) && !url.is_empty() {
-                        return Ok((name.to_string(), url.to_string()));
-                    }
+    let urls = [
+        format!("https://api.github.com/repos/{PROJECT_REPO}/releases/latest"),
+        format!("https://api.github.com/repos/{PROJECT_REPO}/releases/tags/V{version}"),
+        format!("https://api.github.com/repos/{PROJECT_REPO}/releases/tags/v{version}"),
+    ];
+    for api_url in urls {
+        // 1) 走镜像；2) 失败时直连（大陆实测 api.github.com 可直连）
+        let (status, body) = github_get_text(&settings::github_proxy(&api_url, &mirror));
+        let (status, body) = if status == 0 {
+            github_get_text(&api_url)
+        } else {
+            (status, body)
+        };
+        if status != 200 {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        if let Some(assets) = json.get("assets").and_then(|a| a.as_array()) {
+            for a in assets {
+                let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let url = a
+                    .get("browser_download_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("");
+                if asset_matches(name, version) && !url.is_empty() {
+                    return Ok((name.to_string(), url.to_string()));
                 }
             }
         }
-        Err(format!("release 中未找到包含「{needle}」的安装包资产"))
-    } else {
-        Err(format!("获取 release 资产列表失败（状态 {status}）"))
     }
+    Err(format!(
+        "release 中未找到包含「{needle}」的安装包资产（请确认已上传安装包）"
+    ))
 }
 
 /// 下载新版本安装包（走 GitHub 镜像，大陆无 VPN 可用）：
@@ -1232,34 +1289,47 @@ async fn download_update_cmd(version: String, app: tauri::AppHandle) -> Result<S
     let mirror = settings::load_settings().github_mirror;
     // 优先按 release 资产列表模糊匹配（资产名包含 _{v}_x64-setup 即可）；
     // 拿不到资产列表时回退固定命名构造 URL
-    let (fname, direct_url) = match find_setup_asset(&version) {
-        Ok((n, u)) => (n, u),
-        Err(_) => {
-            let n = update_asset_filename(&version);
-            (n.clone(), update_asset_url(&version))
-        }
+    // 优先 API 资产真实 URL；失败则按 tag 大小写 / 文件名点号或空格多候选回退
+    let candidates: Vec<(String, String)> = match find_setup_asset(&version) {
+        Ok((n, u)) => vec![(n, u)],
+        Err(_) => update_asset_url_candidates(&version),
     };
-    let fetch_url = settings::github_proxy(&direct_url, &mirror);
-
     let download_dir = std::env::var("USERPROFILE")
         .map(|u| std::path::Path::new(&u).join("Downloads"))
         .or_else(|_| std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join("Downloads")))
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
     std::fs::create_dir_all(&download_dir).map_err(|e| format!("无法创建下载目录: {e}"))?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+    let mut resp = None;
+    let mut fname = String::new();
+    let mut last_err = String::new();
+    for (name, direct_url) in candidates {
+        let fetch_url = settings::github_proxy(&direct_url, &mirror);
+        match client.get(&fetch_url).send() {
+            Ok(r) if r.status().is_success() => {
+                fname = name;
+                resp = Some(r);
+                break;
+            }
+            Ok(r) => {
+                last_err = format!("HTTP {}（{name}）", r.status());
+            }
+            Err(e) => {
+                last_err = format!("{e}（{name}）");
+            }
+        }
+    }
+    let Some(mut resp) = resp else {
+        return Err(format!(
+            "下载失败：{last_err}。请确认 v{version} 的 release 已上传安装包（资产名含「_{version}_x64-setup」；注意 tag 可能是 V{version}）"
+        ));
+    };
     let out_path = download_dir.join(&fname);
 
-    let client = reqwest::blocking::Client::new();
-    let mut resp = client
-        .get(&fetch_url)
-        .timeout(std::time::Duration::from_secs(300))
-        .send()
-        .map_err(|e| format!("下载失败：{e}（请检查网络或 GitHub 镜像设置）"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "下载失败：HTTP {}（{fname}）。请确认 v{version} 的 release 已上传包含「_{version}_x64-setup」的安装包",
-            resp.status()
-        ));
-    }
     let total = resp.content_length().unwrap_or(0);
 
     let emit_progress = |done: u64| {
@@ -2055,10 +2125,27 @@ fn open_dsh_web_cmd(
     profile: String,
     profiles_dir_str: String,
 ) -> Result<(), String> {
-    let key = run_key(&env_id, &profiles_dir_str, &profile);
+    let key = match get_env_inner(&state, &env_id) {
+        Ok(e) => {
+            let pd = profiles_dir_arg(&profiles_dir_str, &e);
+            run_key(&env_id, &pd, &profile)
+        }
+        Err(_) => run_key(
+            &env_id,
+            std::path::Path::new(profiles_dir_str.trim()),
+            &profile,
+        ),
+    };
     let running = state.running.lock().unwrap();
     let proc = running
         .get(&key)
+        .cloned()
+        .or_else(|| {
+            running
+                .values()
+                .find(|p| p.env_id == env_id && p.profile == profile)
+                .cloned()
+        })
         .ok_or_else(|| format!("「{profile}」在该环境未在运行"))?;
     let url = if proc.log_path.is_empty() {
         format!("http://127.0.0.1:{}", proc.port)
@@ -2257,13 +2344,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.7_x64-setup.exe", "0.3.7"));
-        assert!(asset_matches("dsh-manager_0.3.7_x64-setup.exe", "0.3.7"));
-        assert!(asset_matches("任意名_0.3.7_x64-setup.exe", "0.3.7"));
-        assert!(!asset_matches("DSH-Manager-0.3.7-win-x64.exe", "0.3.7"));
-        assert!(!asset_matches("DSH Manager_0.3.7_x64-setup.exe.sha256", "0.3.7"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.7"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.7"));
+        assert!(asset_matches("DSH Manager_0.3.8_x64-setup.exe", "0.3.8"));
+        assert!(asset_matches("dsh-manager_0.3.8_x64-setup.exe", "0.3.8"));
+        assert!(asset_matches("任意名_0.3.8_x64-setup.exe", "0.3.8"));
+        assert!(!asset_matches("DSH-Manager-0.3.8-win-x64.exe", "0.3.8"));
+        assert!(!asset_matches("DSH Manager_0.3.8_x64-setup.exe.sha256", "0.3.8"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.8"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.8"));
     }
 
     #[test]
@@ -2382,12 +2469,24 @@ mod tests {
 
     #[test]
     fn update_asset_naming() {
-        assert_eq!(update_asset_filename("0.2.0"), "DSH Manager_0.2.0_x64-setup.exe");
-        assert_eq!(
-            update_asset_url("0.2.0"),
-            "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/releases/download/v0.2.0/DSH%20Manager_0.2.0_x64-setup.exe"
-        );
-        assert_eq!(update_asset_filename("0.3.1-rc.2"), "DSH Manager_0.3.1-rc.2_x64-setup.exe");
+        let c = update_asset_url_candidates("0.2.0");
+        // tag V/v × 文件名点号/空格，4 个候选
+        assert!(c.len() >= 4);
+        assert!(c.iter().any(|(n, u)| {
+            n == "DSH.Manager_0.2.0_x64-setup.exe"
+                && u.contains("/releases/download/V0.2.0/")
+                && u.contains("DSH.Manager_0.2.0_x64-setup.exe")
+        }));
+        assert!(c.iter().any(|(n, u)| {
+            n == "DSH Manager_0.2.0_x64-setup.exe"
+                && u.contains("/releases/download/v0.2.0/")
+                && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
+        }));
+        // 实际 release 用的点号名
+        assert!(asset_matches("DSH.Manager_0.3.8_x64-setup.exe", "0.3.8"));
+        // 大小写不敏感
+        assert!(asset_matches("dsh.manager_0.3.8_x64-setup.exe", "0.3.8"));
+        assert!(asset_matches("DSH.MANAGER_0.3.8_X64-SETUP.EXE", "0.3.8"));
     }
 
     #[test]
@@ -2395,7 +2494,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.7", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.8", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }
@@ -2471,20 +2570,23 @@ mod tests {
 
     #[test]
     fn run_key_separates_env_and_profile() {
-        assert_eq!(run_key("e1", "pd1", "web"), "e1::pd1::web");
+        use std::path::Path;
+        let p1 = Path::new("pd1");
+        let p2 = Path::new("pd2");
+        assert_eq!(run_key("e1", p1, "web"), "e1::pd1::web");
         assert_ne!(
-            run_key("e1", "pd1", "web"),
-            run_key("e2", "pd1", "web"),
+            run_key("e1", p1, "web"),
+            run_key("e2", p1, "web"),
             "不同环境同 profile 应区分"
         );
         assert_ne!(
-            run_key("e1", "pd1", "web"),
-            run_key("e1", "pd1", "headless"),
+            run_key("e1", p1, "web"),
+            run_key("e1", p1, "headless"),
             "同环境不同 profile 应区分"
         );
         assert_ne!(
-            run_key("e1", "pd1", "web"),
-            run_key("e1", "pd2", "web"),
+            run_key("e1", p1, "web"),
+            run_key("e1", p2, "web"),
             "同环境不同来源目录同 profile 应区分"
         );
     }
