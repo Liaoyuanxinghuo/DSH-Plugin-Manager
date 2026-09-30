@@ -224,7 +224,8 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .market-list { max-height: 300px; }
 .market-list .hit-name { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .modal-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6); display: flex; align-items: center; justify-content: center; z-index: 100; }
-.install-modal { width: 760px; max-width: 94vw; max-height: 88vh; display: flex; flex-direction: column; gap: 10px; }
+.install-modal { width: 760px; max-width: 94vw; max-height: 88vh; display: flex; flex-direction: column; gap: 10px; overflow-y: auto; overflow-x: hidden; }
+.install-modal > * { min-height: 0; flex-shrink: 0; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .modal-head h3 { margin: 0; }
 .row { display: flex; gap: 8px; align-items: center; }
@@ -246,8 +247,10 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .tag-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
 .tag-latest { background: #1f3a31; color: var(--accent); }
 
-.pkg-view { display: flex; gap: 12px; min-height: 0; }
-.pkg-head { flex: 1; min-width: 0; }
+.pkg-view { display: flex; gap: 12px; min-height: 0; align-items: flex-start; }
+.pkg-head { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.pkg-head strong { display: block; font-size: 13px; word-break: break-all; line-height: 1.4; }
+.pkg-head .hit-desc { display: block; line-height: 1.5; word-break: break-word; }
 .ver-list { flex: 1.4; min-width: 0; overflow-y: auto; max-height: 220px; border: 1px solid var(--border); border-radius: 8px; }
 .ver-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); cursor: pointer; font-size: 12px; }
 .ver-row:hover { background: var(--panel-1); }
@@ -255,7 +258,7 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .ver-row:last-child { border-bottom: none; }
 .ver-no { font-family: Consolas, monospace; flex: 1; }
 
-.compat-box { border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+.compat-box { border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 4px; position: relative; background: var(--panel-2); }
 .compat-title { display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: 600; margin-bottom: 6px; }
 .badge { font-size: 10px; padding: 2px 8px; border-radius: 8px; }
 .badge-green { background: #1f3a31; color: var(--accent); }

@@ -13,7 +13,10 @@ pub struct MarketCatalog {
     pub name: String,
     pub count: usize,
     pub updated: String,
+    /// 分类 key 列表（与插件 category 字段对应，如 memory/docs）
     pub categories: Vec<String>,
+    /// 分类显示名（优先 zh-CN）
+    pub category_labels: std::collections::HashMap<String, String>,
     pub plugins: Vec<MarketPlugin>,
 }
 
@@ -49,11 +52,33 @@ pub fn market_catalog() -> Result<MarketCatalog, String> {
     }
     let raw: serde_json::Value = resp.json().map_err(|e| format!("解析市场目录失败: {e}"))?;
 
-    let categories = raw
-        .get("categories")
-        .and_then(|c| c.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
+    // categories 在源站是 map：{ "memory": {"zh":"记忆","en":"Memory"}, ... }
+    // 兼容数组写法；无 categories 时从插件里去重兜底
+    let mut category_labels: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut categories: Vec<String> = Vec::new();
+    match raw.get("categories") {
+        Some(serde_json::Value::Object(m)) => {
+            for (k, v) in m {
+                let label = v
+                    .get("zh")
+                    .or_else(|| v.get("zh-CN"))
+                    .or_else(|| v.get("en"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(k)
+                    .to_string();
+                category_labels.insert(k.clone(), label);
+                categories.push(k.clone());
+            }
+        }
+        Some(serde_json::Value::Array(arr)) => {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    categories.push(s.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
 
     let mut plugins = Vec::new();
     if let Some(arr) = raw.get("plugins").and_then(|p| p.as_array()) {
@@ -92,11 +117,23 @@ pub fn market_catalog() -> Result<MarketCatalog, String> {
         }
     }
 
+    // 插件出现但未登记的分类 → 补进列表
+    for p in &plugins {
+        if !p.category.is_empty() && !categories.contains(&p.category) {
+            categories.push(p.category.clone());
+            category_labels
+                .entry(p.category.clone())
+                .or_insert_with(|| p.category.clone());
+        }
+    }
+    categories.sort();
+
     Ok(MarketCatalog {
         name: raw.get("name").and_then(|v| v.as_str()).unwrap_or("dsh-market").to_string(),
         count: plugins.len(),
         updated: raw.get("updated").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         categories,
+        category_labels,
         plugins,
     })
 }

@@ -1,4 +1,4 @@
-// 在线插件安装对话框：
+﻿// 在线插件安装对话框：
 // 标签1「市场」= curated 插件目录（awesome-dsh-plugin，含 GitHub-only 插件）
 // 标签2「npm 搜索」= 搜索 → 版本浏览 → 兼容预检 → 安装
 // 标签3「自定义源」= 任意 spec（npm 包 / @scope/pkg@ver / github:user/repo / file:...）
@@ -30,11 +30,24 @@ type Tab = "market" | "search" | "custom" | "local";
 export default function InstallDialog({ env, profile, profilesDir, onClose, onInstalled, initialTab = "market" }: Props) {
   const [tab, setTab] = useState<Tab>(initialTab);
 
+  // 切换标签：清掉插件预览/版本/预检，避免残留叠在其他页上
+  const switchTab = (t: Tab) => {
+    if (t === tab) return;
+    setTab(t);
+    setPkg(null);
+    setGhPlugin(null);
+    setIssues(null);
+    setSelVer("");
+    setLogs([]);
+    setInstalled(false);
+  };
+
   // 市场标签
   const [catalog, setCatalog] = useState<MarketPlugin[] | null>(null);
   const [catLoading, setCatLoading] = useState(false);
   const [catErr, setCatErr] = useState("");
   const [categories, setCategories] = useState<string[]>([]);
+  const [catLabels, setCatLabels] = useState<Record<string, string>>({});
   const [catFilter, setCatFilter] = useState("");
   const [q, setQ] = useState("");
 
@@ -101,6 +114,7 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
       .then((cat) => {
         setCatalog(cat.plugins);
         setCategories(cat.categories);
+        setCatLabels(cat.categoryLabels ?? {});
       })
       .catch((e) => setCatErr(String(e)))
       .finally(() => setCatLoading(false));
@@ -312,16 +326,16 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
 
         {/* 标签页 */}
         <div className="tab-bar">
-          <button className={`tab-btn ${tab === "market" ? "active" : ""}`} onClick={() => setTab("market")}>
+          <button className={`tab-btn ${tab === "market" ? "active" : ""}`} onClick={() => switchTab("market")}>
             市场
           </button>
-          <button className={`tab-btn ${tab === "search" ? "active" : ""}`} onClick={() => setTab("search")}>
+          <button className={`tab-btn ${tab === "search" ? "active" : ""}`} onClick={() => switchTab("search")}>
             npm 搜索
           </button>
-          <button className={`tab-btn ${tab === "custom" ? "active" : ""}`} onClick={() => setTab("custom")}>
+          <button className={`tab-btn ${tab === "custom" ? "active" : ""}`} onClick={() => switchTab("custom")}>
             自定义源
           </button>
-          <button className={`tab-btn ${tab === "local" ? "active" : ""}`} onClick={() => setTab("local")}>
+          <button className={`tab-btn ${tab === "local" ? "active" : ""}`} onClick={() => switchTab("local")}>
             本地导入
           </button>
         </div>
@@ -339,7 +353,7 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
                 <option value="">全部分类</option>
                 {categories.map((c) => (
                   <option key={c} value={c}>
-                    {c}
+                    {catLabels[c] ?? c}
                   </option>
                 ))}
               </select>

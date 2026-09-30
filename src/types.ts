@@ -221,6 +221,8 @@ export interface MarketCatalog {
   count: number;
   updated: string;
   categories: string[];
+  /** 分类显示名：key → 中文名 */
+  categoryLabels?: Record<string, string>;
   plugins: MarketPlugin[];
 }
 

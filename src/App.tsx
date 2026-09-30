@@ -141,6 +141,7 @@ export default function App() {
   const [notes, setNotes] = useState<ProfileNotesMap>({});
   const [noteTarget, setNoteTarget] = useState<{ profile: string; profilesDir: string } | null>(null);
   const [showInitHint, setShowInitHint] = useState(false);
+  const [showInitBtn, setShowInitBtn] = useState(false);
   const [initRunning, setInitRunning] = useState(false);
   // 在线安装对话框
   const [showInstall, setShowInstall] = useState(false);
@@ -458,6 +459,7 @@ export default function App() {
       if (pname === "web") {
         setInitRunning(false);
         setShowInitHint(false);
+        setShowInitBtn(false);
       }
       setInfo(`已停止 ${pname}`);
     } catch (e) {
@@ -713,13 +715,17 @@ export default function App() {
     }
   };
 
-  // 初始化按钮出现 >=5s 仍无 profile 时横幅提示（可点叉关闭；有 profile 后自动消失）
+  // 无 profile 持续 10s：同时出现「初始化」按钮 + 横幅（点叉只关横幅；有 profile 后一起消失）
   useEffect(() => {
     if (envs.length > 0 && profiles.length === 0) {
-      const t = setTimeout(() => setShowInitHint(true), 5000);
+      const t = setTimeout(() => {
+        setShowInitHint(true);
+        setShowInitBtn(true);
+      }, 10000);
       return () => clearTimeout(t);
     }
     setShowInitHint(false);
+    setShowInitBtn(false);
   }, [envs.length, profiles.length]);
 
   // 初始化便携运行时（完整下载 Node LTS + pnpm 到 %AppData%\dsh-plugin-manager\runtime）
@@ -784,6 +790,7 @@ export default function App() {
       setProfiles(ps);
       setSelectedProfile("web");
       setShowInitHint(false);
+      setShowInitBtn(false);
     } catch (e) {
       setInitRunning(false);
       setError(String(e));
@@ -808,6 +815,7 @@ export default function App() {
     } finally {
       setCreatingProfile(false);
       setShowInitHint(false);
+      setShowInitBtn(false);
       setInitRunning(false);
     }
   };
@@ -1132,7 +1140,7 @@ export default function App() {
                 <button className="btn tiny init-btn" onClick={handleStopInit} disabled={creatingProfile || !selectedEnv} title="停止初始化启动的 DSH 进程">
                   结束初始化
                 </button>
-              ) : envs.length > 0 && profiles.length === 0 ? (
+              ) : showInitBtn && envs.length > 0 && profiles.length === 0 ? (
                 <button className="btn tiny init-btn" onClick={handleInitProfile} disabled={creatingProfile || !selectedEnv} title="用本地 dsh 启动内置 web profile（首次自动创建并初始化）">
                   初始化
                 </button>
@@ -2279,7 +2287,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.10</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.11</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

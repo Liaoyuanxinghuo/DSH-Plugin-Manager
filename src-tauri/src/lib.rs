@@ -1513,6 +1513,7 @@ async fn check_deps_cmd(
 }
 
 /// 修复依赖：在 profile 目录执行 dsh plugin install（pnpm install，流式日志）
+/// 必须先 ensure 便携工具链（run_dsh_with_logs 内）并写入 **用户设置的 npm 镜像**（.npmrc）
 #[tauri::command]
 async fn fix_deps_cmd(
     app: tauri::AppHandle,
@@ -1526,8 +1527,12 @@ async fn fix_deps_cmd(
         return Err("该环境未绑定 dsh 运行时，无法修复依赖".to_string());
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    let profile_dir = profiles_dir.join(&profile);
     // 修复前先规范 package.json 依赖声明（兼容 github: 前缀 key），否则 pnpm 直接失败
     let _ = ensure_profile_deps(&profile, &profiles_dir);
+    // npm 源必须用用户设置的镜像（默认 npmmirror），否则大陆拉包失败
+    let registry = settings::load_settings().npm_registry;
+    let _ = dsh_install::ensure_profile_npmrc(&profile_dir, &registry);
     let dsh_home = runner::dsh_home_of(&profiles_dir);
     let app2 = app.clone();
     let env2 = env.clone();
@@ -2398,13 +2403,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.10_x64-setup.exe", "0.3.10"));
-        assert!(asset_matches("dsh-manager_0.3.10_x64-setup.exe", "0.3.10"));
-        assert!(asset_matches("任意名_0.3.10_x64-setup.exe", "0.3.10"));
-        assert!(!asset_matches("DSH-Manager-0.3.10-win-x64.exe", "0.3.10"));
-        assert!(!asset_matches("DSH Manager_0.3.10_x64-setup.exe.sha256", "0.3.10"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.10"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.10"));
+        assert!(asset_matches("DSH Manager_0.3.11_x64-setup.exe", "0.3.11"));
+        assert!(asset_matches("dsh-manager_0.3.11_x64-setup.exe", "0.3.11"));
+        assert!(asset_matches("任意名_0.3.11_x64-setup.exe", "0.3.11"));
+        assert!(!asset_matches("DSH-Manager-0.3.11-win-x64.exe", "0.3.11"));
+        assert!(!asset_matches("DSH Manager_0.3.11_x64-setup.exe.sha256", "0.3.11"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.11"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.11"));
     }
 
     #[test]
@@ -2537,10 +2542,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.10_x64-setup.exe", "0.3.10"));
+        assert!(asset_matches("DSH.Manager_0.3.11_x64-setup.exe", "0.3.11"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.10_x64-setup.exe", "0.3.10"));
-        assert!(asset_matches("DSH.MANAGER_0.3.10_X64-SETUP.EXE", "0.3.10"));
+        assert!(asset_matches("dsh.manager_0.3.11_x64-setup.exe", "0.3.11"));
+        assert!(asset_matches("DSH.MANAGER_0.3.11_X64-SETUP.EXE", "0.3.11"));
     }
 
     #[test]
@@ -2548,7 +2553,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.10", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.11", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }
