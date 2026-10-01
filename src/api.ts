@@ -20,6 +20,7 @@ import type {
   MarketCatalog,
   NpmPackageInfo,
   NpmSearchHit,
+  OrphanProcess,
   PeerIssue,
   PluginInfo,
   PluginUpdate,
@@ -66,6 +67,12 @@ export const api = {
   addDshScanDir: (path: string) => invoke<DshEnv[]>("add_dsh_scan_dir", { path }),
   getEnv: (envId: string) => invoke<DshEnv | null>("get_env", { envId }),
   listAllProfiles: () => invoke<ProfileInfo[]>("list_all_profiles"),
+  /** 增量扫描单个 profiles 目录（空 = 默认 ~/.dsh/profiles） */
+  listProfilesFromDir: (path: string) =>
+    invoke<ProfileInfo[]>("list_profiles_from_dir", { path }),
+  /** 流式扫描：扫到一个 profile 就事件 profile-found，结束 profiles-scan-done */
+  scanProfilesLive: (paths: string[]) =>
+    invoke<void>("scan_profiles_live", { paths }),
   listProfiles: (envId: string) =>
     invoke<ProfileInfo[]>("list_profiles", { envId }),
   listPlugins: (envId: string, profile: string, profilesDir: string) =>
@@ -85,10 +92,17 @@ export const api = {
   dshStatus: (envId: string, profile: string, profilesDir: string) =>
     invoke<DshStatus>("dsh_status", { envId, profile, profilesDirStr: profilesDir }),
   listRunning: () => invoke<RunningProcess[]>("list_running_cmd"),
+  /** 查找目标 env×profile 的孤儿 node 进程（同 bin.js + 同 profile，不在运行表） */
+  findOrphanNodes: (envId: string, profile: string) =>
+    invoke<OrphanProcess[]>("find_orphan_nodes_cmd", { envId, profile }),
+  /** 清理用户确认的孤儿进程（返回清理失败的 PID） */
+  killOrphans: (pids: number[]) => invoke<number[]>("kill_orphans_cmd", { pids }),
   /** 停止全部运行中的 DSH（关闭软件前用）；返回停止失败项 */
   stopAllDsh: () => invoke<string[]>("stop_all_dsh_cmd"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   openUrl: (url: string) => invoke<void>("open_url_cmd", { url }),
+  /** 切换 WebView DevTools（F12 / Ctrl+Shift+I）；release 构建也启用（tauri devtools feature） */
+  toggleDevtools: () => invoke<void>("toggle_devtools"),
   /** 打开 DSH web 界面：后端实时从日志提取带 token 的地址 */
   openDshWeb: (envId: string, profile: string, profilesDir: string) =>
     invoke<void>("open_dsh_web_cmd", { envId, profile, profilesDirStr: profilesDir }),
@@ -104,6 +118,7 @@ export const api = {
   ) => invoke<ExportResult>("export_profile_cmd", { envId, profile, profilesDirStr: profilesDir, targetPath, excludeNodeModules }),
   importProfile: (envId: string, zipPath: string, profilesDir: string) =>
     invoke<ImportResult>("import_profile_cmd", { envId, zipPath, profilesDirStr: profilesDir }),
+  openDevTools: () => invoke<void>("open_devtools_cmd"),
   cloneProfile: (envId: string, profile: string, profilesDir: string) =>
     invoke<{ name: string; skipped: number; files: number }>("clone_profile_cmd", { envId, profile, profilesDirStr: profilesDir }),
   createProfile: (envId: string, name: string, profilesDir: string) =>

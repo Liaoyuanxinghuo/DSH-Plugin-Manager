@@ -99,14 +99,24 @@ async fn scan_envs(state: State<'_, AppState>) -> Result<Vec<DshEnv>, String> {
 }
 
 /// 手动添加环境（如 pnpm dlx 版本）
+/// validate_manual_env 会执行命令探测版本（spawn 子进程）→ 阻塞线程池。
 #[tauri::command]
-fn add_manual_env(state: State<'_, AppState>, name: String, command: String) -> Result<DshEnv, String> {
+async fn add_manual_env(
+    state: State<'_, AppState>,
+    name: String,
+    command: String,
+) -> Result<DshEnv, String> {
     let name = name.trim().to_string();
     let command = command.trim().to_string();
     if name.is_empty() || command.is_empty() {
         return Err("名称和命令都不能为空".to_string());
     }
-    let version = scanner::validate_manual_env(&command)?;
+    let version = {
+        let command = command.clone();
+        tauri::async_runtime::spawn_blocking(move || scanner::validate_manual_env(&command))
+            .await
+            .map_err(|e| format!("探测 dsh 版本失败: {e}"))??
+    };
     let id = format!("manual-{}", uuid_like(&command));
     let env = DshEnv {
         id,
@@ -124,31 +134,35 @@ fn add_manual_env(state: State<'_, AppState>, name: String, command: String) -> 
     Ok(env)
 }
 
-/// 添加本地 profile 扫描目录
+/// 添加本地 profile 扫描目录（FS 检查/写文件 → 阻塞线程池）
 #[tauri::command]
-fn add_scan_dir(state: State<'_, AppState>, path: String) -> Result<ScanDirEntry, String> {
+async fn add_scan_dir(state: State<'_, AppState>, path: String) -> Result<ScanDirEntry, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("目录路径不能为空".to_string());
     }
-    let p = std::path::Path::new(&path);
-    if !p.is_dir() {
-        return Err(format!("目录不存在或不可访问: {path}"));
-    }
-    // 解析实际 profiles 目录
-    let profiles_dir = resolve_profiles_dir(p)?;
-    let id = format!("scan-{}", uuid_like(&path));
-    let label = std::path::Path::new(&path)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.clone());
-    let entry = ScanDirEntry {
-        id,
-        path,
-        label,
-        profiles_dir: profiles_dir.to_string_lossy().to_string(),
-        dsh_bin: None,
-    };
+    let entry = tauri::async_runtime::spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        if !p.is_dir() {
+            return Err(format!("目录不存在或不可访问: {path}"));
+        }
+        // 解析实际 profiles 目录
+        let profiles_dir = resolve_profiles_dir(p)?;
+        let id = format!("scan-{}", uuid_like(&path));
+        let label = std::path::Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.clone());
+        Ok(ScanDirEntry {
+            id,
+            path,
+            label,
+            profiles_dir: profiles_dir.to_string_lossy().to_string(),
+            dsh_bin: None,
+        })
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))??;
     let mut dirs = state.scan_dirs.lock().unwrap();
     if dirs.iter().any(|d| d.path == entry.path) {
         return Err("该目录已在扫描列表中".to_string());
@@ -206,19 +220,24 @@ fn is_profiles_dir(p: &std::path::Path) -> bool {
     dir_count >= 1 && (pkg_count >= 1 || dir_count >= 2)
 }
 
-/// 删除扫描目录
+/// 删除扫描目录（FS 写 → 阻塞线程池）
 #[tauri::command]
-fn remove_scan_dir(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let mut dirs = state.scan_dirs.lock().unwrap();
-    dirs.retain(|d| d.id != id);
-    save_scan_dirs(&dirs);
+async fn remove_scan_dir(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    let snapshot = {
+        let mut dirs = state.scan_dirs.lock().unwrap();
+        dirs.retain(|d| d.id != id);
+        dirs.clone()
+    };
+    tauri::async_runtime::spawn_blocking(move || save_scan_dirs(&snapshot))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?;
     Ok(())
 }
 
-/// 列出所有扫描目录
+/// 列出所有扫描目录（纯内存快照，无 IO）
 #[tauri::command]
-fn list_scan_dirs(state: State<'_, AppState>) -> Vec<ScanDirEntry> {
-    state.scan_dirs.lock().unwrap().clone()
+async fn list_scan_dirs(state: State<'_, AppState>) -> Result<Vec<ScanDirEntry>, String> {
+    Ok(state.scan_dirs.lock().unwrap().clone())
 }
 
 /// 在指定目录中扫描 dsh 本体并添加为可运行环境（自动探测命令与版本）
@@ -430,8 +449,25 @@ fn uuid_like(s: &str) -> String {
 
 /// 获取指定环境
 #[tauri::command]
-fn get_env(state: State<'_, AppState>, env_id: String) -> Option<DshEnv> {
-    get_env_inner(&state, &env_id).ok()
+async fn get_env(state: State<'_, AppState>, env_id: String) -> Result<Option<DshEnv>, String> {
+    // 快路径：手动环境已在 state，直接命中（免扫描）
+    {
+        let manual = state.manual_envs.lock().unwrap();
+        if let Some(e) = manual.iter().find(|e| e.id == env_id) {
+            return Ok(Some(e.clone()));
+        }
+    }
+    // 兜底 scan_envs（spawn 探测版本）→ 阻塞线程池；锁不跨 await
+    let manual = state.manual_envs.lock().unwrap().clone();
+    let scans = state.scan_dirs.lock().unwrap().clone();
+    let found = tauri::async_runtime::spawn_blocking(move || {
+        scanner::scan_envs(&manual, &scans)
+            .into_iter()
+            .find(|e| e.id == env_id)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?;
+    Ok(found)
 }
 
 // ==================== 命令：Profile ====================
@@ -467,6 +503,49 @@ async fn list_all_profiles(state: State<'_, AppState>) -> Result<Vec<ProfileInfo
     tauri::async_runtime::spawn_blocking(move || list_all_profiles_inner(&scans))
         .await
         .map_err(|e| format!("扫描 profiles 失败: {e}"))
+}
+
+/// 增量扫描：只列单个 profiles 目录（path 空 = 默认 DSH_HOME/profiles）。
+/// 供前端「扫到一个目录就先显示一个」。
+#[tauri::command]
+async fn list_profiles_from_dir(path: String) -> Result<Vec<ProfileInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = if path.trim().is_empty() {
+            scanner::default_dsh_home().join("profiles")
+        } else {
+            std::path::PathBuf::from(path.trim())
+        };
+        if !p.is_dir() {
+            return Ok(Vec::new());
+        }
+        Ok(scanner::list_profiles_from(&p))
+    })
+    .await
+    .map_err(|e| format!("扫描 profiles 失败: {e}"))?
+}
+
+/// 逐条流式扫描 profiles：扫到一个就 emit 一个 `profile-found`，全部结束 emit `profiles-scan-done`。
+#[tauri::command]
+async fn scan_profiles_live(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        for path in paths {
+            let p = if path.trim().is_empty() {
+                scanner::default_dsh_home().join("profiles")
+            } else {
+                std::path::PathBuf::from(path.trim())
+            };
+            if !p.is_dir() {
+                continue;
+            }
+            scanner::list_profiles_from_each(&p, |info| {
+                let _ = app.emit("profile-found", &info);
+            });
+        }
+        let _ = app.emit("profiles-scan-done", true);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("扫描 profiles 失败: {e}"))?
 }
 
 /// 列出某环境的全部 profile
@@ -512,22 +591,30 @@ async fn list_plugins(
         }
         let pkg = scanner::read_profile_package_full(&profile_dir)
             .ok_or_else(|| "无法读取 profile 的 package.json".to_string())?;
-        // 读取 cordis.patch.yml 中的禁用列表；服务 id 以 dump-config 为准
-        let disabled_ids = read_disabled_ids(&profile_dir);
+        // 官方语义：按「条目 id + 模块名称」匹配 disabled；服务 id 以包 bundle patch 为准
+        let patch_content = std::fs::read_to_string(profile_dir.join("cordis.patch.yml")).unwrap_or_default();
         let service_map = load_service_map(&env, &profile);
         let mut plugins: Vec<PluginInfo> = pkg
             .dependencies
             .into_iter()
             .map(|(name, spec)| {
                 let is_bundle = pkg.bundles.contains(&name);
-                let sid = service_id_for(&service_map, &name);
+                // market 语义：unbundled（有 dsh.bundle 但不在 bundles）= 没加载 = 关；
+                // 行禁用用 some()（任一 insert 行禁用就算禁用），不用 all()
+                let unbundled = is_unbundled(&profile_dir, &name, is_bundle);
+                let entries = service_entries_for_plugin(&profile_dir, &service_map, &name);
+                let rows_off = !entries.is_empty()
+                    && entries
+                        .iter()
+                        .any(|(id, mod_name)| patchfile::is_plugin_disabled(&patch_content, id, mod_name.as_deref()));
+                let is_disabled = unbundled || rows_off;
                 PluginInfo {
                     name,
                     spec,
                     is_bundle,
                     compatible: None,
                     incompatible_reason: None,
-                    is_disabled: disabled_ids.contains(&sid),
+                    is_disabled,
                 }
             })
             .collect();
@@ -558,6 +645,70 @@ fn service_id_for(service_map: &HashMap<String, String>, package_name: &str) -> 
         .cloned()
         .unwrap_or_else(|| patchfile::derive_service_id(package_name))
 }
+
+/// 读取已安装包自己的 bundle patch，解析其 insert 的真实服务 id / name 列表。
+/// 这是官方权威来源（如 dshmarket → dsh-market、@hyzyn/dsh-mcp → mcp-config）；
+/// name 是覆盖项声明的模块名（多行包子路径，如 @michengai/dsh-codex-ui/session-title），
+/// **不能一律用包名**，否则会匹配到别的条目。
+fn bundle_insert_entries(
+    profile_dir: &std::path::Path,
+    package_name: &str,
+) -> Vec<(String, Option<String>)> {
+    let pkg_dir = profile_dir.join("node_modules").join(package_name);
+    let manifest_path = pkg_dir.join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let patch_rel = json
+        .get("dsh")
+        .and_then(|d| d.get("bundle"))
+        .and_then(|b| b.get("patch"))
+        .and_then(|p| p.as_str())
+        .unwrap_or("cordis.patch.yml");
+    let patch_path = pkg_dir.join(patch_rel.trim_start_matches("./"));
+    let Ok(content) = std::fs::read_to_string(&patch_path) else {
+        return Vec::new();
+    };
+    patchfile::parse_insert_entries(&content)
+}
+
+/// 某插件的全部候选 (服务 id, 模块名)（去重、保序）：
+/// 1. 包 bundle patch 的 insert 条目（权威；name 用声明的模块名）
+/// 2. dump-config 映射 / 包名推导（仅当无 insert 条目时兜底）
+fn service_entries_for_plugin(
+    profile_dir: &std::path::Path,
+    service_map: &HashMap<String, String>,
+    package_name: &str,
+) -> Vec<(String, Option<String>)> {
+    let mut entries = bundle_insert_entries(profile_dir, package_name);
+    // market `rowIdsForPackage`：有 insert 行就只用 insert 行，不加幻影 fallback
+    // （fallback id 查不到条目 → all() 永假 → 显示「已启用」但实际已禁用）
+    if entries.is_empty() {
+        let fallback_id = service_id_for(service_map, package_name);
+        entries.push((fallback_id, Some(package_name.to_string())));
+    }
+    entries
+}
+
+/// 包是否声明了 dsh.bundle（组合包）
+fn declares_bundle(profile_dir: &std::path::Path, package_name: &str) -> bool {
+    let manifest_path = profile_dir.join("node_modules").join(package_name).join("package.json");
+    let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    json.get("dsh").and_then(|d| d.get("bundle")).is_some()
+}
+
+/// market `unbundled`：声明了 dsh.bundle 但不在 `dsh.profile.bundles` → 没被加载
+fn is_unbundled(profile_dir: &std::path::Path, package_name: &str, in_bundles: bool) -> bool {
+    !in_bundles && declares_bundle(profile_dir, package_name)
+}
 fn read_disabled_ids(profile_dir: &std::path::Path) -> Vec<String> {
     let patch_path = profile_dir.join("cordis.patch.yml");
     match std::fs::read_to_string(&patch_path) {
@@ -566,9 +717,11 @@ fn read_disabled_ids(profile_dir: &std::path::Path) -> Vec<String> {
     }
 }
 
-/// 设置插件启用/停用（写入 cordis.patch.yml）
+/// 设置插件启用/停用。
+/// market #696 B：**两层同写** —— patch 行 `disabled` + `dsh.profile.bundles`，
+/// 只写一层就会「开关不同步」。inbox bundle 不动 bundles；带 foreign 行的组合包只写 patch。
 #[tauri::command]
-fn set_plugin_enabled_cmd(
+async fn set_plugin_enabled_cmd(
     state: State<'_, AppState>,
     env_id: String,
     profile: String,
@@ -578,21 +731,62 @@ fn set_plugin_enabled_cmd(
 ) -> Result<Vec<String>, String> {
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
-    let profile_dir = profiles_dir.join(&profile);
-    if !profile_dir.is_dir() {
-        return Err(format!("profile 目录不存在: {}", profile_dir.display()));
-    }
-    let patch_path = profile_dir.join("cordis.patch.yml");
-    let service_map = load_service_map(&env, &profile);
-    let sid = service_id_for(&service_map, &package_name);
-    let content = std::fs::read_to_string(&patch_path).unwrap_or_default();
-    let new_content = patchfile::set_plugin_disabled(&content, &sid, !enabled)?;
-    if new_content != content {
-        std::fs::write(&patch_path, new_content).map_err(|e| format!("写入 patch 失败: {e}"))?;
-    }
-    // 返回新的禁用列表
-    let content = std::fs::read_to_string(&patch_path).unwrap_or_default();
-    Ok(patchfile::list_disabled_ids(&content))
+    tauri::async_runtime::spawn_blocking(move || {
+        let profile_dir = profiles_dir.join(&profile);
+        if !profile_dir.is_dir() {
+            return Err(format!("profile 目录不存在: {}", profile_dir.display()));
+        }
+        let patch_path = profile_dir.join("cordis.patch.yml");
+        let service_map = load_service_map(&env, &profile);
+        let entries = service_entries_for_plugin(&profile_dir, &service_map, &package_name);
+
+        // 1) patch 行层（market `rowBlock` 格式）
+        let mut content = std::fs::read_to_string(&patch_path).unwrap_or_default();
+        for (sid, mod_name) in &entries {
+            content =
+                patchfile::set_plugin_disabled_for(&content, sid, mod_name.as_deref(), !enabled)?;
+        }
+        let orig = std::fs::read_to_string(&patch_path).unwrap_or_default();
+        if content != orig {
+            std::fs::write(&patch_path, content).map_err(|e| format!("写入 patch 失败: {e}"))?;
+        }
+
+        // 2) bundles 层（market `addProfileBundle`/`removeProfileBundle`）
+        //    inbox bundle 永不改动；关闭保留依赖、只动 dsh.profile.bundles
+        const INBOX: [&str; 3] = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-headless"];
+        if !INBOX.contains(&package_name.as_str()) && declares_bundle(&profile_dir, &package_name) {
+            let pj_path = profile_dir.join("package.json");
+            let pj_raw = std::fs::read_to_string(&pj_path).unwrap_or_default();
+            if let Ok(mut pj) = serde_json::from_str::<serde_json::Value>(&pj_raw) {
+                let bundles = pj
+                    .get_mut("dsh")
+                    .and_then(|d| d.get_mut("profile"))
+                    .and_then(|p| p.get_mut("bundles"))
+                    .and_then(|b| b.as_array_mut());
+                if let Some(bundles) = bundles {
+                    let name = package_name.as_str();
+                    let has = bundles.iter().any(|v| v.as_str() == Some(name));
+                    if enabled && !has {
+                        bundles.push(serde_json::Value::String(name.to_string()));
+                    } else if !enabled && has {
+                        bundles.retain(|v| v.as_str() != Some(name));
+                    }
+                    if enabled != has {
+                        let out = serde_json::to_string_pretty(&pj)
+                            .map_err(|e| format!("序列化 package.json 失败: {e}"))?;
+                        std::fs::write(&pj_path, out + "\n")
+                            .map_err(|e| format!("写入 package.json 失败: {e}"))?;
+                    }
+                }
+            }
+        }
+
+        // 返回新的禁用列表
+        let content = std::fs::read_to_string(&patch_path).unwrap_or_default();
+        Ok(patchfile::list_disabled_ids(&content))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 检查插件更新（并行查询 npm latest）
@@ -724,6 +918,12 @@ autoInstallPeers: false
     Ok(())
 }
 
+/// 打开开发者工具（F12 使用；生产包亦可用）
+#[tauri::command]
+fn open_devtools_cmd(window: tauri::WebviewWindow) {
+    let _ = window.open_devtools();
+}
+
 #[tauri::command]
 async fn start_dsh_cmd(
     app: tauri::AppHandle,
@@ -757,8 +957,20 @@ async fn start_dsh_cmd(
     // 启动前兜底：profile 缺依赖（新建未装/导入未装）时自动 pnpm install（日志流式）；
     // 内置模板名（web/headless/acp/sdk/sdk-minimal）目录不存在时跳过——
     // 让 dsh 首次运行自行创建并初始化（官方自举行为，等价 npx @deepseek-ai/dsh web）
-    if !builtin_profile_allowed(&profile, &profiles_dir) {
-        if let Err(e) = ensure_profile_deps(&profile, &profiles_dir) {
+    // FS 检查/写文件 → 阻塞线程池
+    {
+        let profile = profile.clone();
+        let profiles_dir = profiles_dir.clone();
+        let dep_err = tauri::async_runtime::spawn_blocking(move || {
+            if builtin_profile_allowed(&profile, &profiles_dir) {
+                Ok(())
+            } else {
+                ensure_profile_deps(&profile, &profiles_dir)
+            }
+        })
+        .await
+        .map_err(|e| format!("profile 依赖检查失败：{e}"))?;
+        if let Err(e) = dep_err {
             return Err(format!("profile 依赖检查失败：{e}"));
         }
     }
@@ -773,7 +985,8 @@ async fn start_dsh_cmd(
     };
     // 锁操作包在独立作用域内：guard 在块尾自动释放。
     // （MutexGuard 非 Send，若跨 await 存活会让 command future 无法跨线程发送）
-    let port = {
+    // pick_port 内部 TCP 探测端口占用 → 快照 used 后放阻塞线程池，锁不跨 await
+    let used: Vec<u16> = {
         let running = state.running.lock().unwrap();
         if let Some(existing) = running.get(&key) {
             return Err(format!(
@@ -781,13 +994,26 @@ async fn start_dsh_cmd(
                 existing.pid, existing.port
             ));
         }
-        // 确定端口：用户指定（非 0）→ 校验占用；否则自动分配（避开本应用已用端口 + 系统占用）
-        let used: Vec<u16> = running.values().map(|r| r.port).collect();
-        pick_port(port, &used)?
+        running.values().map(|r| r.port).collect()
     };
+    // 确定端口：用户指定（非 0）→ 校验占用；否则自动分配（避开本应用已用端口 + 系统占用）
+    let port = tauri::async_runtime::spawn_blocking(move || pick_port(port, &used))
+        .await
+        .map_err(|e| format!("端口选择失败：{e}"))??;
 
     let dsh_home = runner::dsh_home_of(&profiles_dir);
-    let (pid, log_path) = match runner::start_dsh(&env, &profile, port, Some(&dsh_home)) {
+    // start_dsh 内部解析 launcher / spawn 进程 → 阻塞线程池，不占 tokio worker
+    let first = {
+        let env = env.clone();
+        let profile = profile.clone();
+        let dsh_home = dsh_home.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            runner::start_dsh(&env, &profile, port, Some(&dsh_home))
+        })
+        .await
+        .map_err(|e| format!("启动任务失败：{e}"))?
+    };
+    let (pid, log_path) = match first {
         Ok(r) => r,
         Err(first_err) => {
             // 启动解析失败，且原因指向 node 不可用（本机 node <24 跑不了新 dsh）：
@@ -802,7 +1028,14 @@ async fn start_dsh_cmd(
                 .map_err(|e| format!("自动安装 Node LTS 失败：{e}"))?
                 .map_err(|e| format!("自动安装 Node LTS 失败：{e}"))?;
                 let _ = install_result;
-                runner::start_dsh(&env, &profile, port, Some(&dsh_home))?
+                let env2 = env.clone();
+                let profile2 = profile.clone();
+                let dsh_home2 = dsh_home.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    runner::start_dsh(&env2, &profile2, port, Some(&dsh_home2))
+                })
+                .await
+                .map_err(|e| format!("启动任务失败：{e}"))??
             } else {
                 return Err(first_err);
             }
@@ -811,13 +1044,25 @@ async fn start_dsh_cmd(
 
     // 短暂探测：2 秒后进程仍存活才算启动成功。
     // dsh 若启动失败（例如用旧版 dsh 加载新版 profile → ERR_MODULE_NOT_FOUND）会秒退。
-    // 睡眠放阻塞线程池，避免占用 tokio worker 线程导致其他命令排队。
-    tauri::async_runtime::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(2)))
+    // 睡眠 + tasklist 探测放阻塞线程池，避免占用 tokio worker 线程导致其他命令排队。
+    let (alive, tail) = {
+        let log_path = log_path.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let alive = runner::is_pid_alive(pid);
+            let tail = if alive {
+                String::new()
+            } else {
+                let t = runner::read_log_tail(&log_path, 12);
+                let _ = std::fs::remove_file(&log_path);
+                t
+            };
+            (alive, tail)
+        })
         .await
-        .map_err(|e| format!("等待进程探测失败：{e}"))?;
-    if !runner::is_pid_alive(pid) {
-        let tail = runner::read_log_tail(&log_path, 12);
-        let _ = std::fs::remove_file(&log_path);
+        .map_err(|e| format!("等待进程探测失败：{e}"))?
+    };
+    if !alive {
         return Err(if tail.trim().is_empty() {
             format!("dsh 启动后立即退出（PID {pid}），未捕获到日志")
         } else {
@@ -861,11 +1106,45 @@ async fn start_dsh_cmd(
 }
 
 /// 从 running map 中清理已退出的进程（避免 UI 显示虚假"运行中"）
+/// 批量探测（单次 tasklist）。仅可在阻塞线程池内调用（内部 spawn 子进程）。
 fn prune_dead(running: &mut HashMap<String, RunningProcess>) {
+    if running.is_empty() {
+        return;
+    }
+    let pids: Vec<u32> = running.values().map(|p| p.pid).collect();
+    let alive = runner::alive_pids(&pids);
     let dead: Vec<String> = running
         .iter()
-        .filter(|(_, p)| !runner::is_pid_alive(p.pid))
+        .filter(|(_, p)| !alive.contains(&p.pid))
         .map(|(k, _)| k.clone())
+        .collect();
+    for k in dead {
+        running.remove(&k);
+    }
+}
+
+/// 清理死进程的异步入口：tasklist 探测放阻塞线程池，锁内只做纯内存删除。
+/// 所有高频轮询命令（dsh_status / list_running）必须走这里，绝不能在主线程 spawn 子进程。
+async fn prune_dead_async(state: &State<'_, AppState>) {
+    // 1) 快照 pid（锁内纯内存）
+    let pids: Vec<(String, u32)> = {
+        let running = state.running.lock().unwrap();
+        running.iter().map(|(k, p)| (k.clone(), p.pid)).collect()
+    };
+    if pids.is_empty() {
+        return;
+    }
+    // 2) 存活探测（tasklist 子进程）→ 阻塞线程池
+    let pid_list: Vec<u32> = pids.iter().map(|(_, pid)| *pid).collect();
+    let alive = tauri::async_runtime::spawn_blocking(move || runner::alive_pids(&pid_list))
+        .await
+        .unwrap_or_default();
+    // 3) 删除死进程（锁内纯内存）
+    let mut running = state.running.lock().unwrap();
+    let dead: Vec<String> = pids
+        .into_iter()
+        .filter(|(_, pid)| !alive.contains(pid))
+        .map(|(k, _)| k)
         .collect();
     for k in dead {
         running.remove(&k);
@@ -884,30 +1163,41 @@ async fn stop_dsh_cmd(
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
     let key = run_key(&env_id, &profiles_dir, &profile);
-    let mut running = state.running.lock().unwrap();
-    let mut proc = running.remove(&key);
-    if proc.is_none() {
-        // 宽松：同一 env×profile 只有一个实例时直接停它
-        let alt = running
-            .iter()
-            .find(|(k, p)| {
-                p.env_id == env_id && p.profile == profile && k.ends_with(&format!("::{profile}"))
-            })
-            .map(|(k, _)| k.clone());
-        if let Some(k) = alt {
-            proc = running.remove(&k);
+    // 快照取出目标进程（锁不跨 await；MutexGuard 非 Send）
+    let mut proc = {
+        let mut running = state.running.lock().unwrap();
+        let mut proc = running.remove(&key);
+        if proc.is_none() {
+            // 宽松：同一 env×profile 只有一个实例时直接停它
+            let alt = running
+                .iter()
+                .find(|(k, p)| {
+                    p.env_id == env_id && p.profile == profile && k.ends_with(&format!("::{profile}"))
+                })
+                .map(|(k, _)| k.clone());
+            if let Some(k) = alt {
+                proc = running.remove(&k);
+            }
         }
-    }
-    if let Some(p) = proc {
-        if !runner::is_pid_alive(p.pid) {
-            // 进程已自行退出，视为停止成功
-            return Ok(());
-        }
-        match runner::stop_dsh(p.pid) {
+        proc
+    };
+    if let Some(p) = proc.take() {
+        // tasklist / taskkill 都是子进程 → 阻塞线程池
+        let pid = p.pid;
+        let stop_result = tauri::async_runtime::spawn_blocking(move || {
+            if !runner::is_pid_alive(pid) {
+                // 进程已自行退出，视为停止成功
+                return Ok(());
+            }
+            runner::stop_dsh(pid)
+        })
+        .await
+        .map_err(|e| format!("停止任务失败：{e}"))?;
+        match stop_result {
             Ok(_) => Ok(()),
             Err(e) => {
-                // taskkill 失败但进程可能已退出
-                running.insert(key, p);
+                // taskkill 失败但进程可能已退出：把记录放回去
+                state.running.lock().unwrap().insert(key, p);
                 Err(e)
             }
         }
@@ -921,9 +1211,10 @@ async fn stop_dsh_cmd(
 #[tauri::command]
 async fn stop_all_dsh_cmd(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     // 快照运行 key（锁不跨 await；MutexGuard 非 Send）
+    // tasklist 清理死进程 → 阻塞线程池（prune_dead 内部 spawn 子进程）
+    prune_dead_async(&state).await;
     let keys: Vec<String> = {
-        let mut running = state.running.lock().unwrap();
-        prune_dead(&mut running);
+        let running = state.running.lock().unwrap();
         running.keys().cloned().collect()
     };
     let mut failed: Vec<String> = Vec::new();
@@ -934,67 +1225,167 @@ async fn stop_all_dsh_cmd(state: State<'_, AppState>) -> Result<Vec<String>, Str
             continue;
         }
         let k = key.clone();
-        // 锁只在该语句内临时持有（taskkill 是同步快操作，不跨 await）
+        // 锁只在该语句内临时持有
         let proc = {
             let mut running = state.running.lock().unwrap();
             running.remove(&k)
         };
         if let Some(p) = proc {
-            if runner::is_pid_alive(p.pid) {
-                if let Err(e) = runner::stop_dsh(p.pid) {
-                    failed.push(format!("{}: {e}", p.profile));
+            // tasklist / taskkill 子进程 → 阻塞线程池
+            let r = tauri::async_runtime::spawn_blocking(move || {
+                if runner::is_pid_alive(p.pid) {
+                    runner::stop_dsh(p.pid).map(|_| p.profile)
+                } else {
+                    Ok(p.profile)
                 }
+            })
+            .await
+            .map_err(|e| format!("{key}: 停止任务失败：{e}"));
+            match r {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => failed.push(e),
+                Err(e) => failed.push(e),
             }
         }
     }
     Ok(failed)
 }
 
+/// 就绪判定（可测试）：端口通 **且**（拿到带 token 的 web URL **或** web 已在 HTTP 服务）。
+/// token URL 是最稳的打开方式；但 dsh 的 token 行要等 MCP 初始化完才打印（常 2-3 分钟），
+/// 而 web 服务本身早就起来了——浏览器若已有签名 cookie，裸地址即可直接用。
+/// 因此 HTTP 已响应（含 401）也算就绪，不再干等 token 行。
+fn compute_web_ready(port_open: bool, url: Option<&str>, web_serving: bool) -> bool {
+    let has_token = url.map(|u| u.contains("token=")).unwrap_or(false);
+    port_open && (has_token || web_serving)
+}
+
 /// 查询指定 env×profile 的运行状态（自动清理已退出进程）
-/// 轮询频繁：**不做 scan_envs**，只查 running 表，避免卡 UI。
+/// 轮询频繁（启动就绪轮询 1s/次）：**不做 scan_envs**；tasklist/TCP 探测
+/// 一律放阻塞线程池，绝不能在主线程 spawn 子进程（同步 command 跑主线程）。
 #[tauri::command]
-fn dsh_status(state: State<'_, AppState>, env_id: String, profile: String, profiles_dir_str: String) -> DshStatus {
-    let mut running = state.running.lock().unwrap();
-    prune_dead(&mut running);
+async fn dsh_status(
+    state: State<'_, AppState>,
+    env_id: String,
+    profile: String,
+    profiles_dir_str: String,
+) -> Result<DshStatus, String> {
+    prune_dead_async(&state).await;
     let key = run_key(
         &env_id,
         std::path::Path::new(profiles_dir_str.trim()),
         &profile,
     );
-    let proc = running.get(&key).cloned().or_else(|| {
-        running
-            .values()
-            .find(|p| p.env_id == env_id && p.profile == profile)
-            .cloned()
-    });
-    drop(running);
-    match proc {
-        Some(p) => DshStatus {
-            running: true,
-            port_open: runner::is_port_open(p.port),
-            process: Some(p),
-        },
+    let proc = {
+        let running = state.running.lock().unwrap();
+        running.get(&key).cloned().or_else(|| {
+            running
+                .values()
+                .find(|p| p.env_id == env_id && p.profile == profile)
+                .cloned()
+        })
+    };
+    Ok(match proc {
+        Some(p) => {
+            let port = p.port;
+            let log_path = p.log_path.clone();
+            // TCP 探测 + HTTP 探测 + 日志取 token URL → 阻塞线程池（不占主线程）
+            let (port_open, auth_url, web_serving) = tauri::async_runtime::spawn_blocking(move || {
+                let po = runner::is_port_open(port);
+                // token URL：日志出现 `dsh web: http://127.0.0.1:<port>/?token=...`（MCP 初始化完才打印）
+                let url = if log_path.is_empty() {
+                    None
+                } else {
+                    runner::find_auth_url(&log_path)
+                };
+                // HTTP 已响应（含 401）= web 已可访问（有 cookie 的浏览器开裸地址就能用）
+                let serving = po && runner::probe_web_serving(port);
+                (po, url, serving)
+            })
+            .await
+            .unwrap_or((false, None, false));
+            // 未提取到 token URL 时退回裸地址（端口已通时用于兜底展示）
+            let url = auth_url.or_else(|| {
+                if port_open {
+                    Some(format!("http://127.0.0.1:{port}"))
+                } else {
+                    None
+                }
+            });
+            let web_ready = compute_web_ready(port_open, url.as_deref(), web_serving);
+            DshStatus {
+                running: true,
+                port_open,
+                process: Some(p),
+                web_ready,
+                url,
+            }
+        }
         None => DshStatus {
             running: false,
             port_open: false,
             process: None,
+            web_ready: false,
+            url: None,
         },
-    }
+    })
 }
 
 /// 列出全部运行中的 DSH 进程（跨环境跨 profile，自动清理已退出进程）
 #[tauri::command]
-fn list_running_cmd(state: State<'_, AppState>) -> Vec<RunningProcess> {
-    let mut running = state.running.lock().unwrap();
-    prune_dead(&mut running);
-    running.values().cloned().collect()
+async fn list_running_cmd(state: State<'_, AppState>) -> Result<Vec<RunningProcess>, String> {
+    prune_dead_async(&state).await;
+    let running = state.running.lock().unwrap();
+    Ok(running.values().cloned().collect())
+}
+
+/// 查找目标 env×profile 的孤儿 node 进程（同 bin.js + 同 profile 精确匹配，且不在运行表）。
+/// 只查不杀：UI 展示列表，用户确认后调用 kill_orphans_cmd。
+#[tauri::command]
+async fn find_orphan_nodes_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    profile: String,
+) -> Result<Vec<OrphanProcess>, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    // 快照运行表 PID（排除本会话已知实例）
+    let known: Vec<u32> = {
+        let running = state.running.lock().unwrap();
+        running.values().map(|p| p.pid).collect()
+    };
+    // WMI 枚举 node 进程 + 命令行匹配 → 阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || runner::find_orphans(&env, &profile, &known))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))
+}
+
+/// 清理用户确认的孤儿进程（taskkill /T 连 MCP 子树一起收）
+#[tauri::command]
+async fn kill_orphans_cmd(pids: Vec<u32>) -> Result<Vec<u32>, String> {
+    // 返回清理失败的 PID（已退出/不存在视为成功）
+    let failed = tauri::async_runtime::spawn_blocking(move || {
+        let mut failed = Vec::new();
+        for pid in pids {
+            if runner::is_pid_alive(pid) {
+                if let Err(e) = runner::stop_dsh(pid) {
+                    eprintln!("清理孤儿进程 {pid} 失败: {e}");
+                    failed.push(pid);
+                }
+            }
+        }
+        failed
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?;
+    Ok(failed)
 }
 
 // ==================== 命令：Profile 导出/导入 ====================
 
 /// 新建 profile（目标目录必须是 profiles 文件夹，不满足报错）
+/// 目录创建/写文件放阻塞线程池，不占主线程。
 #[tauri::command]
-fn create_profile_cmd(
+async fn create_profile_cmd(
     state: State<'_, AppState>,
     env_id: String,
     name: String,
@@ -1016,7 +1407,9 @@ fn create_profile_cmd(
         p.to_path_buf()
     };
     // 目录不存在也允许（create_profile 内部 create_dir_all 递归创建 profiles 目录）
-    profile_io::create_profile(&profiles_dir, &name)
+    tauri::async_runtime::spawn_blocking(move || profile_io::create_profile(&profiles_dir, &name))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 删除 profile（running 时拒绝）
@@ -1050,38 +1443,47 @@ async fn delete_profile_cmd(
 
 /// 读取设置
 #[tauri::command]
-fn get_settings_cmd() -> settings::Settings {
-    settings::load_settings()
+async fn get_settings_cmd() -> settings::Settings {
+    tauri::async_runtime::spawn_blocking(settings::load_settings)
+        .await
+        .unwrap_or_default()
 }
 
-/// 保存设置
+/// 保存设置（FS 写 → 阻塞线程池）
 #[tauri::command]
-fn set_settings_cmd(
+async fn set_settings_cmd(
     npm_registry: String,
     dsh_download_dir: String,
     github_mirror: String,
     github_mirrors: Option<Vec<String>>,
 ) -> Result<(), String> {
-    settings::validate_registry(&npm_registry)?;
-    settings::validate_github_mirror(&github_mirror)?;
-    if dsh_download_dir.trim().is_empty() {
-        return Err("DSH 下载目录不能为空".to_string());
-    }
-    let mut s = settings::load_settings();
-    s.npm_registry = settings::normalize_registry(&npm_registry);
-    s.dsh_download_dir = dsh_download_dir.trim().to_string();
-    s.github_mirror = settings::normalize_github_mirror(&github_mirror);
-    s.github_mirrors = settings::normalize_github_mirrors(&github_mirrors.unwrap_or_default())?;
-    settings::save_settings(&s)
+    tauri::async_runtime::spawn_blocking(move || {
+        settings::validate_registry(&npm_registry)?;
+        settings::validate_github_mirror(&github_mirror)?;
+        if dsh_download_dir.trim().is_empty() {
+            return Err("DSH 下载目录不能为空".to_string());
+        }
+        let mut s = settings::load_settings();
+        s.npm_registry = settings::normalize_registry(&npm_registry);
+        s.dsh_download_dir = dsh_download_dir.trim().to_string();
+        s.github_mirror = settings::normalize_github_mirror(&github_mirror);
+        s.github_mirrors = settings::normalize_github_mirrors(&github_mirrors.unwrap_or_default())?;
+        settings::save_settings(&s)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 项目仓库信息（关于 / 检查更新用）
 const PROJECT_REPO: &str = "Liaoyuanxinghuo/DSH-Plugin-Manager";
 
 /// 检测便携运行时是否已就绪（%AppData%\dsh-plugin-manager\runtime\ 内 Node≥24 + npm + pnpm）
+/// 内部会逐个探测 node 版本（spawn 子进程）→ 阻塞线程池，不占主线程。
 #[tauri::command]
-fn check_portable_runtime_cmd() -> bool {
-    toolchain::runtime_toolchain().is_some()
+async fn check_portable_runtime_cmd() -> bool {
+    tauri::async_runtime::spawn_blocking(|| toolchain::runtime_toolchain().is_some())
+        .await
+        .unwrap_or(false)
 }
 
 /// 初始化便携运行时：完整下载 Node LTS 到 runtime 并安装 pnpm（已就绪则直接返回）。
@@ -1423,18 +1825,24 @@ async fn download_update_cmd(version: String, app: tauri::AppHandle) -> Result<S
 /// 启动已下载的安装程序，然后立即退出当前程序（让安装器能覆盖正在运行的 exe）。
 /// 安装器为独立进程，父进程退出不影响它继续运行。
 #[tauri::command]
-fn launch_installer_and_exit_cmd(path: String, app: tauri::AppHandle) -> Result<(), String> {
+async fn launch_installer_and_exit_cmd(path: String, app: tauri::AppHandle) -> Result<(), String> {
     if path.trim().is_empty() {
         return Err("安装程序路径为空".to_string());
     }
     if !std::path::Path::new(&path).exists() {
         return Err(format!("安装程序不存在: {path}"));
     }
-    std::process::Command::new(&path)
-        .spawn()
-        .map_err(|e| format!("启动安装程序失败：{e}"))?;
-    // 稍等片刻确保安装程序已拉起，再退出自己
-    std::thread::sleep(std::time::Duration::from_millis(1200));
+    // spawn + 等待放阻塞线程池，勿在主线程 sleep
+    tauri::async_runtime::spawn_blocking(move || {
+        std::process::Command::new(&path)
+            .spawn()
+            .map_err(|e| format!("启动安装程序失败：{e}"))?;
+        // 稍等片刻确保安装程序已拉起，再退出自己
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))??;
     app.exit(0);
     Ok(())
 }
@@ -1482,7 +1890,7 @@ async fn install_dsh_version_cmd(
 
 /// 确保 profile 的 .npmrc 使用当前镜像（安装插件前调用）
 #[tauri::command]
-fn ensure_profile_npmrc_cmd(
+async fn ensure_profile_npmrc_cmd(
     state: State<'_, AppState>,
     env_id: String,
     profile: String,
@@ -1490,16 +1898,20 @@ fn ensure_profile_npmrc_cmd(
 ) -> Result<(), String> {
     let env = get_env_inner(&state, &env_id)?;
     let profile_dir = profiles_dir_arg(&profiles_dir_str, &env).join(&profile);
-    if !profile_dir.is_dir() {
-        return Err(format!("profile 不存在: {profile}"));
-    }
-    let registry = settings::load_settings().npm_registry;
-    dsh_install::ensure_profile_npmrc(&profile_dir, &registry)
+    tauri::async_runtime::spawn_blocking(move || {
+        if !profile_dir.is_dir() {
+            return Err(format!("profile 不存在: {profile}"));
+        }
+        let registry = settings::load_settings().npm_registry;
+        dsh_install::ensure_profile_npmrc(&profile_dir, &registry)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 // ==================== 命令：M4 依赖健康 / 残留清理 / 诊断导出 ====================
 
-/// 依赖健康检查
+/// 依赖健康检查（FS 扫描 → 阻塞线程池）
 #[tauri::command]
 async fn check_deps_cmd(
     state: State<'_, AppState>,
@@ -1509,7 +1921,9 @@ async fn check_deps_cmd(
 ) -> Result<Vec<health::DepIssue>, String> {
     let env = get_env_inner(&state, &env_id)?;
     let profile_dir = profiles_dir_arg(&profiles_dir_str, &env).join(&profile);
-    health::check_profile_deps(&profile_dir)
+    tauri::async_runtime::spawn_blocking(move || health::check_profile_deps(&profile_dir))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 修复依赖：在 profile 目录执行 dsh plugin install（pnpm install，流式日志）
@@ -1903,26 +2317,32 @@ async fn import_pack_cmd(
 
 /// 读取全部 profile 备注
 #[tauri::command]
-fn get_profile_notes_cmd() -> Result<packforge::NotesMap, String> {
-    Ok(packforge::load_notes())
+async fn get_profile_notes_cmd() -> Result<packforge::NotesMap, String> {
+    tauri::async_runtime::spawn_blocking(packforge::load_notes)
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))
 }
 
-/// 保存 profile 备注（清空则删除）
+/// 保存 profile 备注（清空则删除；FS 写 → 阻塞线程池）
 #[tauri::command]
-fn save_profile_note_cmd(
+async fn save_profile_note_cmd(
     profile: String,
     profiles_dir_str: String,
     note: String,
     hint_version: String,
 ) -> Result<(), String> {
-    let key = packforge::note_key(&profile, &profiles_dir_str);
-    packforge::save_note(
-        &key,
-        &packforge::ProfileNote {
-            note,
-            hint_version,
-        },
-    )
+    tauri::async_runtime::spawn_blocking(move || {
+        let key = packforge::note_key(&profile, &profiles_dir_str);
+        packforge::save_note(
+            &key,
+            &packforge::ProfileNote {
+                note,
+                hint_version,
+            },
+        )
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 fn timestamp_compact() -> String {
@@ -1997,7 +2417,7 @@ async fn market_catalog_cmd() -> Result<market::MarketCatalog, String> {
 
 /// 修复 pnpm 构建白名单（git 源插件安装需要）
 #[tauri::command]
-fn fix_build_permit_cmd(
+async fn fix_build_permit_cmd(
     state: State<'_, AppState>,
     env_id: String,
     profile: String,
@@ -2007,10 +2427,14 @@ fn fix_build_permit_cmd(
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
     let profile_dir = profiles_dir.join(profile);
-    if !profile_dir.is_dir() {
-        return Err(format!("profile 目录不存在: {}", profile_dir.display()));
-    }
-    buildpermit::fix_build_permit(&profile_dir, &packages)
+    tauri::async_runtime::spawn_blocking(move || {
+        if !profile_dir.is_dir() {
+            return Err(format!("profile 目录不存在: {}", profile_dir.display()));
+        }
+        buildpermit::fix_build_permit(&profile_dir, &packages)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 本地安装插件：文件夹（file:）或 .tgz 压缩包
@@ -2161,16 +2585,33 @@ async fn disallow_version_cmd(
 
 // ==================== 命令：文件/URL ====================
 
-/// 在资源管理器中打开路径
+/// 在资源管理器中打开路径（spawn 子进程 → 阻塞线程池）
 #[tauri::command]
-fn open_path(path: String) -> Result<(), String> {
-    fsutil::open_in_explorer(&path)
+async fn open_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || fsutil::open_in_explorer(&path))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
-/// 用默认浏览器打开 URL
+/// 用默认浏览器打开 URL（spawn 子进程 → 阻塞线程池）
 #[tauri::command]
-fn open_url_cmd(url: String) -> Result<(), String> {
-    fsutil::open_url(&url)
+async fn open_url_cmd(url: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || fsutil::open_url(&url))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+/// 切换 WebView DevTools（F12 / Ctrl+Shift+I）。
+/// 依赖 tauri 的 `devtools` feature（Cargo.toml 已开）：release/安装版也可用。
+/// WebView2 的浏览器快捷键在 DevTools 关闭时会吞掉 F12 且不转发给页面，
+/// 因此前端监听到 F12 时显式调本命令兜底。
+#[tauri::command]
+fn toggle_devtools(window: tauri::WebviewWindow) {
+    if window.is_devtools_open() {
+        window.close_devtools();
+    } else {
+        window.open_devtools();
+    }
 }
 
 /// 打开指定 env×profile 的 DSH web 界面。
@@ -2202,15 +2643,29 @@ async fn open_dsh_web_cmd(
             .ok_or_else(|| format!("「{profile}」在该环境未在运行"))?;
         proc
     };
-    // 2) 读日志 + 打开浏览器放阻塞池，避免读大日志/拉起进程卡 IPC
+    // 2) 读日志 + 打开浏览器放阻塞池，避免读大日志/拉起进程卡 IPC。
+    //    优先打开带 token 的地址（免认证）；token 行要等 MCP 初始化完才打印（常 2-3 分钟），
+    //    而 web 服务早已可访问——因此短等 3s 仍拿不到 token 就直接开裸地址：
+    //    浏览器若已有 dsh 签名 cookie（此前访问过 token 地址）即可直接用；
+    //    没有 cookie 会显示 401 提示，届时再点一次通常 token 已刷出。
+    //    不再长等 180s：服务一起来就应能打开。
     tauri::async_runtime::spawn_blocking(move || {
-        let url = if log_path.log_path.is_empty() {
-            format!("http://127.0.0.1:{}", log_path.port)
-        } else {
-            runner::find_auth_url(&log_path.log_path)
-                .unwrap_or_else(|| format!("http://127.0.0.1:{}", log_path.port))
-        };
-        fsutil::open_url(&url)
+        let port = log_path.port;
+        if log_path.log_path.is_empty() {
+            return fsutil::open_url(&format!("http://127.0.0.1:{port}"));
+        }
+        if let Some(url) = runner::find_auth_url(&log_path.log_path) {
+            return fsutil::open_url(&url);
+        }
+        // token 行可能刚写进日志尚未刷出：给 3s 短等
+        if let Some(url) = runner::find_auth_url_wait(&log_path.log_path, 3_000, 250) {
+            return fsutil::open_url(&url);
+        }
+        // 服务已可访问 → 开裸地址；端口都不通才是真的没起
+        if runner::is_port_open(port) {
+            return fsutil::open_url(&format!("http://127.0.0.1:{port}/"));
+        }
+        Err("DSH web 服务尚未启动，请稍后再试".to_string())
     })
     .await
     .map_err(|e| format!("打开浏览器失败: {e}"))?
@@ -2219,13 +2674,33 @@ async fn open_dsh_web_cmd(
 /// 获取当前选中"环境 × Profile"的关键路径集合（供前端文件按钮使用）。
 /// 以选中 profile 的来源目录为基准：sessions/logs 位于其父目录（即注入的 DSH_HOME）。
 #[tauri::command]
-fn get_env_paths(
+async fn get_env_paths(
     state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
 ) -> Result<serde_json::Value, String> {
-    let env = get_env_inner(&state, &env_id)?;
+    // get_env_inner 兜底会 scan_envs（spawn 探测）→ 先快路径，再阻塞线程池
+    let env = {
+        let manual = state.manual_envs.lock().unwrap();
+        manual.iter().find(|e| e.id == env_id).cloned()
+    };
+    let env = match env {
+        Some(e) => e,
+        None => {
+            let manual = state.manual_envs.lock().unwrap().clone();
+            let scans = state.scan_dirs.lock().unwrap().clone();
+            let id = env_id.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                scanner::scan_envs(&manual, &scans)
+                    .into_iter()
+                    .find(|e| e.id == id)
+            })
+            .await
+            .unwrap_or(None)
+            .ok_or_else(|| format!("环境不存在: {env_id}"))?
+        }
+    };
     let home = std::path::Path::new(&env.home_dir);
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
     // 当前选中 profile 的目录（存在才返回，不存在返回 null）
@@ -2276,9 +2751,12 @@ pub fn run() {
             list_scan_dirs,
             add_dsh_scan_dir,
             list_all_profiles,
+            list_profiles_from_dir,
+            scan_profiles_live,
             list_profiles,
             create_profile_cmd,
             delete_profile_cmd,
+            open_devtools_cmd,
             list_plugins,
             set_plugin_enabled_cmd,
             check_updates_cmd,
@@ -2294,10 +2772,13 @@ pub fn run() {
             export_diag_cmd,
             start_dsh_cmd,
             stop_dsh_cmd,
+            find_orphan_nodes_cmd,
+            kill_orphans_cmd,
             dsh_status,
             list_running_cmd,
             open_path,
             open_url_cmd,
+            toggle_devtools,
             check_update_cmd,
             download_update_cmd,
             launch_installer_and_exit_cmd,
@@ -2341,6 +2822,125 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundle_insert_ids_reads_real_ids_from_package_patch() {
+        // 模拟 profile/node_modules/<pkg>/package.json + cordis.patch.yml
+        let tmp = std::env::temp_dir().join("dshpm-bundle-ids-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pkg = tmp.join("node_modules").join("dshmarket");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"dshmarket","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("cordis.patch.yml"),
+            "- insert:\n    - id: dsh-market\n      name: 'dshmarket'\n",
+        )
+        .unwrap();
+        let ids = bundle_insert_entries(&tmp, "dshmarket");
+        assert_eq!(ids, vec![("dsh-market".to_string(), Some("dshmarket".to_string()))]);
+
+        // 多行包：web-all 一类，全部 insert id 都要返回，name 用各自声明的模块名
+        let pkg2 = tmp.join("node_modules").join("@linxin666").join("dsh-web-all");
+        std::fs::create_dir_all(&pkg2).unwrap();
+        std::fs::write(
+            pkg2.join("package.json"),
+            r#"{"name":"@linxin666/dsh-web-all","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg2.join("cordis.patch.yml"),
+            "- insert:\n    - id: web-ui-compat\n      name: '@linxin666/dsh-web-all'\n- insert:\n    - id: web-ui-settings\n      name: '@linxin666/dsh-web-all/settings'\n",
+        )
+        .unwrap();
+        let ids = bundle_insert_entries(&tmp, "@linxin666/dsh-web-all");
+        assert_eq!(
+            ids,
+            vec![
+                ("web-ui-compat".to_string(), Some("@linxin666/dsh-web-all".to_string())),
+                ("web-ui-settings".to_string(), Some("@linxin666/dsh-web-all/settings".to_string()))
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn service_ids_prefers_bundle_patch_over_derived() {
+        // 推导 id 是 mcp，真实 insert id 是 mcp-config — 必须以真实 id 为准
+        let tmp = std::env::temp_dir().join("dshpm-service-ids-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pkg = tmp.join("node_modules").join("@hyzyn").join("dsh-mcp");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@hyzyn/dsh-mcp","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("cordis.patch.yml"),
+            "- insert:\n    - id: mcp-config\n      name: '@hyzyn/dsh-mcp'\n",
+        )
+        .unwrap();
+        let map = HashMap::new();
+        let entries = service_entries_for_plugin(&tmp, &map, "@hyzyn/dsh-mcp");
+        assert_eq!(entries[0].0, "mcp-config", "必须以 bundle patch 的 insert id 为首: {entries:?}");
+        assert_eq!(entries[0].1.as_deref(), Some("@hyzyn/dsh-mcp"), "name 用 insert 声明的模块名");
+        // market 语义：有 insert 行时不加幻影 fallback（避免 all()/some() 被污染）
+        assert_eq!(entries.len(), 1, "有 insert 行时只用 insert 行: {entries:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn enable_clears_each_insert_row_by_its_own_name() {
+        // codex-ui 这类多行包：两行 insert，name 各不相同
+        // 启用时必须按各自 name/id 清 disabled，且不能只删 id 行留下孤儿 name
+        let tmp = std::env::temp_dir().join("dshpm-enable-rows-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let pkg = tmp.join("node_modules").join("@michengai").join("dsh-codex-ui");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"@michengai/dsh-codex-ui","dsh":{"bundle":{"patch":"./cordis.patch.yml"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("cordis.patch.yml"),
+            "- insert:\n    - id: michengai-codex-ui-session-title\n      name: '@michengai/dsh-codex-ui/session-title'\n    - id: codex-ui\n      name: '@michengai/dsh-codex-ui'\n",
+        )
+        .unwrap();
+        // profile patch：两行都已禁用
+        let mut content = String::from(
+            "- id: other\n  disabled: true\n\n- id: michengai-codex-ui-session-title\n  name: '@michengai/dsh-codex-ui/session-title'\n  disabled: true\n\n- id: codex-ui\n  name: '@michengai/dsh-codex-ui'\n  disabled: true\n",
+        );
+        let map = HashMap::new();
+        let entries = service_entries_for_plugin(&tmp, &map, "@michengai/dsh-codex-ui");
+        assert_eq!(entries.len(), 2);
+        // 模拟「启用」
+        for (sid, mod_name) in &entries {
+            content = patchfile::set_plugin_disabled_for(&content, sid, mod_name.as_deref(), false).unwrap();
+        }
+        // 两行都应已启用
+        for (sid, mod_name) in &entries {
+            assert!(
+                !patchfile::is_plugin_disabled(&content, sid, mod_name.as_deref()),
+                "id={sid} 仍显示禁用: {content}"
+            );
+        }
+        // name 行必须仍归属各自 id 条目（不是孤儿）
+        assert!(content.contains("- id: michengai-codex-ui-session-title"), "{content}");
+        assert!(content.contains("- id: codex-ui"), "{content}");
+        assert!(content.contains("name: '@michengai/dsh-codex-ui/session-title'"), "{content}");
+        assert!(content.contains("name: '@michengai/dsh-codex-ui'"), "{content}");
+        // 不能再出现这两个 id 的 disabled（other 的 disabled 保留）
+        assert!(!content.contains("- id: codex-ui\n  name: '@michengai/dsh-codex-ui'\n  disabled:"), "{content}");
+        assert!(!content.contains("session-title'\n  disabled:"), "{content}");
+        // 其他条目不动
+        assert!(content.contains("- id: other"), "{content}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn copy_dir_all_copies_tree() {
@@ -2403,13 +3003,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.11_x64-setup.exe", "0.3.11"));
-        assert!(asset_matches("dsh-manager_0.3.11_x64-setup.exe", "0.3.11"));
-        assert!(asset_matches("任意名_0.3.11_x64-setup.exe", "0.3.11"));
-        assert!(!asset_matches("DSH-Manager-0.3.11-win-x64.exe", "0.3.11"));
-        assert!(!asset_matches("DSH Manager_0.3.11_x64-setup.exe.sha256", "0.3.11"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.11"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.11"));
+        assert!(asset_matches("DSH Manager_0.3.12_x64-setup.exe", "0.3.12"));
+        assert!(asset_matches("dsh-manager_0.3.12_x64-setup.exe", "0.3.12"));
+        assert!(asset_matches("任意名_0.3.12_x64-setup.exe", "0.3.12"));
+        assert!(!asset_matches("DSH-Manager-0.3.12-win-x64.exe", "0.3.12"));
+        assert!(!asset_matches("DSH Manager_0.3.12_x64-setup.exe.sha256", "0.3.12"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.12"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.12"));
     }
 
     #[test]
@@ -2542,10 +3142,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.11_x64-setup.exe", "0.3.11"));
+        assert!(asset_matches("DSH.Manager_0.3.12_x64-setup.exe", "0.3.12"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.11_x64-setup.exe", "0.3.11"));
-        assert!(asset_matches("DSH.MANAGER_0.3.11_X64-SETUP.EXE", "0.3.11"));
+        assert!(asset_matches("dsh.manager_0.3.12_x64-setup.exe", "0.3.12"));
+        assert!(asset_matches("DSH.MANAGER_0.3.12_X64-SETUP.EXE", "0.3.12"));
     }
 
     #[test]
@@ -2553,7 +3153,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.11", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.12", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }
@@ -2678,6 +3278,44 @@ mod tests {
         // 找一个当前空闲端口，指定它应原样返回
         let free = runner::find_free_port(40000).unwrap();
         assert_eq!(pick_port(Some(free), &[]).unwrap(), free);
+    }
+
+    #[test]
+    fn web_ready_when_token_url_or_http_serving() {
+        // token URL + 端口通 → 就绪（最稳）
+        assert!(compute_web_ready(true, Some("http://127.0.0.1:3080/?token=abc"), false));
+        // 无 token 但 HTTP 已服务（浏览器有 cookie 时裸地址能用）→ 也算就绪
+        assert!(compute_web_ready(true, Some("http://127.0.0.1:3080"), true));
+        assert!(compute_web_ready(true, None, true));
+        // 仅 TCP 通、HTTP 未服务且无 token → 不算就绪
+        assert!(!compute_web_ready(true, Some("http://127.0.0.1:3080"), false), "仅端口通不算就绪");
+        assert!(!compute_web_ready(true, None, false), "无 URL 且未服务不算就绪");
+        // 端口不通一律不就绪
+        assert!(!compute_web_ready(false, Some("http://127.0.0.1:3080/?token=x"), true));
+    }
+
+    #[test]
+    fn probe_web_serving_treats_401_as_up() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        // 极简 HTTP 服务：一律回 401（模拟无 cookie 访问 dsh web 裸地址）
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 4\r\n\r\nauth");
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(runner::probe_web_serving(port), "401 响应也算 web 已在服务");
+    }
+
+    #[test]
+    fn probe_web_serving_false_when_down() {
+        let port = runner::find_free_port(45100).unwrap();
+        assert!(!runner::probe_web_serving(port), "无服务不应探测为已起");
     }
 
     #[test]

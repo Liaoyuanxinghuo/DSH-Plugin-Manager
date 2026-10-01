@@ -168,6 +168,19 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .file-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* 插件表格 */
+.plugin-search {
+  width: 100%;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  outline: none;
+  box-sizing: border-box;
+}
+.plugin-search:focus { border-color: var(--accent); }
 .plugin-table { overflow-y: auto; flex: 1; }
 .plugin-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 4px; border-bottom: 1px solid var(--border); font-size: 12px; }
 .plugin-row:last-child { border-bottom: none; }

@@ -1,4 +1,4 @@
-﻿//! 环境扫描器：探测 DSH 版本、解析 profile 与插件清单
+//! 环境扫描器：探测 DSH 版本、解析 profile 与插件清单
 
 use crate::models::*;
 use std::fs;
@@ -312,25 +312,24 @@ pub fn list_profiles(home_dir: &str) -> Vec<ProfileInfo> {
     list_profiles_from(&Path::new(home_dir).join("profiles"))
 }
 
-/// 直接扫描指定 profiles 目录
-pub fn list_profiles_from(profiles_dir: &Path) -> Vec<ProfileInfo> {
-    let mut result = Vec::new();
+/// 逐个产出 profiles 目录下的 profile（扫到一个回调一次，便于 UI 增量刷新）
+pub fn list_profiles_from_each(profiles_dir: &Path, mut on_item: impl FnMut(ProfileInfo)) {
     let entries = match fs::read_dir(profiles_dir) {
         Ok(e) => e,
-        Err(_) => return result,
+        Err(_) => return,
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        // 跳过非 profile 目录（node_modules、.generations 等隐藏目录）
         let name = entry.file_name().to_string_lossy().to_string();
         if name.starts_with('.') || name == "node_modules" {
             continue;
         }
         let (plugin_count, bundles) = parse_profile_package(&path);
-        result.push(ProfileInfo {
+        let _ = bundles;
+        on_item(ProfileInfo {
             name,
             profiles_dir: profiles_dir.to_string_lossy().to_string(),
             path: path.to_string_lossy().to_string(),
@@ -341,8 +340,13 @@ pub fn list_profiles_from(profiles_dir: &Path) -> Vec<ProfileInfo> {
             has_lock: path.join("pnpm-lock.yaml").exists(),
             has_package: path.join("package.json").exists(),
         });
-        let _ = bundles;
     }
+}
+
+/// 直接扫描指定 profiles 目录
+pub fn list_profiles_from(profiles_dir: &Path) -> Vec<ProfileInfo> {
+    let mut result = Vec::new();
+    list_profiles_from_each(profiles_dir, |p| result.push(p));
     // 按名称排序
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result

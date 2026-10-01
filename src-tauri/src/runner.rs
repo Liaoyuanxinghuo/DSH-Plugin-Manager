@@ -268,12 +268,15 @@ pub fn build_start_command(env: &DshEnv, profile: &str, port: u16) -> String {
 
 /// 从 dsh web 日志中提取带认证 token 的访问 URL。
 /// dsh web 启动后打印 `dsh web: http://127.0.0.1:<port>/?token=...`，
-/// 必须打开该 URL 才能完成认证（裸地址会显示 authentication required）。
+/// 必须打开该 URL 才能完成认证（裸地址会显示 authentication required / 401）。
 pub fn find_auth_url(log_path: &str) -> Option<String> {
     let content = std::fs::read_to_string(log_path).ok()?;
     for line in content.lines() {
         let line = line.trim();
-        if let Some(pos) = line.find("http://127.0.0.1:") {
+        let pos = line
+            .find("http://127.0.0.1:")
+            .or_else(|| line.find("http://localhost:"));
+        if let Some(pos) = pos {
             let url = line[pos..].trim_end_matches(|c: char| c.is_whitespace() || c == '。' || c == '，');
             if !url.is_empty() {
                 return Some(url.to_string());
@@ -281,6 +284,21 @@ pub fn find_auth_url(log_path: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// 等待日志中出现带 token 的 web URL（dsh 的 `dsh web:` 行常在 MCP 初始化完成后才打印）。
+/// 每隔 `interval_ms` 重读一次日志，直到找到或超过 `timeout_ms`。
+pub fn find_auth_url_wait(log_path: &str, timeout_ms: u64, interval_ms: u64) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if let Some(u) = find_auth_url(log_path) {
+            return Some(u);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms.max(50)));
+    }
 }
 
 /// DSH CLI 语义：profile 位于 `$DSH_HOME/profiles/<name>`。
@@ -342,6 +360,8 @@ pub fn start_dsh(env: &DshEnv, profile: &str, port: u16, dsh_home: Option<&str>)
         }
         let full_path = format!("{path_extra}{}", std::env::var("PATH").unwrap_or_default());
         cmd.env("PATH", full_path);
+        // 国内镜像：uvx/pip 走 pypi 镜像、npm 走用户设置 registry（否则 MCP 装包 pypi.org 超时卡 1-2 分钟）
+        apply_mirror_envs(&mut cmd);
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         cmd.stdout(Stdio::from(log_file.try_clone().map_err(|e| format!("日志失败: {e}"))?))
             .stderr(Stdio::from(err_file))
@@ -370,6 +390,8 @@ pub fn start_dsh(env: &DshEnv, profile: &str, port: u16, dsh_home: Option<&str>)
     if let Some(home) = dsh_home {
         cmd.env("DSH_HOME", home);
     }
+    // 国内镜像：uvx/pip 走 pypi 镜像、npm 走用户设置 registry
+    apply_mirror_envs(&mut cmd);
     cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     cmd.stdout(Stdio::from(log_file))
         .stderr(Stdio::from(err_file))
@@ -398,6 +420,51 @@ pub fn is_pid_alive(pid: u32) -> bool {
             o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&format!("{pid}"))
         }
         Err(_) => false,
+    }
+}
+
+/// 批量探测 PID 存活集合（单次 tasklist 列全表，避免每 PID 起一个子进程）。
+/// 必须在阻塞线程池调用——内部会 spawn 子进程，绝不能跑在主线程。
+pub fn alive_pids(pids: &[u32]) -> std::collections::HashSet<u32> {
+    use std::os::windows::process::CommandExt;
+    use std::collections::HashSet;
+    let mut alive = HashSet::new();
+    if pids.is_empty() {
+        return alive;
+    }
+    let out = Command::new("tasklist")
+        .args(["/FO", "CSV", "/NH"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            // 行格式："name.exe","1234","Console","1,234 K"
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let line = line.trim();
+                if !line.starts_with('"') {
+                    continue;
+                }
+                let fields: Vec<&str> = line.split("\",\"").collect();
+                if fields.len() < 2 {
+                    continue;
+                }
+                if let Ok(pid) = fields[1].parse::<u32>() {
+                    if pids.contains(&pid) {
+                        alive.insert(pid);
+                    }
+                }
+            }
+            alive
+        }
+        _ => {
+            // tasklist 失败：退回逐个探测
+            for &p in pids {
+                if is_pid_alive(p) {
+                    alive.insert(p);
+                }
+            }
+            alive
+        }
     }
 }
 
@@ -434,6 +501,169 @@ pub fn stop_dsh(pid: u32) -> Result<(), String> {
 /// 探测端口是否已被占用
 pub fn is_port_open(port: u16) -> bool {
     TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+/// 探测 web 是否已在 HTTP 服务（任意响应即算，含 401 认证页）。
+/// TCP 通 ≠ web 可访问；这里发一次极简 GET，看到 `HTTP/` 响应行即认为已起。
+/// 浏览器若持有 dsh 签名 cookie（此前访问过 token 地址），裸地址可直接用。
+pub fn probe_web_serving(port: u16) -> bool {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(800))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(800)));
+    let _ = stream.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let mut buf = [0u8; 16];
+    match stream.read(&mut buf) {
+        Ok(n) => n >= 5 && &buf[..5] == b"HTTP/",
+        Err(_) => false,
+    }
+}
+
+/// 国内 pypi 镜像（uvx/pip 走镜像，避免 pypi.org 大陆超时导致 MCP 启动卡 1-2 分钟）
+pub const PYPI_MIRROR: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
+
+/// DSH 子进程的国内镜像环境变量（uv / uvx / pip / npm）。
+/// 纯函数便于测试；`npm_registry` 传用户设置的 registry（默认 npmmirror）。
+pub fn mirror_env_pairs(npm_registry: &str) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = vec![
+        ("UV_INDEX_URL".into(), PYPI_MIRROR.into()),
+        ("UV_DEFAULT_INDEX".into(), PYPI_MIRROR.into()),
+        ("PIP_INDEX_URL".into(), PYPI_MIRROR.into()),
+    ];
+    if !npm_registry.trim().is_empty() {
+        v.push(("npm_config_registry".into(), npm_registry.trim().to_string()));
+    }
+    v
+}
+
+/// 给 DSH 子进程注入国内镜像环境（只写该 Command 的环境块，不改系统/用户环境）
+fn apply_mirror_envs(cmd: &mut Command) {
+    let registry = crate::settings::load_settings().npm_registry;
+    for (k, v) in mirror_env_pairs(&registry) {
+        cmd.env(k, v);
+    }
+}
+
+/// 按空白切分命令行并去引号（支持带空格的引号路径）
+fn cmdline_tokens(cmdline: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in cmdline.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// 命令行中 `--profile` 参数是否精确等于给定 profile（防 `web` 误配 `web2`）
+pub fn profile_arg_matches(cmdline: &str, profile: &str) -> bool {
+    let toks = cmdline_tokens(cmdline);
+    toks.iter().enumerate().any(|(i, t)| {
+        if t == "--profile" {
+            toks.get(i + 1).map(|p| p == profile).unwrap_or(false)
+        } else {
+            t.strip_prefix("--profile=").map(|p| p == profile).unwrap_or(false)
+        }
+    })
+}
+
+/// 从命令行提取 `--port N`（无则 0）
+pub fn parse_cmdline_port(cmdline: &str) -> u16 {
+    let toks = cmdline_tokens(cmdline);
+    toks.iter()
+        .enumerate()
+        .find_map(|(i, t)| {
+            if t == "--port" {
+                toks.get(i + 1)?.parse::<u16>().ok()
+            } else {
+                t.strip_prefix("--port=").and_then(|v| v.parse::<u16>().ok())
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// 严格孤儿判定：命令行包含目标 bin.js 路径（大小写/反斜杠归一）**且** `--profile` 精确匹配。
+/// 已知 PID（running 表）由调用方排除。
+pub fn orphan_cmdline_match(cmdline: &str, binjs: &str, profile: &str) -> bool {
+    if binjs.trim().is_empty() || !profile_arg_matches(cmdline, profile) {
+        return false;
+    }
+    let norm = |s: &str| s.to_lowercase().replace("\\\\", "\\");
+    norm(cmdline).contains(&norm(binjs))
+}
+
+/// 列出机器上的 node.exe 进程（PID + 命令行）。PowerShell WMI 查询，必须在阻塞线程池调用。
+fn list_node_processes() -> Vec<(u32, String)> {
+    use std::os::windows::process::CommandExt;
+    let out = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
+        ])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output();
+    let text = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+    let val: serde_json::Value = match serde_json::from_str(text.trim()) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let items: Vec<&serde_json::Value> = match &val {
+        serde_json::Value::Array(a) => a.iter().collect(),
+        serde_json::Value::Object(_) => vec![&val],
+        _ => Vec::new(),
+    };
+    items
+        .into_iter()
+        .filter_map(|it| {
+            let pid = it.get("ProcessId")?.as_u64()? as u32;
+            let cmd = it
+                .get("CommandLine")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some((pid, cmd))
+        })
+        .collect()
+}
+
+/// 查找目标 env×profile 的孤儿 node 进程（同 bin.js + 同 profile 名，且不在 known_pids 中）。
+/// 只查不杀——清理必须由用户在 UI 上确认。
+pub fn find_orphans(env: &DshEnv, profile: &str, known_pids: &[u32]) -> Vec<crate::models::OrphanProcess> {
+    let binjs = resolve_dsh_launcher(env)
+        .map(|(_, b)| b)
+        .unwrap_or_default();
+    list_node_processes()
+        .into_iter()
+        .filter_map(|(pid, cmd)| {
+            if known_pids.contains(&pid) || !orphan_cmdline_match(&cmd, &binjs, profile) {
+                return None;
+            }
+            Some(crate::models::OrphanProcess {
+                pid,
+                port: parse_cmdline_port(&cmd),
+                cmdline: cmd,
+            })
+        })
+        .collect()
 }
 
 /// 从 start 起找第一个空闲端口（用于多实例自动分配，避免端口冲突）
@@ -823,5 +1053,110 @@ mod tests {
         std::fs::write(&tmp, "starting...\nno url here\n").unwrap();
         assert!(find_auth_url(tmp.to_string_lossy().as_ref()).is_none());
         std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn find_auth_url_matches_localhost_variant() {
+        let tmp = std::env::temp_dir().join(format!("dshpm-auth3-{}", std::process::id()));
+        std::fs::write(&tmp, "dsh web: http://localhost:3080/?token=xyz\n").unwrap();
+        let url = find_auth_url(tmp.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(url, "http://localhost:3080/?token=xyz");
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn find_auth_url_wait_picks_up_url_written_later() {
+        // 日志先为空，稍后写入 token URL → 等待函数应能等到
+        let tmp = std::env::temp_dir().join(format!("dshpm-auth-wait-{}", std::process::id()));
+        std::fs::write(&tmp, "booting...\n").unwrap();
+        let writer = {
+            let p = tmp.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(&p, "booting...\ndsh web: http://127.0.0.1:3080/?token=late\n").unwrap();
+            })
+        };
+        let url = find_auth_url_wait(tmp.to_string_lossy().as_ref(), 3000, 100)
+            .expect("应等到稍后写入的 token URL");
+        assert_eq!(url, "http://127.0.0.1:3080/?token=late");
+        writer.join().unwrap();
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn find_auth_url_wait_times_out_when_never_appears() {
+        let tmp = std::env::temp_dir().join(format!("dshpm-auth-to-{}", std::process::id()));
+        std::fs::write(&tmp, "no web line ever\n").unwrap();
+        assert!(
+            find_auth_url_wait(tmp.to_string_lossy().as_ref(), 200, 50).is_none(),
+            "日志始终无 URL 应返回 None"
+        );
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn mirror_env_pairs_has_pypi_and_npm_registry() {
+        let pairs = mirror_env_pairs("https://registry.npmmirror.com");
+        let get = |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        // uvx/pip 必须走 pypi 镜像（大陆 pypi.org 超时卡 MCP 启动 1-2 分钟）
+        assert_eq!(get("UV_INDEX_URL"), PYPI_MIRROR);
+        assert_eq!(get("UV_DEFAULT_INDEX"), PYPI_MIRROR);
+        assert_eq!(get("PIP_INDEX_URL"), PYPI_MIRROR);
+        // npm 走用户设置的 registry
+        assert_eq!(get("npm_config_registry"), "https://registry.npmmirror.com");
+        // 空 registry 不注入该项（保留用户本机 npm 配置）
+        let pairs2 = mirror_env_pairs("  ");
+        assert!(pairs2.iter().all(|(k, _)| k != "npm_config_registry"));
+    }
+
+    #[test]
+    fn profile_arg_matches_exact_only() {
+        // 命令行里 --profile 必须精确等于目标名（web 不匹配 web2）
+        let c = r#""node.exe" "C:\a\bin.js" --profile web --no-open --port 3080"#;
+        assert!(profile_arg_matches(c, "web"));
+        assert!(!profile_arg_matches(c, "web2"));
+        assert!(!profile_arg_matches(c, "we"));
+        // --profile=name 形式
+        let c2 = r#""node.exe" bin.js --profile=harness --no-open"#;
+        assert!(profile_arg_matches(c2, "harness"));
+        assert!(!profile_arg_matches(c2, "harness-1"));
+        // 无 --profile 参数
+        assert!(!profile_arg_matches(r#"node.exe bin.js"#, "web"));
+    }
+
+    #[test]
+    fn parse_cmdline_port_variants() {
+        assert_eq!(
+            parse_cmdline_port(r#""node.exe" bin.js --profile web --no-open --port 3080"#),
+            3080
+        );
+        assert_eq!(parse_cmdline_port("node.exe bin.js --port=10722"), 10722);
+        assert_eq!(parse_cmdline_port("node.exe bin.js --profile web"), 0);
+    }
+
+    #[test]
+    fn orphan_cmdline_match_strict() {
+        let binjs = r"C:\Users\t\.dsh-win\versions\0.1.7\node_modules\@deepseek-ai\dsh\lib\bin.js";
+        let cmd = format!(r#""node" "{}" --profile web --no-open --port 3080"#, binjs);
+        // 同 bin.js + 同 profile → 孤儿候选
+        assert!(orphan_cmdline_match(&cmd, binjs, "web"));
+        // 同名前缀的其他 profile → 不算
+        assert!(!orphan_cmdline_match(&cmd, binjs, "web2"));
+        // 其他 bin.js（如另一个 DSH 版本）→ 不算（严格按 bin.js 归属）
+        let other_binjs = r"C:\Users\t\.dsh-win\versions\0.1.6\node_modules\@deepseek-ai\dsh\lib\bin.js";
+        assert!(!orphan_cmdline_match(&cmd, other_binjs, "web"));
+        // 命令行不带 --profile → 不算
+        assert!(!orphan_cmdline_match("node.exe something.js", binjs, "web"));
+        // 空 binjs → 不算（无法归属，宁可漏不误杀）
+        assert!(!orphan_cmdline_match(&cmd, "", "web"));
+        // 反斜杠/大小写归一：同一路径不同写法也算
+        let cmd2 = format!(r#""NODE" "{}" --profile web"#, binjs.to_uppercase());
+        assert!(orphan_cmdline_match(&cmd2, binjs, "web"));
     }
 }

@@ -113,6 +113,17 @@ export interface DshStatus {
   running: boolean;
   process: RunningProcess | null;
   portOpen: boolean;
+  /** 真正可服务：端口通 且 日志出现带 token 的 web URL（dsh web: http://...） */
+  webReady?: boolean;
+  /** 日志提取的带 token URL（webReady 时给出） */
+  url?: string | null;
+}
+
+/** 孤儿 node 进程候选（同 bin.js + 同 profile 精确匹配，不在运行表；待用户确认后清理） */
+export interface OrphanProcess {
+  pid: number;
+  port: number;
+  cmdline: string;
 }
 
 export interface StartResult {

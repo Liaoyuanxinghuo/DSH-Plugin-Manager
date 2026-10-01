@@ -138,6 +138,20 @@ pub struct DshStatus {
     pub running: bool,
     pub process: Option<RunningProcess>,
     pub port_open: bool,
+    /// 真正可服务：端口通 **且** 日志已出现带 token 的 web URL（`dsh web: http://...`）。
+    /// 仅端口通不代表 web 就绪（MCP 初始化中前端会一直「连接中」）。
+    pub web_ready: bool,
+    /// 日志中提取到的带 token URL（web_ready 时给出，供打开界面）
+    pub url: Option<String>,
+}
+
+/// 孤儿 node 进程候选（同 bin.js + 同 profile 名，不在运行表中；只展示，待用户确认后清理）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanProcess {
+    pub pid: u32,
+    pub port: u16,
+    pub cmdline: String,
 }
 
 /// 启动结果

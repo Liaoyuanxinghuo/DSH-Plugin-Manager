@@ -30,6 +30,24 @@ export function applyStoredOrder<T>(list: T[], getId: (x: T) => string, stored: 
   return [...ordered, ...rest];
 }
 
+/**
+ * 迁移旧版排序 id（仅 name）→ 稳定 id（name::profilesDir）。
+ * 兼容历史 localStorage，避免升级后拖拽顺序全部丢失。
+ */
+export function migrateStoredOrder<T>(
+  stored: string[],
+  list: T[],
+  getId: (x: T) => string,
+  getFallbackId: (x: T) => string,
+): string[] {
+  const byFallback = new Map<string, string>();
+  for (const x of list) {
+    const fb = getFallbackId(x);
+    if (!byFallback.has(fb)) byFallback.set(fb, getId(x));
+  }
+  return stored.map((s) => (s.includes("::") ? s : byFallback.get(s) ?? s));
+}
+
 /** 把 from 位置的元素移动到 to 位置，返回新数组 */
 export function moveItem<T>(list: T[], from: number, to: number): T[] {
   if (from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) return [...list];

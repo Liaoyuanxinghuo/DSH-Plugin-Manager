@@ -14,6 +14,27 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn().mockResolvedValue(null),
 }));
 
+// mock 事件总线：让 profile-found 流式事件可控（流式渲染回归测试用）
+const eventBus = vi.hoisted(() => {
+  const listeners = new Map<string, Set<(e: { payload: unknown }) => void>>();
+  return {
+    listeners,
+    emit(event: string, payload: unknown) {
+      for (const cb of listeners.get(event) ?? []) cb({ payload });
+    },
+    clear() {
+      listeners.clear();
+    },
+  };
+});
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: (event: string, cb: (e: { payload: unknown }) => void) => {
+    if (!eventBus.listeners.has(event)) eventBus.listeners.set(event, new Set());
+    eventBus.listeners.get(event)!.add(cb);
+    return Promise.resolve(() => eventBus.listeners.get(event)?.delete(cb));
+  },
+}));
+
 import { invoke } from "@tauri-apps/api/core";
 import { save as mockSave, open as mockOpen } from "@tauri-apps/plugin-dialog";
 
@@ -80,7 +101,11 @@ function mockAll() {
           },
         ]);
       case "dsh_status":
-        return Promise.resolve({ running: false, process: null, portOpen: false });
+        return Promise.resolve({ running: false, process: null, portOpen: false, webReady: false, url: null });
+      case "find_orphan_nodes_cmd":
+        return Promise.resolve([]);
+      case "kill_orphans_cmd":
+        return Promise.resolve([]);
       case "list_running_cmd":
         return Promise.resolve([]);
       case "get_env_paths":
@@ -98,6 +123,10 @@ function mockAll() {
         return Promise.resolve(true);
       case "init_portable_runtime_cmd":
         return Promise.resolve("便携运行时已就绪");
+      case "list_scan_dirs":
+        return Promise.resolve([]);
+      case "list_profiles_from_dir":
+        return Promise.resolve([]);
       default:
         return Promise.resolve(null);
     }
@@ -240,6 +269,30 @@ describe("App 主界面", () => {
     expect(screen.getByText(/Profiles 目录/)).toBeInTheDocument();
   });
 
+  it("运行中的 profile 隐藏删除按钮，停止后恢复显示", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_running_cmd") {
+        return Promise.resolve([
+          { envId: "global", profile: "web", profilesDir: "C:\\Users\\test\\.dsh\\profiles", pid: 123, port: 3080, startedAt: "2026-09-27 12:00" },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    await screen.findByText("■ 停止");
+    // 运行中：删除按钮隐藏（mock 只有一个 profile，唯一删除按钮应不存在）
+    expect(screen.queryByText("🗑 删除")).not.toBeInTheDocument();
+    // 进程退出 → 删除按钮恢复
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_running_cmd") return Promise.resolve([]);
+      return mockAllDefault(cmd);
+    });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 3100));
+    });
+    expect(screen.getByText("🗑 删除")).toBeInTheDocument();
+  });
+
   it("进程退出后，重启按钮自动变回启动按钮", async () => {
     // 初始：web 实例运行中 → 显示「重启」
     mockInvoke.mockImplementation((cmd: string) => {
@@ -264,18 +317,17 @@ describe("App 主界面", () => {
   });
   it("启动就绪后不再自动打开浏览器，点「打开界面」才打开带 token 的地址", async () => {
     mockInvoke.mockImplementation((cmd: string, args?: unknown) => {
-      const a = (args ?? {}) as Record<string, unknown>;
       if (cmd === "start_dsh_cmd") {
         return Promise.resolve({
           success: true,
           pid: 12345,
           message: "已启动",
-          port: a.port ?? 3080,
+          port: (args as Record<string, unknown>)?.port ?? 3080,
           url: "http://127.0.0.1:3080/?token=abc",
         });
       }
       if (cmd === "dsh_status") {
-        return Promise.resolve({ running: true, process: null, portOpen: true });
+        return Promise.resolve({ running: true, process: null, portOpen: true, webReady: true, url: "http://127.0.0.1:3080/?token=abc" });
       }
       return mockAllDefault(cmd);
     });
@@ -324,6 +376,29 @@ describe("App 主界面", () => {
       profile: "web",
       profilesDirStr: "C:\\Users\\test\\.dsh\\profiles",
     });
+  });
+
+  it("按 F12 / Ctrl+Shift+I 调用 toggle_devtools 切换调试面板", async () => {
+    mockInvoke.mockImplementation((cmd: string) => mockAllDefault(cmd));
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("DSH Manager")).toBeInTheDocument();
+    });
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "F12" });
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("toggle_devtools");
+    mockInvoke.mockClear();
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "I", ctrlKey: true, shiftKey: true });
+    });
+    expect(mockInvoke).toHaveBeenCalledWith("toggle_devtools");
+    mockInvoke.mockClear();
+    // 普通按键不应触发
+    await act(async () => {
+      fireEvent.keyDown(window, { key: "a" });
+    });
+    expect(mockInvoke).not.toHaveBeenCalledWith("toggle_devtools");
   });
 
   it("安装插件对话框明确展示目标：当前环境版本 × profile 及来源目录", async () => {
@@ -389,7 +464,7 @@ describe("App 主界面", () => {
         });
       }
       if (cmd === "dsh_status") {
-        return Promise.resolve({ running: true, process: null, portOpen: true });
+        return Promise.resolve({ running: true, process: null, portOpen: true, webReady: true, url: "http://127.0.0.1:3080/?token=t" });
       }
       return mockAllDefault(cmd);
     });
@@ -475,6 +550,38 @@ describe("M3 插件管理", () => {
         packageName: "@deepseek-ai/dsh-mcp-client",
         enabled: false,
       });
+    });
+  });
+
+  it("插件搜索框过滤列表", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByRole("switch").length).toBeGreaterThan(0);
+    });
+    const search = screen.getByPlaceholderText(/搜索插件/);
+    await user.type(search, "mcp-client");
+    await waitFor(() => {
+      // 只剩 mcp-client 一行（mock 列表里 2 个插件）
+      expect(screen.getAllByRole("switch").length).toBe(1);
+    });
+    expect(screen.getByText("@deepseek-ai/dsh-mcp-client")).toBeInTheDocument();
+    // 清空恢复
+    await user.clear(search);
+    await waitFor(() => {
+      expect(screen.getAllByRole("switch").length).toBe(2);
+    });
+  });
+
+  it("插件搜索无匹配时显示空态", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByRole("switch").length).toBeGreaterThan(0);
+    });
+    await user.type(screen.getByPlaceholderText(/搜索插件/), "zzzz-no-match");
+    await waitFor(() => {
+      expect(screen.getByText(/没有匹配/)).toBeInTheDocument();
     });
   });
 
@@ -931,13 +1038,232 @@ describe("M5 设置与 DSH 下载", () => {
     localStorage.removeItem("dshpm-auto-port");
   });
 
+  it("流式渲染：扫描未结束时已发现的 profile 立即显示", async () => {
+    eventBus.clear();
+    let resolveScan: (() => void) | undefined;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "scan_profiles_live") {
+        // 挂起：模拟慢扫描尚未结束
+        return new Promise<void>((r) => {
+          resolveScan = r;
+        });
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    // 扫描未出结果时的空态提示
+    expect(screen.getByText("正在扫描 Profiles…")).toBeInTheDocument();
+    // 等监听注册完成（loadProfiles 内 await import 之后）
+    await waitFor(() => {
+      expect(eventBus.listeners.get("profile-found")?.size ?? 0).toBeGreaterThan(0);
+    });
+    // 流式事件到达 → 立即渲染该 profile（不等扫描结束）
+    act(() => {
+      eventBus.emit("profile-found", {
+        name: "web",
+        profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+        path: "C:\\Users\\test\\.dsh\\profiles\\web",
+        pluginCount: 1,
+        dataSize: 0,
+        modified: "",
+        hasPatch: false,
+        hasLock: false,
+        hasPackage: true,
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getAllByText("web").length).toBeGreaterThan(0);
+    });
+    // 扫描未结束 → 追加提示仍在；列表已可见
+    expect(screen.getByText("正在扫描更多 Profiles…")).toBeInTheDocument();
+    // 扫描结束 → 追加提示消失
+    act(() => {
+      resolveScan?.();
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("正在扫描更多 Profiles…")).not.toBeInTheDocument();
+    });
+  });
+
+  it("webReady=false 继续等，webReady=true 即报「服务已就绪」并展示地址", async () => {
+    // 第一次轮询：端口通但尚未就绪（webReady=false）
+    let calls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_dsh_cmd") {
+        return Promise.resolve({ success: true, pid: 1, message: "已启动", port: 3080, url: "http://127.0.0.1:3080" });
+      }
+      if (cmd === "dsh_status") {
+        calls += 1;
+        // 前 2 次：未就绪；之后：就绪（带 token 地址）
+        const ready = calls > 2;
+        return Promise.resolve({
+          running: true,
+          process: null,
+          portOpen: true,
+          webReady: ready,
+          url: ready ? "http://127.0.0.1:3080/?token=abc" : "http://127.0.0.1:3080",
+        });
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("web")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("▶ 启动 DSH"));
+    // 未就绪阶段：不应出现「服务已就绪」
+    await waitFor(() => {
+      expect(screen.getByText(/正在等待服务就绪/)).toBeInTheDocument();
+    });
+    // token URL 出现后才报就绪，且展示带 token 的地址
+    await waitFor(
+      () => {
+        expect(screen.getByText(/服务已就绪：http:\/\/127\.0\.0\.1:3080\/\?token=abc/)).toBeInTheDocument();
+      },
+      { timeout: 8000 },
+    );
+  });
+
+  it("web 已可访问（webReady=true 裸地址）不等 token 直接报就绪", async () => {
+    // 后端新语义：HTTP 已响应就算就绪，url 可能还是裸地址
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_dsh_cmd") {
+        return Promise.resolve({ success: true, pid: 1, message: "已启动", port: 3080, url: "http://127.0.0.1:3080" });
+      }
+      if (cmd === "dsh_status") {
+        return Promise.resolve({
+          running: true,
+          process: null,
+          portOpen: true,
+          webReady: true,
+          url: "http://127.0.0.1:3080",
+        });
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("web")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("▶ 启动 DSH"));
+    await waitFor(
+      () => {
+        expect(screen.getByText(/服务已就绪：http:\/\/127\.0\.0\.1:3080/)).toBeInTheDocument();
+      },
+      { timeout: 8000 },
+    );
+    // 不应再出现干等 token 的旧文案
+    expect(screen.queryByText(/MCP 加载中/)).not.toBeInTheDocument();
+  });
+
+  it("启动前发现残留 node 弹确认框：清理并启动会先 kill_orphans 再 start", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "find_orphan_nodes_cmd") {
+        return Promise.resolve([
+          { pid: 24716, port: 10722, cmdline: '"node" "C:\\dsh\\bin.js" --profile web --no-open --port 10722' },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("web")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("▶ 启动 DSH"));
+    // 弹出残留确认框（严格匹配结果 + 手动确认）
+    await waitFor(() => {
+      expect(screen.getByText(/发现 1 个残留的 node 进程/)).toBeInTheDocument();
+    });
+    expect(screen.getByText(/PID 24716/)).toBeInTheDocument();
+    // 清理并启动：先 kill_orphans（携带候选 PID），再 start_dsh_cmd
+    await user.click(screen.getByText("清理并启动"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("kill_orphans_cmd", { pids: [24716] });
+    });
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("start_dsh_cmd", expect.anything());
+    });
+  });
+
+  it("残留确认框点「取消启动」不调 start_dsh_cmd", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "find_orphan_nodes_cmd") {
+        return Promise.resolve([{ pid: 999, port: 0, cmdline: "node bin.js --profile web" }]);
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("web")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("▶ 启动 DSH"));
+    await waitFor(() => {
+      expect(screen.getByText(/发现 1 个残留的 node 进程/)).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("取消启动"));
+    await new Promise((r) => setTimeout(r, 100));
+    const starts = mockInvoke.mock.calls.filter((c) => c[0] === "start_dsh_cmd");
+    expect(starts).toHaveLength(0);
+    const kills = mockInvoke.mock.calls.filter((c) => c[0] === "kill_orphans_cmd");
+    expect(kills).toHaveLength(0);
+  });
+
+  it("启动后不等扫描完成：上次 profile 来源目录立即恢复并可直接启动", async () => {
+    localStorage.setItem("dshpm-sel-env", "global");
+    localStorage.setItem("dshpm-sel-profile", "web");
+    localStorage.setItem("dshpm-sel-profile-dir", "C:\\Users\\test\\.dsh\\profiles");
+    // 扫描挂起：模拟慢扫描未结束（profiles 列表仍为空）
+    mockInvoke.mockImplementation((cmd: string, args?: unknown) => {
+      const a = (args ?? {}) as Record<string, unknown>;
+      if (cmd === "scan_profiles_live" || cmd === "list_all_profiles") {
+        return new Promise(() => {});
+      }
+      if (cmd === "start_dsh_cmd") {
+        return Promise.resolve({
+          success: true,
+          pid: 12345,
+          message: "已启动",
+          port: a.port ?? 3080,
+          url: "http://localhost:3080",
+        });
+      }
+      if (cmd === "dsh_status") {
+        return Promise.resolve({ running: true, process: null, portOpen: true, webReady: true, url: "http://127.0.0.1:3080/?token=t" });
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    // 来源立即显示（不等扫描）
+    await waitFor(() => {
+      expect(screen.getByText(/来源:/)).toBeInTheDocument();
+    });
+    // 启动按钮可用，点击后以记住的来源目录启动
+    const btn = await screen.findByRole("button", { name: /启动 DSH/ });
+    expect(btn).toBeEnabled();
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("start_dsh_cmd", {
+        envId: "global",
+        profile: "web",
+        profilesDirStr: "C:\\Users\\test\\.dsh\\profiles",
+      });
+    });
+    localStorage.removeItem("dshpm-sel-env");
+    localStorage.removeItem("dshpm-sel-profile");
+    localStorage.removeItem("dshpm-sel-profile-dir");
+  });
+
   it("设置弹窗：关于本项目与检查更新", async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "get_settings_cmd") {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.11", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.12", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -964,27 +1290,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.11", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.12", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.11_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.12_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.11"));
+    await user.click(screen.getByText("⬇ 下载 v0.3.12"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.11" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.12" });
     // 打开所在文件夹
     await user.click(screen.getByText("📂 打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.11_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.12_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("🔄 关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.11_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.12_x64-setup.exe" });
     });
   });
 });
@@ -1141,6 +1467,10 @@ function mockAllDefault(cmd: string) {
       return Promise.resolve(true);
     case "init_portable_runtime_cmd":
       return Promise.resolve("便携运行时已就绪");
+    case "list_scan_dirs":
+      return Promise.resolve([]);
+    case "list_profiles_from_dir":
+      return Promise.resolve([]);
     case "scan_envs":
       return Promise.resolve([
         {
@@ -1189,6 +1519,12 @@ function mockAllDefault(cmd: string) {
       ]);
     case "list_running_cmd":
       return Promise.resolve([]);
+    case "find_orphan_nodes_cmd":
+      return Promise.resolve([]);
+    case "kill_orphans_cmd":
+      return Promise.resolve([]);
+    case "dsh_status":
+      return Promise.resolve({ running: true, process: null, portOpen: true, webReady: true, url: "http://127.0.0.1:3080/?token=t" });
     case "get_env_paths":
       return Promise.resolve({
         homeDir: "C:\\Users\\test\\.dsh",

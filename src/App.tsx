@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
 import { api, formatSize, pickDspackFile, pickFolder, pickSavePackPath, pickSaveZipPath, pickZipFile } from "./api";
 import { listen } from "@tauri-apps/api/event";
-import { applyStoredOrder, moveItem, readStoredOrder } from "./reorder";
+import { applyStoredOrder, migrateStoredOrder, moveItem, readStoredOrder } from "./reorder";
 import InstallDialog from "./InstallDialog";
 import type {
   DshEnv,
@@ -10,6 +10,7 @@ import type {
   JunkEntry,
   InstallDone,
   InstallLogLine,
+  OrphanProcess,
   PackMarketEntry,
   PackImportResult,
   PluginInfo,
@@ -122,8 +123,19 @@ export default function App() {
   const [selectedEnv, setSelectedEnv] = useState<string>(() => localStorage.getItem("dshpm-sel-env") ?? "");
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
   const [selectedProfile, setSelectedProfile] = useState<string>(() => localStorage.getItem("dshpm-sel-profile") ?? "");
-  const [selectedProfilesDir, setSelectedProfilesDir] = useState<string>("");
+  // 来源目录一并记住：启动后立即显示「来源」并可直接启动，不必等扫描
+  const [selectedProfilesDir, setSelectedProfilesDir] = useState<string>(
+    () => localStorage.getItem("dshpm-sel-profile-dir") ?? "",
+  );
+  // 增量扫描/重排时锚定选中项，防止异步 setState 竞态把选中踢掉
+  const selectedProfileRef = useRef(selectedProfile);
+  const selectedDirRef = useRef(selectedProfilesDir);
+  useEffect(() => {
+    selectedProfileRef.current = selectedProfile;
+    selectedDirRef.current = selectedProfilesDir;
+  }, [selectedProfile, selectedProfilesDir]);
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
+  const [pluginQuery, setPluginQuery] = useState("");
   // 多实例：全部运行中的 DSH 进程（跨环境跨 profile）
   const [runnings, setRunnings] = useState<RunningProcess[]>([]);
   const [paths, setPaths] = useState<EnvPaths | null>(null);
@@ -142,6 +154,8 @@ export default function App() {
   const [noteTarget, setNoteTarget] = useState<{ profile: string; profilesDir: string } | null>(null);
   const [showInitHint, setShowInitHint] = useState(false);
   const [showInitBtn, setShowInitBtn] = useState(false);
+  /** 流式渲染：扫到一个显示一个；此项仅表示「扫描是否结束」（空态文案用） */
+  const [profilesReady, setProfilesReady] = useState(false);
   const [initRunning, setInitRunning] = useState(false);
   // 在线安装对话框
   const [showInstall, setShowInstall] = useState(false);
@@ -154,6 +168,13 @@ export default function App() {
   // 新建 / 删除 profile
   const [showCreateProfile, setShowCreateProfile] = useState(false);
   const [confirmDeleteProfile, setConfirmDeleteProfile] = useState<ProfileInfo | null>(null);
+  // 启动前发现孤儿 node（同 bin.js × 同 profile，不在运行表）→ 严格匹配 + 手动确认
+  const [orphanPrompt, setOrphanPrompt] = useState<{
+    envId: string;
+    profile: string;
+    pdir: string;
+    list: OrphanProcess[];
+  } | null>(null);
   const [creatingProfile, setCreatingProfile] = useState(false);
   const [deletingProfile, setDeletingProfile] = useState(false);
   // M4 依赖健康 / 残留清理
@@ -211,11 +232,29 @@ export default function App() {
     if (selectedProfile) localStorage.setItem("dshpm-sel-profile", selectedProfile);
   }, [selectedProfile]);
   useEffect(() => {
+    if (selectedProfilesDir) localStorage.setItem("dshpm-sel-profile-dir", selectedProfilesDir);
+  }, [selectedProfilesDir]);
+  useEffect(() => {
     localStorage.setItem("dshpm-sel-port", String(port));
   }, [port]);
   useEffect(() => {
     localStorage.setItem("dshpm-auto-port", autoPort ? "1" : "0");
   }, [autoPort]);
+
+  // F12 / Ctrl+Shift+I 切换 DevTools。WebView2 的浏览器快捷键在 DevTools 关闭时
+  // 会吞掉 F12 且不转发给页面，故显式监听并调 toggle_devtools 兜底（release 也可用）。
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const isF12 = e.key === "F12";
+      const isInspect =
+        e.ctrlKey && e.shiftKey && !e.altKey && (e.key === "I" || e.key === "i");
+      if (!isF12 && !isInspect) return;
+      e.preventDefault();
+      void api.toggleDevtools().catch(() => {});
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // 加载环境列表
   const loadEnvs = useCallback(async () => {
@@ -236,20 +275,75 @@ export default function App() {
     loadEnvs();
   }, [loadEnvs]);
 
-  // 加载 profile（全局合并：默认 DSH_HOME/profiles + 所有扫描目录；任意 dsh × 任意来源 profile 可组合）
+  // 加载 profile：
+  // - 扫到一个就写入 profiles 并立刻可渲染（流式），同时可见（供初始化计时判断）
+  // - profilesReady 仅标记扫描结束（空态文案）；选中项按 name+目录锚定，扫描/重排都不会被踢掉
   const loadProfiles = useCallback(async () => {
-    setBusy(true);
+    // 不占用 busy：扫描后台进行，启动/停止等操作不被「正在扫描」挡住
+    setProfilesReady(false);
     try {
-      const ps = (await api.listAllProfiles()) ?? [];
-      setProfiles(applyStoredOrder(ps, (x) => x.name, readStoredOrder("dshpm-prof-order")));
-      setSelectedProfile((cur) => {
-        if (cur && ps.some((p) => p.name === cur)) return cur;
-        return ps[0]?.name ?? "";
-      });
+      const seen = new Map<string, ProfileInfo>();
+      const keyOf = (x: { name: string; profilesDir: string }) => `${x.name}::${x.profilesDir}`;
+      const sortAll = (list: ProfileInfo[]) => {
+        const stored = migrateStoredOrder(
+          readStoredOrder("dshpm-prof-order"),
+          list,
+          keyOf,
+          (x) => x.name,
+        );
+        return applyStoredOrder(list, keyOf, stored);
+      };
+      // 扫到一个 → 进列表数据（不在 UI 展现，但 profiles.length 已 >0）
+      const pushOne = (p: ProfileInfo) => {
+        if (!p) return;
+        seen.set(keyOf(p), p);
+        setProfiles(sortAll([...seen.values()]));
+      };
+
+      const { listen } = await import("@tauri-apps/api/event");
+      const un = await listen<ProfileInfo>("profile-found", (e) => {
+        if (e.payload) pushOne(e.payload);
+      }).catch(() => undefined);
+
+      const dirs = (await api.listScanDirs().catch(() => [])) ?? [];
+      try {
+        await api.scanProfilesLive(["", ...dirs.map((d) => d.profilesDir)]);
+      } catch {
+        /* 流式接口失败则走全量兜底 */
+      }
+      un?.();
+      if (seen.size === 0) {
+        const all = (await api.listAllProfiles().catch(() => [])) ?? [];
+        for (const p of all) pushOne(p);
+      }
+      // 扫描结束：按拖拽顺序一次性显示
+      const finalList = sortAll([...seen.values()]);
+      setProfiles(finalList);
+      setProfilesReady(true);
+
+      // 选中锚定：有则保住（name+目录优先），已消失才回退到第一个
+      const prevName = selectedProfileRef.current;
+      const prevDir = selectedDirRef.current;
+      if (prevName) {
+        const hit =
+          finalList.find((p) => p.name === prevName && p.profilesDir === prevDir) ??
+          finalList.find((p) => p.name === prevName);
+        if (hit) {
+          setSelectedProfile(hit.name);
+          setSelectedProfilesDir(hit.profilesDir);
+        } else if (finalList.length > 0) {
+          setSelectedProfile(finalList[0].name);
+          setSelectedProfilesDir(finalList[0].profilesDir);
+        } else {
+          setSelectedProfile("");
+          setSelectedProfilesDir("");
+        }
+      } else if (finalList.length > 0) {
+        setSelectedProfile(finalList[0].name);
+        setSelectedProfilesDir(finalList[0].profilesDir);
+      }
     } catch (e) {
       setError(String(e));
-    } finally {
-      setBusy(false);
     }
   }, []);
 
@@ -372,11 +466,17 @@ export default function App() {
   };
 
   // 启动 + 就绪轮询（供启动/重启共用）
+  // 就绪判定：端口通 **且**（日志出现带 token 的 web URL **或** web 已在 HTTP 服务）——
+  // token 行要等 MCP 初始化完才打印（常 2-3 分钟），但 web 服务早就可访问；
+  // 浏览器已有签名 cookie 时裸地址即可用，因此 HTTP 已响应就算就绪，不干等 token。
+  // 软时限（2 分钟）只换提示文案，**继续轮询**直到真正就绪；硬上限 10 分钟才放弃。
   const startAndPoll = async (eid: string, pname: string, pdir: string) => {
     const r = await api.startDsh(eid, pname, pdir, autoPort ? undefined : port);
     setInfo(`${r.message} — 正在等待服务就绪...`);
     api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
-    const deadline = Date.now() + 30000;
+    const softAt = Date.now() + 120000;
+    const hardStop = Date.now() + 600000;
+    let softShown = false;
     const poll = setInterval(async () => {
       const st = await api.dshStatus(eid, pname, pdir).catch(() => null);
       if (st && !st.running) {
@@ -386,10 +486,26 @@ export default function App() {
         setInfo("启动失败：进程已退出（可能是 DSH 版本与 profile 不匹配），请选择匹配的 DSH 版本");
         return;
       }
-      if (st?.portOpen || Date.now() > deadline) {
+      if (st?.webReady) {
         clearInterval(poll);
         api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
-        setInfo(st?.portOpen ? `服务已就绪：${r.url}` : "启动超时，请查看日志");
+        setInfo(`服务已就绪：${st?.url || r.url}`);
+        return;
+      }
+      if (Date.now() > hardStop) {
+        clearInterval(poll);
+        api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
+        setInfo("启动超时：web 一直未就绪，请查看日志（常见于 MCP 初始化失败/网络超时）");
+        return;
+      }
+      // 软时限到达仍未就绪：提示一次后继续等（极慢 profile 的 MCP 可能拖更久）
+      if (!softShown && Date.now() > softAt) {
+        softShown = true;
+        setInfo(
+          st?.portOpen
+            ? "web 端口已通但 HTTP 尚未响应，继续等待服务就绪…"
+            : "启动较慢，仍在等待服务就绪…",
+        );
       }
     }, 1000);
   };
@@ -404,14 +520,49 @@ export default function App() {
     setBusy(true);
     setError("");
     setInfo("");
-    const pdir = profiles.find((x) => x.name === pname)?.profilesDir ?? "";
+    // 扫描未完成时列表可能为空 → 回退到记住的来源目录（localStorage），不挡启动
+    const pdir =
+      profiles.find((x) => x.name === pname)?.profilesDir ??
+      (pname === selectedProfile ? selectedProfilesDir : "");
     if (!pdir) {
       setError(`未找到 profile「${pname}」的来源目录`);
       setBusy(false);
       return;
     }
     try {
+      // 启动前查孤儿 node（同 bin.js × 同 profile 精确匹配）；有则弹窗手动确认
+      const orphans = (await api.findOrphanNodes(eid, pname).catch(() => [])) ?? [];
+      if (orphans.length > 0) {
+        setOrphanPrompt({ envId: eid, profile: pname, pdir, list: orphans });
+        setBusy(false);
+        return;
+      }
       await startAndPoll(eid, pname, pdir);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 孤儿确认弹窗：清理并启动 / 直接启动 / 取消
+  const startWithOrphanChoice = async (clean: boolean) => {
+    const t = orphanPrompt;
+    if (!t) return;
+    setOrphanPrompt(null);
+    setBusy(true);
+    setError("");
+    setInfo("");
+    try {
+      if (clean) {
+        const failed = await api.killOrphans(t.list.map((x) => x.pid));
+        if (failed.length > 0) {
+          setInfo(`有 ${failed.length} 个残留进程未能清理（PID ${failed.join("、")}），继续启动`);
+        }
+        // taskkill 异步生效，稍等避免端口仍被占
+        await new Promise((r) => setTimeout(r, 400));
+      }
+      await startAndPoll(t.envId, t.profile, t.pdir);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -476,7 +627,11 @@ export default function App() {
   });
   const profileReorder = useDragReorder(profiles, (next) => {
     setProfiles(next);
-    localStorage.setItem("dshpm-prof-order", JSON.stringify(next.map((x) => x.name)));
+    // 用 name::profilesDir 作为稳定 id（仅 name 会同名冲突、重启后顺序丢失）
+    localStorage.setItem(
+      "dshpm-prof-order",
+      JSON.stringify(next.map((x) => `${x.name}::${x.profilesDir}`)),
+    );
   });
 
   // 刷新：环境 + Profiles 都立刻重扫，列表与增删保持同步
@@ -714,6 +869,18 @@ export default function App() {
       setCreatingProfile(false);
     }
   };
+
+  // F12 打开开发者工具（生产包亦可用）
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "F12") {
+        e.preventDefault();
+        api.openDevTools().catch(() => {});
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // 无 profile 持续 10s：同时出现「初始化」按钮 + 横幅（点叉只关横幅；有 profile 后一起消失）
   useEffect(() => {
@@ -1159,10 +1326,11 @@ export default function App() {
             </div>
           </div>
           <div className="profile-list" ref={profileReorder.listRef}>
-            {profiles.length === 0 && <div className="empty">该环境暂无 profile</div>}
+            {!profilesReady && profiles.length === 0 && <div className="empty">正在扫描 Profiles…</div>}
+            {profilesReady && profiles.length === 0 && <div className="empty">该环境暂无 profile</div>}
             {profiles.map((p, i) => (
               <div
-                key={p.name}
+                key={`${p.name}::${p.profilesDir}`}
                 className={`profile-item drag-item ${p.name === selectedProfile ? "active" : ""}${profileReorder.dragCls(i)}`}
                 {...profileReorder.bind(i)}
                 onClick={() => {
@@ -1247,19 +1415,27 @@ export default function App() {
                   >
                     ⬆ 导出
                   </button>
-                  <button
-                    className="btn tiny uninstall"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setConfirmDeleteProfile(p);
-                    }}
-                    title={`删除 profile「${p.name}」（含 node_modules，不可恢复）`}
-                  >
-                    🗑 删除
-                  </button>
+                  {/* 运行中隐藏删除按钮：停止/启动按钮已占位，删除按钮会超出列表最右侧 */}
+                  {!runnings.find(
+                    (r) => r.envId === selectedEnv && r.profile === p.name,
+                  ) && (
+                    <button
+                      className="btn tiny uninstall"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setConfirmDeleteProfile(p);
+                      }}
+                      title={`删除 profile「${p.name}」（含 node_modules，不可恢复）`}
+                    >
+                      🗑 删除
+                    </button>
+                  )}
                 </div>
               </div>
             ))}
+            {!profilesReady && profiles.length > 0 && (
+              <div className="empty">正在扫描更多 Profiles…</div>
+            )}
           </div>
         </section>
 
@@ -1351,11 +1527,14 @@ export default function App() {
                   {curRun && (
                     <button
                       className="btn"
-                      onClick={() =>
+                      title="打开 DSH web 界面（优先带 token 的地址；服务已可访问时直接打开，不再干等 MCP 初始化）"
+                      onClick={() => {
+                        setInfo("正在打开界面…");
                         api
                           .openDshWeb(curRun.envId, curRun.profile, curRun.profilesDir)
-                          .catch(() => {})
-                      }
+                          .then(() => setInfo("已在浏览器打开 DSH 界面"))
+                          .catch((e) => setError(String(e)));
+                      }}
                     >
                       🌐 打开界面
                     </button>
@@ -1498,8 +1677,30 @@ export default function App() {
                 {plugins.length === 0 ? (
                   <div className="empty">暂无插件</div>
                 ) : (
+                  <>
+                    <input
+                      className="plugin-search"
+                      type="search"
+                      placeholder="🔍 搜索插件（名称 / 版本）..."
+                      value={pluginQuery}
+                      onChange={(e) => setPluginQuery(e.target.value)}
+                      disabled={busy}
+                    />
+                    {(() => {
+                      const q = pluginQuery.trim().toLowerCase();
+                      const filtered = q
+                        ? plugins.filter(
+                            (p) =>
+                              p.name.toLowerCase().includes(q) ||
+                              p.spec.toLowerCase().includes(q)
+                          )
+                        : plugins;
+                      if (filtered.length === 0) {
+                        return <div className="empty">没有匹配「{pluginQuery}」的插件</div>;
+                      }
+                      return (
                   <div className="plugin-table">
-                    {plugins.map((p) => {
+                    {filtered.map((p) => {
                       const up = updates?.find((u) => u.name === p.name);
                       const updatable = up?.updatable && up.latest;
                       return (
@@ -1562,6 +1763,9 @@ export default function App() {
                       );
                     })}
                   </div>
+                      );
+                    })()}
+                    </>
                 )}
               </div>
             </>
@@ -1700,6 +1904,37 @@ export default function App() {
       )}
 
       {/* 删除 profile 确认弹窗 */}
+      {orphanPrompt && (
+        <div className="modal-mask" onClick={() => setOrphanPrompt(null)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>发现 {orphanPrompt.list.length} 个残留的 node 进程</h3>
+            <p className="modal-hint">
+              与「{orphanPrompt.profile}」同 bin.js 同 profile 精确匹配，且不在运行列表中
+              （可能是上次未正常退出、或浏览器重试导致重复启动）。请选择处理方式：
+            </p>
+            <ul className="modal-hint" style={{ margin: "8px 0", paddingLeft: 18 }}>
+              {orphanPrompt.list.map((o) => (
+                <li key={o.pid}>
+                  PID {o.pid}
+                  {o.port ? ` · 端口 ${o.port}` : ""} —{" "}
+                  <code style={{ fontSize: 11, wordBreak: "break-all" }}>{o.cmdline.slice(0, 110)}</code>
+                </li>
+              ))}
+            </ul>
+            <div className="modal-actions">
+              <button className="btn" onClick={() => setOrphanPrompt(null)} disabled={busy}>
+                取消启动
+              </button>
+              <button className="btn" onClick={() => startWithOrphanChoice(false)} disabled={busy}>
+                直接启动（不清理）
+              </button>
+              <button className="btn primary" onClick={() => startWithOrphanChoice(true)} disabled={busy}>
+                清理并启动
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {confirmDeleteProfile && (
         <div className="modal-mask" onClick={() => setConfirmDeleteProfile(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -2287,7 +2522,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.11</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.12</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -2296,6 +2531,9 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
               <button className="btn tiny" onClick={() => api.openUrl("https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/")}>
                 🌐 项目地址（GitHub）
               </button>
+            </div>
+            <div style={{ marginTop: 6 }}>
+              QQ 交流群：<b>1044723843</b>
             </div>
           </div>
         )}

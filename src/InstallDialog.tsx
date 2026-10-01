@@ -1,4 +1,4 @@
-﻿// 在线插件安装对话框：
+// 在线插件安装对话框：
 // 标签1「市场」= curated 插件目录（awesome-dsh-plugin，含 GitHub-only 插件）
 // 标签2「npm 搜索」= 搜索 → 版本浏览 → 兼容预检 → 安装
 // 标签3「自定义源」= 任意 spec（npm 包 / @scope/pkg@ver / github:user/repo / file:...）
@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, pickFolder, pickTgzFile } from "./api";
+import { filterAndSortMarket } from "./marketRank";
 import type {
   DshEnv,
   InstallDone,
@@ -112,7 +113,15 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
     api
       .marketCatalog()
       .then((cat) => {
-        setCatalog(cat.plugins);
+        // 源站有重复条目，按 name+owner 去重，避免 React key 冲突导致列表异常
+        const seen = new Set<string>();
+        const unique = (cat.plugins ?? []).filter((p) => {
+          const id = `${p.owner || ""}/${p.name || ""}|${p.install || ""}`;
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        });
+        setCatalog(unique);
         setCategories(cat.categories);
         setCatLabels(cat.categoryLabels ?? {});
       })
@@ -293,19 +302,9 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
     }
   };
 
-  // 市场过滤（本地）
-  const filtered = (catalog ?? [])
+  // 市场检索：先按关键词过滤，再「名称匹配优先，star 次之」
+  const filtered = filterAndSortMarket(catalog ?? [], q)
     .filter((p) => (catFilter ? p.category === catFilter : true))
-    .filter((p) => {
-      const k = q.trim().toLowerCase();
-      if (!k) return true;
-      return (
-        p.name.toLowerCase().includes(k) ||
-        p.descriptionZh.toLowerCase().includes(k) ||
-        p.descriptionEn.toLowerCase().includes(k)
-      );
-    })
-    .sort((a, b) => (b.stars ?? 0) - (a.stars ?? 0))
     .slice(0, 200);
 
   return (
@@ -362,10 +361,10 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
             {catErr && <div className="error">{catErr}</div>}
             {!catLoading && catalog && (
               <>
-                <div className="search-results market-list">
+                <div className="search-results market-list" data-count={filtered.length}>
                   {filtered.length === 0 && <div className="empty">无匹配插件</div>}
-                  {filtered.map((p) => (
-                    <div key={p.name} className="search-hit" onClick={() => openMarketPlugin(p)}>
+                  {filtered.map((p, idx) => (
+                    <div key={`${p.owner || "p"}/${p.name}#${idx}`} className="search-hit" onClick={() => openMarketPlugin(p)}>
                       <div className="hit-name">
                         {p.name}
                         {p.githubOnly && <span className="tag tag-gh">GitHub</span>}
@@ -381,7 +380,8 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
                   ))}
                 </div>
                 <div className="hit-meta dim-note">
-                  共 {catalog.length} 个插件，展示前 {filtered.length} 个（按 star 排序）
+                  共 {catalog.length} 个插件，匹配并展示 {filtered.length} 个
+                  {q.trim() ? `（名称匹配优先，其次 star）：${filtered.slice(0, 5).map((p) => p.name).join("、") || "无"}` : "（按 star 排序）"}
                 </div>
               </>
             )}
