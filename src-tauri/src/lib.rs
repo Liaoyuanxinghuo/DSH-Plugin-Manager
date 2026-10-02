@@ -1,5 +1,6 @@
 //! DSH Plugin Manager 应用入口与命令注册
 
+mod browsers;
 mod buildpermit;
 mod dsh_install;
 mod fsutil;
@@ -16,6 +17,7 @@ mod toolchain;
 mod profile_io;
 mod runner;
 mod scanner;
+mod webauth;
 
 use models::*;
 use std::collections::HashMap;
@@ -2616,13 +2618,18 @@ fn toggle_devtools(window: tauri::WebviewWindow) {
 
 /// 打开指定 env×profile 的 DSH web 界面。
 /// **不调用 get_env_inner/scan_envs**（全盘扫描会卡住 UI）；只查 running 表 + 读日志取 token。
+/// **只打开带 token 的认证地址**（裸地址无当前进程 cookie 必 401）。
+/// token 行要等 Loader 树结算才打印（多 MCP 的 profile 常要 2-3 分钟）：
+/// 已就绪则立刻打开；未就绪则后台等待并自动打开，立刻返回提示不阻塞 UI。
+/// `browser_exe`：浏览器下拉框选中的 exe（空串 = 系统默认浏览器），全局记忆由前端持久化。
 #[tauri::command]
 async fn open_dsh_web_cmd(
     state: State<'_, AppState>,
     env_id: String,
     profile: String,
     profiles_dir_str: String,
-) -> Result<(), String> {
+    browser_exe: String,
+) -> Result<String, String> {
     // 1) 在 running 里定位实例（精确 key 或 env×profile 宽松匹配），锁不跨 await
     let log_path = {
         let running = state.running.lock().unwrap();
@@ -2643,32 +2650,68 @@ async fn open_dsh_web_cmd(
             .ok_or_else(|| format!("「{profile}」在该环境未在运行"))?;
         proc
     };
-    // 2) 读日志 + 打开浏览器放阻塞池，避免读大日志/拉起进程卡 IPC。
-    //    优先打开带 token 的地址（免认证）；token 行要等 MCP 初始化完才打印（常 2-3 分钟），
-    //    而 web 服务早已可访问——因此短等 3s 仍拿不到 token 就直接开裸地址：
-    //    浏览器若已有 dsh 签名 cookie（此前访问过 token 地址）即可直接用；
-    //    没有 cookie 会显示 401 提示，届时再点一次通常 token 已刷出。
-    //    不再长等 180s：服务一起来就应能打开。
+    // 2) 读日志放阻塞池。已就绪秒开 token 地址；token 行被插件拖住时用持久密钥
+    //    自铸 cookie 跳转进入（不再干等 token 行，也不开裸地址吃 401）。
     tauri::async_runtime::spawn_blocking(move || {
+        let log = log_path.log_path.clone();
+        // 快路径：token 已在日志 → 立刻打开
+        if !log.is_empty() {
+            if let Some(url) = runner::find_auth_url(&log) {
+                if url.contains("token=") {
+                    browsers::open_url_with(&browser_exe, &url)?;
+                    return Ok("已在浏览器打开 DSH 界面".to_string());
+                }
+            }
+        }
         let port = log_path.port;
-        if log_path.log_path.is_empty() {
-            return fsutil::open_url(&format!("http://127.0.0.1:{port}"));
-        }
-        if let Some(url) = runner::find_auth_url(&log_path.log_path) {
-            return fsutil::open_url(&url);
-        }
-        // token 行可能刚写进日志尚未刷出：给 3s 短等
-        if let Some(url) = runner::find_auth_url_wait(&log_path.log_path, 3_000, 250) {
-            return fsutil::open_url(&url);
-        }
-        // 服务已可访问 → 开裸地址；端口都不通才是真的没起
+        let profiles_dir = std::path::PathBuf::from(&log_path.profiles_dir);
+        // DSH_HOME = profiles_dir 的父目录（与启动注入语义一致）
+        let dsh_home = profiles_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(profiles_dir);
+        // 快路径没 token → 免 token 铸 cookie 进入（dsh-mcp-connector 等会拖住 token 行）
         if runner::is_port_open(port) {
-            return fsutil::open_url(&format!("http://127.0.0.1:{port}/"));
+            match webauth::open_web_via_cookie_hop(&dsh_home, port, &browser_exe) {
+                Ok(_) => {
+                    return Ok("已在浏览器打开 DSH 界面（免 token 登录）".to_string());
+                }
+                Err(e) => {
+                    // 密钥读不到再退后台等 token（至少还能等到就开）
+                    let log_bg = log.clone();
+                    let browser_bg = browser_exe.clone();
+                    std::thread::spawn(move || {
+                        if let Ok(url) = runner::resolve_web_open_url(&log_bg, 300_000) {
+                            let _ = browsers::open_url_with(&browser_bg, &url);
+                        }
+                    });
+                    return Ok(format!(
+                        "认证地址尚未生成，且免 token 登录失败（{e}）；已后台等待 token 行，就绪后自动打开"
+                    ));
+                }
+            }
         }
-        Err("DSH web 服务尚未启动，请稍后再试".to_string())
+        // 端口未通：后台等 token 行
+        let log_bg = log.clone();
+        let browser_bg = browser_exe.clone();
+        std::thread::spawn(move || {
+            if let Ok(url) = runner::resolve_web_open_url(&log_bg, 300_000) {
+                let _ = browsers::open_url_with(&browser_bg, &url);
+            }
+        });
+        Ok("服务尚未监听端口，已后台等待认证地址，就绪后将自动打开浏览器".to_string())
     })
     .await
     .map_err(|e| format!("打开浏览器失败: {e}"))?
+}
+
+/// 枚举已安装浏览器：第一项系统默认，其后各浏览器（带图标 data URL）。
+/// 供「打开界面」旁的浏览器下拉框使用；探测走注册表 + 图标缓存，放阻塞池。
+#[tauri::command]
+async fn list_browsers_cmd() -> Result<Vec<browsers::BrowserInfo>, String> {
+    tauri::async_runtime::spawn_blocking(browsers::list_browsers)
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))
 }
 
 /// 获取当前选中"环境 × Profile"的关键路径集合（供前端文件按钮使用）。
@@ -2783,6 +2826,7 @@ pub fn run() {
             download_update_cmd,
             launch_installer_and_exit_cmd,
             open_dsh_web_cmd,
+            list_browsers_cmd,
             get_env_paths,
             export_profile_cmd,
             import_profile_cmd,
@@ -3003,13 +3047,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.12_x64-setup.exe", "0.3.12"));
-        assert!(asset_matches("dsh-manager_0.3.12_x64-setup.exe", "0.3.12"));
-        assert!(asset_matches("任意名_0.3.12_x64-setup.exe", "0.3.12"));
-        assert!(!asset_matches("DSH-Manager-0.3.12-win-x64.exe", "0.3.12"));
-        assert!(!asset_matches("DSH Manager_0.3.12_x64-setup.exe.sha256", "0.3.12"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.12"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.12"));
+        assert!(asset_matches("DSH Manager_0.3.13_x64-setup.exe", "0.3.13"));
+        assert!(asset_matches("dsh-manager_0.3.13_x64-setup.exe", "0.3.13"));
+        assert!(asset_matches("任意名_0.3.13_x64-setup.exe", "0.3.13"));
+        assert!(!asset_matches("DSH-Manager-0.3.13-win-x64.exe", "0.3.13"));
+        assert!(!asset_matches("DSH Manager_0.3.13_x64-setup.exe.sha256", "0.3.13"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.13"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.13"));
     }
 
     #[test]
@@ -3142,10 +3186,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.12_x64-setup.exe", "0.3.12"));
+        assert!(asset_matches("DSH.Manager_0.3.13_x64-setup.exe", "0.3.13"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.12_x64-setup.exe", "0.3.12"));
-        assert!(asset_matches("DSH.MANAGER_0.3.12_X64-SETUP.EXE", "0.3.12"));
+        assert!(asset_matches("dsh.manager_0.3.13_x64-setup.exe", "0.3.13"));
+        assert!(asset_matches("DSH.MANAGER_0.3.13_X64-SETUP.EXE", "0.3.13"));
     }
 
     #[test]
@@ -3153,7 +3197,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.12", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.13", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

@@ -1,6 +1,7 @@
 // API 封装：调用 Tauri 后端命令
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  BrowserInfo,
   DshEnv,
   PackExportResult,
   PackImportResult,
@@ -103,9 +104,12 @@ export const api = {
   openUrl: (url: string) => invoke<void>("open_url_cmd", { url }),
   /** 切换 WebView DevTools（F12 / Ctrl+Shift+I）；release 构建也启用（tauri devtools feature） */
   toggleDevtools: () => invoke<void>("toggle_devtools"),
-  /** 打开 DSH web 界面：后端实时从日志提取带 token 的地址 */
-  openDshWeb: (envId: string, profile: string, profilesDir: string) =>
-    invoke<void>("open_dsh_web_cmd", { envId, profile, profilesDirStr: profilesDir }),
+  /** 打开 DSH web 界面：后端提取带 token 的地址；未就绪则后台等待并自动打开。
+   *  browserExe：浏览器下拉框选中的 exe（空串 = 系统默认）。 */
+  openDshWeb: (envId: string, profile: string, profilesDir: string, browserExe = "") =>
+    invoke<string>("open_dsh_web_cmd", { envId, profile, profilesDirStr: profilesDir, browserExe }),
+  /** 枚举已安装浏览器（第一项系统默认，带图标 data URL） */
+  listBrowsers: () => invoke<BrowserInfo[]>("list_browsers_cmd"),
   getEnvPaths: (envId: string, profile: string, profilesDir: string) =>
     invoke<EnvPaths>("get_env_paths", { envId, profile, profilesDirStr: profilesDir }),
   // profile 导出/导入

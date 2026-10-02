@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { applyStoredOrder, migrateStoredOrder, moveItem, readStoredOrder } from "./reorder";
 import InstallDialog from "./InstallDialog";
 import type {
+  BrowserInfo,
   DshEnv,
   EnvPaths,
   DepIssue,
@@ -118,6 +119,81 @@ function logLineClass(l: { line: string; kind?: string }): string {
   return "";
 }
 
+/** 浏览器图标（data URL）；无图标时用 🌐 占位 */
+function BrowserIco({ icon }: { icon: string }) {
+  return icon ? (
+    <img className="browser-ico" src={icon} alt="" />
+  ) : (
+    <span className="browser-ico browser-ico-fallback">🌐</span>
+  );
+}
+
+/**
+ * 「打开界面」旁的浏览器选择下拉：图标展示，默认浏览器在首位，其后是已安装浏览器。
+ * 选择由调用方持久化（localStorage 全局记忆，与 DSH/Profile 无关）。
+ */
+function BrowserPick({
+  browsers,
+  value,
+  onChange,
+}: {
+  browsers: BrowserInfo[];
+  /** 选中项 id：空串 = 系统默认浏览器 */
+  value: string;
+  onChange: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  const cur = browsers.find((b) => b.id === value) ?? (browsers.length ? browsers[0] : null);
+  return (
+    <div className="browser-pick" ref={boxRef}>
+      <button
+        type="button"
+        className="btn browser-pick-btn"
+        title={cur ? `打开界面用：${cur.name}（全局记忆，点击更换）` : "选择打开界面用的浏览器（全局记忆）"}
+        aria-label="选择打开界面用的浏览器"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <BrowserIco icon={cur?.icon ?? ""} />
+        <span className="caret">▾</span>
+      </button>
+      {open && (
+        <div className="browser-pick-menu" role="listbox" aria-label="已安装浏览器">
+          {browsers.length === 0 ? (
+            <div className="browser-pick-empty">正在检测浏览器…</div>
+          ) : (
+            browsers.map((b) => (
+              <button
+                type="button"
+                key={b.id || "default"}
+                className={`browser-pick-item${b.id === value ? " active" : ""}`}
+                role="option"
+                aria-selected={b.id === value}
+                aria-label={b.name}
+                title={b.name}
+                onClick={() => {
+                  onChange(b.id);
+                  setOpen(false);
+                }}
+              >
+                <BrowserIco icon={b.icon} />
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function App() {
   const [envs, setEnvs] = useState<DshEnv[]>([]);
   const [selectedEnv, setSelectedEnv] = useState<string>(() => localStorage.getItem("dshpm-sel-env") ?? "");
@@ -157,6 +233,9 @@ export default function App() {
   /** 流式渲染：扫到一个显示一个；此项仅表示「扫描是否结束」（空态文案用） */
   const [profilesReady, setProfilesReady] = useState(false);
   const [initRunning, setInitRunning] = useState(false);
+  // 「打开界面」浏览器选择：全局记忆（localStorage，与 DSH/Profile 无关）；空串 = 系统默认
+  const [browsers, setBrowsers] = useState<BrowserInfo[]>([]);
+  const [browserExe, setBrowserExe] = useState<string>(() => localStorage.getItem("dshpm-browser") ?? "");
   // 在线安装对话框
   const [showInstall, setShowInstall] = useState(false);
   const [installTab, setInstallTab] = useState<"market" | "search" | "custom" | "local">("market");
@@ -240,6 +319,25 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("dshpm-auto-port", autoPort ? "1" : "0");
   }, [autoPort]);
+  // 浏览器选择全局记忆（与 DSH/Profile 无关）
+  useEffect(() => {
+    localStorage.setItem("dshpm-browser", browserExe);
+  }, [browserExe]);
+  // 启动时探测已安装浏览器；记住的浏览器已卸载则回退默认（空串）
+  useEffect(() => {
+    let alive = true;
+    api
+      .listBrowsers()
+      .then((list) => {
+        if (!alive) return;
+        setBrowsers(list);
+        setBrowserExe((cur) => (cur && !list.some((b) => b.id === cur) ? "" : cur));
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   // F12 / Ctrl+Shift+I 切换 DevTools。WebView2 的浏览器快捷键在 DevTools 关闭时
   // 会吞掉 F12 且不转发给页面，故显式监听并调 toggle_devtools 兜底（release 也可用）。
@@ -406,9 +504,28 @@ export default function App() {
   }, [selectedEnv, selectedProfile, selectedProfilesDir, profiles]);
 
   // 运行实例轮询（全局，跨环境跨 profile，3s 一次：进程退出后按钮/状态快速自动纠正）
+  // webReady（HTTP 可访问）即可打开——打开时走免 token 自动登录，不再等 token 行。
   useEffect(() => {
-    const tick = () => {
-      api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
+    const tick = async () => {
+      const l = await api.listRunning().catch(() => null);
+      setRunnings(l ?? []);
+      for (const r of l ?? []) {
+        const st = await api.dshStatus(r.envId, r.profile, r.profilesDir).catch(() => null);
+        if (st?.webReady) {
+          const u = st.url || `http://127.0.0.1:${r.port}/`;
+          const label = u.includes("token=") ? u : `${u}（点「打开界面」自动登录）`;
+          setInfo((prev) => {
+            // 可设置：空 / 等待中 / 或「自动登录」版升级为 token 地址版
+            const replaceable =
+              prev === "" ||
+              prev.includes("正在等待服务就绪") ||
+              prev.includes("启动中") ||
+              (prev.includes("自动登录") && u.includes("token="));
+            return replaceable ? `服务已就绪：${label}` : prev;
+          });
+          return;
+        }
+      }
     };
     tick();
     const t = setInterval(tick, 3000);
@@ -466,10 +583,8 @@ export default function App() {
   };
 
   // 启动 + 就绪轮询（供启动/重启共用）
-  // 就绪判定：端口通 **且**（日志出现带 token 的 web URL **或** web 已在 HTTP 服务）——
-  // token 行要等 MCP 初始化完才打印（常 2-3 分钟），但 web 服务早就可访问；
-  // 浏览器已有签名 cookie 时裸地址即可用，因此 HTTP 已响应就算就绪，不干等 token。
-  // 软时限（2 分钟）只换提示文案，**继续轮询**直到真正就绪；硬上限 10 分钟才放弃。
+  // 就绪 = web 可访问（webReady）。token 行被插件拖住也没关系——
+  // 点「打开界面」会自动登录（token 地址或免 token 铸 cookie），不干等 token。
   const startAndPoll = async (eid: string, pname: string, pdir: string) => {
     const r = await api.startDsh(eid, pname, pdir, autoPort ? undefined : port);
     setInfo(`${r.message} — 正在等待服务就绪...`);
@@ -486,16 +601,19 @@ export default function App() {
         setInfo("启动失败：进程已退出（可能是 DSH 版本与 profile 不匹配），请选择匹配的 DSH 版本");
         return;
       }
+      // webReady = 可访问 → 就绪可打开（token 或自动登录均可）
       if (st?.webReady) {
         clearInterval(poll);
         api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
-        setInfo(`服务已就绪：${st?.url || r.url}`);
+        const u = st?.url || r.url;
+        const label = u && u.includes("token=") ? u : `${u || ""}（点「打开界面」自动登录）`;
+        setInfo(`服务已就绪：${label}`);
         return;
       }
       if (Date.now() > hardStop) {
         clearInterval(poll);
         api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
-        setInfo("启动超时：web 一直未就绪，请查看日志（常见于 MCP 初始化失败/网络超时）");
+        setInfo("启动超时：web 一直未响应，请查看日志（常见于 MCP 初始化失败/网络超时）");
         return;
       }
       // 软时限到达仍未就绪：提示一次后继续等（极慢 profile 的 MCP 可能拖更久）
@@ -503,7 +621,7 @@ export default function App() {
         softShown = true;
         setInfo(
           st?.portOpen
-            ? "web 端口已通但 HTTP 尚未响应，继续等待服务就绪…"
+            ? "web 端口已通但服务尚未响应，继续等待…"
             : "启动较慢，仍在等待服务就绪…",
         );
       }
@@ -1525,19 +1643,22 @@ export default function App() {
                     ■ 停止
                   </button>
                   {curRun && (
-                    <button
-                      className="btn"
-                      title="打开 DSH web 界面（优先带 token 的地址；服务已可访问时直接打开，不再干等 MCP 初始化）"
-                      onClick={() => {
-                        setInfo("正在打开界面…");
-                        api
-                          .openDshWeb(curRun.envId, curRun.profile, curRun.profilesDir)
-                          .then(() => setInfo("已在浏览器打开 DSH 界面"))
-                          .catch((e) => setError(String(e)));
-                      }}
-                    >
-                      🌐 打开界面
-                    </button>
+                    <>
+                      <button
+                        className="btn"
+                        title="打开 DSH web 界面（优先 token 地址，否则自动登录）"
+                        onClick={() => {
+                          setInfo("正在打开界面…");
+                          api
+                            .openDshWeb(curRun.envId, curRun.profile, curRun.profilesDir, browserExe)
+                            .then((msg) => setInfo(msg))
+                            .catch((e) => setError(String(e)));
+                        }}
+                      >
+                        🌐 打开界面
+                      </button>
+                      <BrowserPick browsers={browsers} value={browserExe} onChange={setBrowserExe} />
+                    </>
                   )}
                 </div>
                 <div className="run-hint">
@@ -2522,7 +2643,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.12</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.13</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

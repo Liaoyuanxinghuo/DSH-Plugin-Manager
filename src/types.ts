@@ -74,6 +74,16 @@ export interface Settings {
   githubMirrors: string[];
 }
 
+/** 已安装浏览器（「打开界面」下拉框用）；id 空串 = 系统默认浏览器 */
+export interface BrowserInfo {
+  id: string;
+  name: string;
+  exePath: string;
+  /** data URL（image/png;base64,...）；失败则空串 */
+  icon: string;
+  isDefault: boolean;
+}
+
 export interface UpdateInfo {
   current: string;
   latest: string;

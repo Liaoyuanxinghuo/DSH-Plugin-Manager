@@ -1,6 +1,6 @@
 [package]
 name = "dsh-manager"
-version = "0.3.12"
+version = "0.3.13"
 description = "DSH Manager - 图形化 DSH 环境与插件管理工具"
 authors = ["dshpm"]
 edition = "2021"
@@ -24,6 +24,7 @@ dirs = "6"
 thiserror = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
+hmac = "0.12"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

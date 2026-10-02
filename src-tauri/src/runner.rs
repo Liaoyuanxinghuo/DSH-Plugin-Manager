@@ -269,8 +269,11 @@ pub fn build_start_command(env: &DshEnv, profile: &str, port: u16) -> String {
 /// 从 dsh web 日志中提取带认证 token 的访问 URL。
 /// dsh web 启动后打印 `dsh web: http://127.0.0.1:<port>/?token=...`，
 /// 必须打开该 URL 才能完成认证（裸地址会显示 authentication required / 401）。
+/// **优先返回带 `token=` 的 URL**：日志里可能先出现其他 127.0.0.1 地址（裸地址、
+/// 插件打印的本机 URL 等），若取第一条会永远拿不到 token、卡在「认证地址生成中」。
 pub fn find_auth_url(log_path: &str) -> Option<String> {
     let content = std::fs::read_to_string(log_path).ok()?;
+    let mut first_any: Option<String> = None;
     for line in content.lines() {
         let line = line.trim();
         let pos = line
@@ -278,12 +281,18 @@ pub fn find_auth_url(log_path: &str) -> Option<String> {
             .or_else(|| line.find("http://localhost:"));
         if let Some(pos) = pos {
             let url = line[pos..].trim_end_matches(|c: char| c.is_whitespace() || c == '。' || c == '，');
-            if !url.is_empty() {
+            if url.is_empty() {
+                continue;
+            }
+            if url.contains("token=") {
                 return Some(url.to_string());
+            }
+            if first_any.is_none() {
+                first_any = Some(url.to_string());
             }
         }
     }
-    None
+    first_any
 }
 
 /// 等待日志中出现带 token 的 web URL（dsh 的 `dsh web:` 行常在 MCP 初始化完成后才打印）。
@@ -298,6 +307,22 @@ pub fn find_auth_url_wait(log_path: &str, timeout_ms: u64, interval_ms: u64) -> 
             return None;
         }
         std::thread::sleep(std::time::Duration::from_millis(interval_ms.max(50)));
+    }
+}
+
+/// 解析「打开界面」应打开的 URL：**只认带 token 的认证地址**。
+/// 裸地址在浏览器没有当前进程的 dsh cookie 时返回 401
+/// （`dsh web authentication required; reopen the URL printed by dsh web.`），
+/// 且每个进程 token 不同、重启后旧 cookie 失效，因此绝不回退裸地址。
+/// 等不到 token 行则报错，让用户稍后再试。
+pub fn resolve_web_open_url(log_path: &str, timeout_ms: u64) -> Result<String, String> {
+    if log_path.trim().is_empty() {
+        return Err("缺少运行日志，无法获取认证地址".to_string());
+    }
+    match find_auth_url_wait(log_path, timeout_ms, 500) {
+        Some(url) if url.contains("token=") => Ok(url),
+        Some(_) => Err("日志中的地址缺少认证 token，请查看运行日志".to_string()),
+        None => Err("认证地址尚未出现（MCP 初始化可能仍在进行），请稍后再试".to_string()),
     }
 }
 
@@ -1048,6 +1073,44 @@ mod tests {
     }
 
     #[test]
+    fn find_auth_url_prefers_token_over_earlier_bare_url() {
+        // 日志里可能先出现裸地址/其他本机 URL，必须跳到带 token 的那条
+        let tmp = std::env::temp_dir().join(format!("dshpm-auth-pref-{}", std::process::id()));
+        std::fs::write(
+            &tmp,
+            "listening on http://127.0.0.1:3080/\nplugin probe http://127.0.0.1:9229\n\ndsh web: http://127.0.0.1:3080/?token=xyz789\n",
+        )
+        .unwrap();
+        let url = find_auth_url(tmp.to_string_lossy().as_ref()).unwrap();
+        assert_eq!(url, "http://127.0.0.1:3080/?token=xyz789");
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    /// 功能测试：start_dsh 用 File::create 持有写句柄传给子进程，
+    /// find_auth_url 必须仍能从同一路径读到 token（Windows 文件共享）。
+    #[test]
+    fn find_auth_url_reads_while_writer_handle_held() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!("dshpm-locked-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        // 与 start_dsh 相同的创建方式：句柄保持打开
+        let mut writer = std::fs::File::create(&tmp).unwrap();
+        writer
+            .write_all(b"booting...\ndsh web: http://127.0.0.1:3081/?token=held-open\n")
+            .unwrap();
+        writer.flush().unwrap();
+        // writer 不 drop = 子进程继承句柄期间文件仍被占用
+        let url = find_auth_url(tmp.to_string_lossy().as_ref())
+            .expect("写句柄占用期间必须仍可读到 token");
+        assert_eq!(url, "http://127.0.0.1:3081/?token=held-open");
+        // resolve_web_open_url 同样要能在占用期间拿到
+        let url2 = resolve_web_open_url(tmp.to_string_lossy().as_ref(), 500).unwrap();
+        assert_eq!(url2, "http://127.0.0.1:3081/?token=held-open");
+        drop(writer);
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
     fn find_auth_url_none_when_no_url() {
         let tmp = std::env::temp_dir().join(format!("dshpm-auth2-{}", std::process::id()));
         std::fs::write(&tmp, "starting...\nno url here\n").unwrap();
@@ -1092,6 +1155,40 @@ mod tests {
             "日志始终无 URL 应返回 None"
         );
         std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn resolve_web_open_url_returns_token_url() {
+        let tmp = std::env::temp_dir().join(format!("dshpm-open-{}", std::process::id()));
+        std::fs::write(&tmp, "dsh web: http://127.0.0.1:3080/?token=abc123\n").unwrap();
+        let url = resolve_web_open_url(tmp.to_string_lossy().as_ref(), 1000).unwrap();
+        assert_eq!(url, "http://127.0.0.1:3080/?token=abc123");
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn resolve_web_open_url_rejects_bare_address() {
+        // 裸地址无 token → 401，不允许作为打开目标
+        let tmp = std::env::temp_dir().join(format!("dshpm-open-bare-{}", std::process::id()));
+        std::fs::write(&tmp, "dsh web: http://127.0.0.1:3080/\n").unwrap();
+        let err = resolve_web_open_url(tmp.to_string_lossy().as_ref(), 800)
+            .unwrap_err();
+        assert!(err.contains("token"), "裸地址应报缺少 token：{err}");
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn resolve_web_open_url_times_out_without_token_line() {
+        let tmp = std::env::temp_dir().join(format!("dshpm-open-to-{}", std::process::id()));
+        std::fs::write(&tmp, "starting mcp...\n").unwrap();
+        let err = resolve_web_open_url(tmp.to_string_lossy().as_ref(), 300).unwrap_err();
+        assert!(err.contains("尚未出现"), "无 token 行应报尚未出现：{err}");
+        std::fs::remove_file(&tmp).unwrap();
+    }
+
+    #[test]
+    fn resolve_web_open_url_empty_log_is_error() {
+        assert!(resolve_web_open_url("", 300).is_err(), "空日志路径应报错");
     }
 
     #[test]
