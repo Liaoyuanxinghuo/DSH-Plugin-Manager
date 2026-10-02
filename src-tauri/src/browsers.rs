@@ -48,7 +48,7 @@ fn icon_data_url(exe: &str) -> String {
          $i=[System.Drawing.Icon]::ExtractAssociatedIcon('{exe_q}'); \
          if($i){{ $b=$i.ToBitmap(); $b.Save('{out}',[System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose(); $i.Dispose(); exit 0 }} else {{ exit 1 }}"
     );
-    let ok = std::process::Command::new("powershell.exe")
+    let ok = crate::fsutil::hidden_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -112,7 +112,7 @@ foreach ($root in $paths) {
   }
 }
 "#;
-    let out = std::process::Command::new("powershell.exe")
+    let out = crate::fsutil::hidden_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output();
     let mut seen = std::collections::HashSet::new();
@@ -171,7 +171,7 @@ if ($progId) {
   if ($name) { Write-Output $name }
 }
 "#;
-    let out = std::process::Command::new("powershell.exe")
+    let out = crate::fsutil::hidden_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .ok()?;
@@ -217,7 +217,7 @@ if ($progId) {
   elseif ($cmd -match '(\S+\.exe)') { Write-Output $Matches[1] }
 }
 "#;
-    let out = std::process::Command::new("powershell.exe")
+    let out = crate::fsutil::hidden_command("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output();
     if let Ok(o) = out {
@@ -241,7 +241,7 @@ pub fn open_url_with(exe_path: &str, url: &str) -> Result<(), String> {
     if !std::path::Path::new(exe).is_file() {
         return Err(format!("浏览器不存在: {exe}"));
     }
-    std::process::Command::new(exe)
+    crate::fsutil::hidden_command(exe)
         .arg(url)
         .spawn()
         .map(|_| ())

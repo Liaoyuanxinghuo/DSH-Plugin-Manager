@@ -790,7 +790,7 @@ mod tests {
         let alive = is_pid_alive(pid);
         println!("进程存活: {alive}");
         assert!(alive);
-        let _ = std::process::Command::new("taskkill")
+        let _ = crate::fsutil::hidden_command("taskkill")
             .args(["/PID", &pid.to_string(), "/F"])
             .output();
     }

@@ -1836,7 +1836,7 @@ async fn launch_installer_and_exit_cmd(path: String, app: tauri::AppHandle) -> R
     }
     // spawn + 等待放阻塞线程池，勿在主线程 sleep
     tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new(&path)
+        fsutil::hidden_command(&path)
             .spawn()
             .map_err(|e| format!("启动安装程序失败：{e}"))?;
         // 稍等片刻确保安装程序已拉起，再退出自己

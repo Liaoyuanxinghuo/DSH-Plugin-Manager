@@ -267,7 +267,7 @@ mod tests {
         let (node, binjs) = crate::runner::resolve_dsh_launcher(&env).expect("应解析出 node+bin.js");
         println!("node={node}\nbinjs={binjs}");
         // PATH 置空 + 只带 NODE 运行时变量 → 仍应输出版本
-        let mut c = Command::new(&node);
+        let mut c = crate::fsutil::hidden_command(&node);
         c.arg(&binjs).arg("-V");
         c.env("PATH", "");
         c.env("NODE", &node);

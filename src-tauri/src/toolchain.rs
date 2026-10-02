@@ -399,7 +399,7 @@ pub fn install_pnpm(app: &tauri::AppHandle, node_dir: &Path, registry: &str) -> 
 /// 查 npm 全局目录：sub 为 "prefix"（`npm prefix -g`）或 "config get prefix"
 fn npm_global_dir(npm: &Path, sub: &str) -> Option<PathBuf> {
     let args: Vec<&str> = sub.split_whitespace().collect();
-    let mut cmd = Command::new(npm);
+    let mut cmd = crate::fsutil::hidden_command(npm);
     cmd.args(&args);
     if sub.starts_with("config") {
         cmd.arg("-g");
@@ -419,7 +419,7 @@ fn npm_global_dir(npm: &Path, sub: &str) -> Option<PathBuf> {
 
 /// cmd /c where pnpm.cmd（完整 PATH + PATHEXT 探测）
 fn where_pnpm() -> Option<PathBuf> {
-    let out = Command::new("cmd").args(["/c", "where", "pnpm.cmd"]).output().ok()?;
+    let out = crate::fsutil::hidden_command("cmd").args(["/c", "where", "pnpm.cmd"]).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -640,7 +640,7 @@ mod tests {
         };
         let path_before = std::env::var("PATH").unwrap_or_default();
         // 子进程内：NODE 已设；PATH（该进程 env）应以运行时目录开头
-        let mut cmd = Command::new("cmd");
+        let mut cmd = crate::fsutil::hidden_command("cmd");
         cmd.args(["/C", "echo NODE=%NODE% & echo PATHHEAD=%PATH:~0,80%"]);
         cmd.stdout(Stdio::piped()).stderr(Stdio::null());
         tc.apply_runtime_env(&mut cmd);
@@ -709,7 +709,7 @@ mod tests {
         }
         let node = dest.join("node.exe");
         assert!(node.is_file(), "应解压出 node.exe");
-        let v = Command::new(&node).arg("--version").output().unwrap();
+        let v = crate::fsutil::hidden_command(&node).arg("--version").output().unwrap();
         let vs = String::from_utf8_lossy(&v.stdout).trim().to_string();
         println!("node --version => {vs}");
         assert!(vs.starts_with('v'), "应输出版本号: {vs}");
@@ -719,7 +719,7 @@ mod tests {
         // npm -g pnpm --prefix 到 node 目录（与 install_pnpm 相同参数）
         let npm = dest.join("npm.cmd");
         assert!(npm.is_file());
-        let st = Command::new(&npm)
+        let st = crate::fsutil::hidden_command(&npm)
             .args([
                 "install",
                 "-g",
@@ -737,7 +737,7 @@ mod tests {
         assert!(st.status.success(), "pnpm 安装应成功: {st:?}");
         let pnpm = dest.join("pnpm.cmd");
         assert!(pnpm.is_file(), "pnpm.cmd 应落在 node 目录");
-        let pv = Command::new(&pnpm).arg("--version").output().unwrap();
+        let pv = crate::fsutil::hidden_command(&pnpm).arg("--version").output().unwrap();
         let pvs = String::from_utf8_lossy(&pv.stdout).trim().to_string();
         println!("pnpm --version => {pvs}");
         assert!(!pvs.is_empty());
