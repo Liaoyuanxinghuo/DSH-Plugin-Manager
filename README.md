@@ -342,7 +342,6 @@ dshcjaz/
 ***
 
 ## 常见问题（FAQ）
-
 **Q：为什么「打开界面」要用带 token 的地址？**
 
 dsh web 只监听 `127.0.0.1`，且访问需认证 token（`dsh web: http://127.0.0.1:<port>/?token=...`）。应用在启动后保留日志，「打开界面」时实时提取最新 token，避免出现 `authentication required`。
@@ -392,9 +391,6 @@ dsh web 只监听 `127.0.0.1`，且访问需认证 token（`dsh web: http://127.
 * **包管理**：pnpm
 
 ## 致谢
-
-感谢 [Linux.do](https://linux.do/) 社区——项目的想法、讨论与第一波用户反馈都来自这里的朋友们。
-
 本项目站在这些优秀开源项目的肩膀上（列主要的）：
 
 **核心框架**
@@ -402,24 +398,6 @@ dsh web 只监听 `127.0.0.1`，且访问需认证 token（`dsh web: http://127.
 * [Tauri](https://tauri.app)：跨平台桌面应用框架（Rust 后端 + 系统 WebView2）
 
 * [React](https://react.dev)：前端 UI 库
-
-* [Vite](https://vite.dev) / [TypeScript](https://www.typescriptlang.org)：构建工具与类型系统
-
-**Rust 依赖**（[crates.io](https://crates.io)）
-
-* [serde](https://crates.io/crates/serde) / [serde_json](https://crates.io/crates/serde_json) / [serde_yaml](https://crates.io/crates/serde_yaml)：序列化
-
-* [reqwest](https://crates.io/crates/reqwest)：HTTP 客户端（更新检查、市场、镜像下载）
-
-* [zip](https://crates.io/crates/zip)：整合包 / 诊断包压缩
-
-* [sha2](https://crates.io/crates/sha2) / [hmac](https://crates.io/crates/hmac)：完整性校验与登录签名
-
-* [dirs](https://crates.io/crates/dirs) / [thiserror](https://crates.io/crates/thiserror)：系统路径解析与错误处理
-
-**前端与测试**
-
-* [Vitest](https://vitest.dev) / [Testing Library](https://testing-library.com) / [jsdom](https://github.com/jsdom/jsdom)：单元与界面测试
 
 **生态项目**
 
