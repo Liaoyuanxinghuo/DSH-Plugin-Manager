@@ -391,7 +391,7 @@ dsh web 只监听 `127.0.0.1`，且访问需认证 token（`dsh web: http://127.
 * **包管理**：pnpm
 
 ## 致谢
-感谢[Linux.do](https:/linux.do/)社区--的支持与帮助。
+感谢[Linux.do](https:/linux.do/)社区的支持与帮助。
 
 本项目站在这些优秀开源项目的肩膀上（列主要的）：
 
