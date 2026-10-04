@@ -95,15 +95,20 @@ pub fn run_dsh_with_logs(
             }
         })
     };
-    // stderr 线程
+    // stderr 线程（顺带记下最后一条非空错误行，失败摘要用它说话而不是「详见日志」）
+    let last_err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
     let err_handle = {
         let app = app.clone();
+        let last_err = last_err.clone();
         let stderr = child.stderr.take();
         std::thread::spawn(move || {
             if let Some(stderr) = stderr {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines() {
                     if let Ok(l) = line {
+                        if !l.trim().is_empty() {
+                            *last_err.lock().unwrap() = l.clone();
+                        }
                         let _ = app.emit("install-log", serde_json::json!({ "line": l, "kind": "stderr" }));
                     }
                 }
@@ -123,10 +128,33 @@ pub fn run_dsh_with_logs(
         "install-done",
         serde_json::json!({ "success": success, "exitCode": exit_code }),
     );
+    let tail = last_err.lock().unwrap().clone();
     InstallOutcome {
         success,
         exit_code,
-        summary: if success { "执行成功".to_string() } else { "执行失败，详见日志".to_string() },
+        summary: failure_summary(success, &tail),
+    }
+}
+
+/// 失败摘要：带上 stderr 最后一条错误行（CLI 的真实原因），没有才退回「详见日志」。
+/// 命中官方「Electron 应用独占管理」类拒绝时追加提示：可能是该 profile 被
+/// 官方桌面应用特别管理导致失败（不预检、不拦截，照常执行，仅失败时说明）。
+fn failure_summary(success: bool, last_stderr_line: &str) -> String {
+    if success {
+        return "执行成功".to_string();
+    }
+    let tail = last_stderr_line.trim();
+    if tail.is_empty() {
+        return "执行失败，详见日志".to_string();
+    }
+    let base = format!("执行失败：{tail}");
+    if tail.contains("managed exclusively") || tail.contains("Electron application") {
+        format!(
+            "{base}（提示：可能是该 profile 被官方 DSH Desktop 应用特别管理导致失败；\
+             可在官方桌面应用内操作，或克隆/改名后用本管理器管理）"
+        )
+    } else {
+        base
     }
 }
 
@@ -232,6 +260,25 @@ mod tests {
         assert_eq!(args[3], "add");
         assert_eq!(args[4], "dshmarket");
         let _ = &env;
+    }
+
+    #[test]
+    fn failure_summary_carries_real_cli_reason() {
+        // 失败摘要必须带 stderr 真实原因，而不是干巴巴的「详见日志」
+        assert_eq!(failure_summary(true, "whatever"), "执行成功");
+        assert_eq!(failure_summary(false, ""), "执行失败，详见日志");
+        assert_eq!(
+            failure_summary(false, "some npm error"),
+            "执行失败：some npm error"
+        );
+        // 命中官方「特别管理」拒绝 → 追加可能原因提示（不拦截，仅失败时说明）
+        let s = failure_summary(
+            false,
+            "error: profile \"desktop\" is managed exclusively by the Electron application",
+        );
+        assert!(s.contains("执行失败：error: profile \"desktop\""), "{s}");
+        assert!(s.contains("特别管理"), "应提示可能被特别管理: {s}");
+        assert!(s.contains("可能"), "提示语气是「可能」: {s}");
     }
 
     /// 真实验证：绝对路径 node 启动 dsh，**PATH 清空也能跑**（不靠 PATH、不置顶）。

@@ -356,6 +356,172 @@ pub fn list_disabled_ids(content: &str) -> Vec<String> {
     disables
 }
 
+/// 卸载收尾：删掉 market/本管理器为某行写的简单块（`- id: X` + `disabled: …`，
+/// 或再带一行 `name: …`）。只删这两种**我们自己写入**的形状；
+/// 用户手写的带 config 的长条目原样保留（与 market `removeRowBlocks` 同策略，
+/// 不能把用户配置当孤儿删掉）。
+pub fn remove_row_blocks(content: &str, row_ids: &[String]) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut remove = vec![false; lines.len()];
+    for id in row_ids {
+        for (i, line) in lines.iter().enumerate() {
+            if remove[i] {
+                continue;
+            }
+            let t = line.trim_start();
+            let Some(rest) = t.strip_prefix("- id:") else {
+                continue;
+            };
+            let rid = rest.trim().trim_matches('"').trim_matches('\'');
+            if rid != id.as_str() {
+                continue;
+            }
+            // 收集条目属性行（直到下一个 `- ` 条目或空行）
+            let mut j = i + 1;
+            let mut attrs: Vec<&str> = Vec::new();
+            while j < lines.len() {
+                let t2 = lines[j].trim_start();
+                if t2.is_empty() || t2.starts_with("- ") || t2 == "-" {
+                    break;
+                }
+                attrs.push(t2);
+                j += 1;
+            }
+            let is_simple = match attrs.len() {
+                1 => attrs[0].starts_with("disabled:"),
+                2 => attrs[0].starts_with("name:") && attrs[1].starts_with("disabled:"),
+                _ => false,
+            };
+            if is_simple {
+                for k in i..j {
+                    remove[k] = true;
+                }
+            }
+        }
+    }
+    let eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let kept: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !remove[*i])
+        .map(|(_, l)| *l)
+        .collect();
+    let mut s = kept.join(eol);
+    if content.is_empty() || content.ends_with('\n') {
+        s.push_str(eol);
+    }
+    with_placeholder_restored(&s)
+}
+
+/// market `withPlaceholderRestored` 等价：删空后的 patch 必须仍是合法 YAML
+/// 列表（`[]`），否则下一次「启用」写入会把 profile 撑挂。
+fn with_placeholder_restored(text: &str) -> String {
+    let has_content = text
+        .lines()
+        .any(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        });
+    if has_content {
+        return text.to_string();
+    }
+    // 只剩注释：优先还原注释掉的 `# []` 占位
+    if let Some(pos) = text.find('#') {
+        let _ = pos;
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut restored = false;
+        for l in text.lines() {
+            let t = l.trim();
+            if !restored && t.starts_with('#') {
+                let body = t.trim_start_matches('#').trim();
+                if body == "[]" {
+                    out_lines.push("[]".to_string());
+                    restored = true;
+                    continue;
+                }
+            }
+            out_lines.push(l.to_string());
+        }
+        if restored {
+            let mut s = out_lines.join("\n");
+            if text.ends_with('\n') {
+                s.push('\n');
+            }
+            return s;
+        }
+    }
+    // 无可还原占位：空文件或纯注释 → 补 `[]`
+    if text.is_empty() || text.ends_with('\n') {
+        format!("{text}[]\n")
+    } else {
+        format!("{text}\n[]\n")
+    }
+}
+
+/// 包自身 patch 的「邻居行」与「停用载体」识别（market `foreignRowIds` /
+/// `carrierDisableIds` 等价）：
+/// - foreign：顶层 `- id:` 行且**不在**本包 insert 列表（对其他插件的重配/停用）
+/// - carrier：foreign 中带 `disabled: true` 的（禁用载体，#224）
+/// 用于决定停用时是否可以把包从 `dsh.profile.bundles` 里摘掉：
+/// 摘掉 = 整包 patch 失效，会把邻居的配置一起带走（#147）。
+pub fn package_patch_foreign_and_carriers(content: &str) -> (Vec<String>, Vec<String>) {
+    let inserted: std::collections::HashSet<String> =
+        parse_insert_entries(content).into_iter().map(|(id, _)| id).collect();
+    let mut foreign: Vec<String> = Vec::new();
+    let mut carriers: Vec<String> = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut in_insert = false;
+    let mut insert_indent = 0usize;
+    for (index, raw) in lines.iter().enumerate() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let t = line.trim_start();
+        if t.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - t.len();
+        if t.starts_with("- insert:") || t == "- insert" {
+            in_insert = true;
+            insert_indent = indent;
+            continue;
+        }
+        if in_insert {
+            if t.starts_with("- ") && indent <= insert_indent {
+                in_insert = false;
+                // 落回顶层处理
+            } else {
+                continue;
+            }
+        }
+        if !t.starts_with("- ") && t != "-" {
+            continue;
+        }
+        let body = t.strip_prefix("-").unwrap_or(t).trim_start();
+        let (id, _) = parse_id_name(body);
+        if id.is_empty() || inserted.contains(&id) {
+            continue;
+        }
+        let mut disabled_true = false;
+        for j in index + 1..lines.len() {
+            let t2 = lines[j].trim_start();
+            if t2.starts_with("- ") || t2 == "-" || t2.is_empty() {
+                break;
+            }
+            if let Some(rest) = t2.strip_prefix("disabled:") {
+                if rest.trim() == "true" {
+                    disabled_true = true;
+                }
+            }
+        }
+        if !foreign.contains(&id) {
+            foreign.push(id.clone());
+        }
+        if disabled_true && !carriers.contains(&id) {
+            carriers.push(id);
+        }
+    }
+    (foreign, carriers)
+}
+
 /// 解析 bundle patch 中 `insert:` 块内的条目，返回 (id, name) 列表。
 /// 只收集 insert 列表里的行；顶层 `- id:` 覆盖项不算。
 /// 形如：
@@ -738,5 +904,57 @@ mod tests {
         let out = set_plugin_disabled_for(content, "mcp-dsh-computer-use-win", None, true).unwrap();
         assert!(is_plugin_disabled(&out, "mcp-dsh-computer-use-win", None));
         assert!(out.contains("serverName: wincu"), "config 必须保留: {out}");
+    }
+
+    // ===== 卸载收尾：remove_row_blocks / 占位恢复 / foreign-carrier =====
+
+    #[test]
+    fn test_remove_row_blocks_simple_shapes() {
+        // 两行块（row_block）与三行块（id+name+disabled）都删；用户长条目保留
+        let content = "- id: keep-me\n  config:\n    x: 1\n- id: codex-ui\n  disabled: true\n- id: pet\n  name: 'dsh-whale-girl-pet'\n  disabled: false\n- id: rich\n  name: foo\n  config:\n    y: 2\n  disabled: true\n";
+        let out = remove_row_blocks(content, &["codex-ui".into(), "pet".into()]);
+        assert!(!out.contains("- id: codex-ui"), "{out}");
+        assert!(!out.contains("- id: pet"), "{out}");
+        assert!(out.contains("- id: keep-me"), "其他条目保留: {out}");
+        assert!(out.contains("- id: rich"), "用户长条目保留: {out}");
+        assert!(out.contains("y: 2"), "{out}");
+    }
+
+    #[test]
+    fn test_remove_row_blocks_emptied_gets_placeholder() {
+        // 删空后的 patch 必须是合法 YAML 列表 `[]`，否则下次启用会写挂 profile
+        let content = "- id: a\n  disabled: true\n";
+        let out = remove_row_blocks(content, &["a".into()]);
+        assert_eq!(out.trim(), "[]", "删空应补 [] 占位: {out:?}");
+
+        let commented = "# note\n# []\n- id: a\n  disabled: true\n";
+        let out2 = remove_row_blocks(commented, &["a".into()]);
+        assert!(out2.contains("[]"), "注释占位应还原: {out2:?}");
+        assert!(out2.contains("# note"), "注释保留: {out2:?}");
+    }
+
+    #[test]
+    fn test_remove_row_blocks_unknown_id_is_noop() {
+        let content = "- id: a\n  disabled: true\n";
+        assert_eq!(remove_row_blocks(content, &["b".into()]), content);
+    }
+
+    #[test]
+    fn test_foreign_and_carriers_detection() {
+        // 包 patch：insert 自己的行 + 顶层重配邻居 + 顶层停用他人（载体）
+        let patch = "- insert:\n    - id: mine\n      name: 'my-pkg'\n- id: neighbour\n  config:\n    a: 1\n- id: victim\n  disabled: true\n";
+        let (foreign, carriers) = package_patch_foreign_and_carriers(patch);
+        assert!(foreign.contains(&"neighbour".to_string()), "{foreign:?}");
+        assert!(foreign.contains(&"victim".to_string()), "{foreign:?}");
+        assert!(!foreign.contains(&"mine".to_string()), "insert 行不算 foreign: {foreign:?}");
+        assert_eq!(carriers, vec!["victim".to_string()], "disabled:true 的他人行 = 停用载体");
+    }
+
+    #[test]
+    fn test_foreign_empty_for_self_only_patch() {
+        let patch = "- insert:\n    - id: mine\n      name: 'my-pkg'\n";
+        let (foreign, carriers) = package_patch_foreign_and_carriers(patch);
+        assert!(foreign.is_empty());
+        assert!(carriers.is_empty());
     }
 }

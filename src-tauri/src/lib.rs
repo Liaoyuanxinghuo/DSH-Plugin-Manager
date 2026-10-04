@@ -719,6 +719,86 @@ fn read_disabled_ids(profile_dir: &std::path::Path) -> Vec<String> {
     }
 }
 
+/// 基础组合包：不可停用、不可卸载（动了 profile 直接起不来）
+const INBOX_BUNDLES: [&str; 3] = [
+    "@deepseek-ai/dsh-base",
+    "@deepseek-ai/dsh-web-app",
+    "@deepseek-ai/dsh-headless",
+];
+
+/// npm 包名校验（market NPM_NAME_RE 等价）：防止 `../../evil` 之类拼进
+/// node_modules 清理路径。可选 @scope/，段内仅 [a-z0-9._-]，不以 . 或 _ 开头。
+fn is_valid_npm_name(name: &str) -> bool {
+    fn seg_ok(p: &str) -> bool {
+        !p.is_empty()
+            && !p.starts_with('.')
+            && !p.starts_with('_')
+            && p
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    }
+    if name.is_empty() || name.len() > 214 {
+        return false;
+    }
+    if let Some(scoped) = name.strip_prefix('@') {
+        let parts: Vec<&str> = scoped.split('/').collect();
+        return parts.len() == 2 && parts.iter().all(|p| seg_ok(p));
+    }
+    !name.contains('/') && seg_ok(name)
+}
+
+/// 停用/启用时是否可以动 `dsh.profile.bundles`（market #224/#147 `stackToggle` 等价）：
+/// inbox 永不动；带「邻居行」（patch 重配他人）的组合包不动 —— 摘掉整包会把邻居
+/// 配置一起带走；「停用载体」（patch 停用他人）必须动 —— 否则它的停用每个 boot
+/// 都生效；普通组合包照常动。
+fn should_toggle_bundle_layer(
+    is_inbox: bool,
+    declares: bool,
+    foreign_empty: bool,
+    is_carrier: bool,
+) -> bool {
+    !is_inbox && declares && (is_carrier || foreign_empty)
+}
+
+/// 读包自身 patch（declared `dsh.bundle.patch` + 根 `cordis.patch.yml`）的
+/// 邻居行 / 停用载体（market `foreignRowIds` / `carrierDisableIds` 等价）
+fn package_patch_roles(
+    profile_dir: &std::path::Path,
+    package_name: &str,
+) -> (Vec<String>, Vec<String>) {
+    use std::collections::HashSet;
+    fn collect(text: &str, foreign: &mut HashSet<String>, carriers: &mut HashSet<String>) {
+        let (f, c) = patchfile::package_patch_foreign_and_carriers(text);
+        foreign.extend(f);
+        carriers.extend(c);
+    }
+    let pkg_dir = profile_dir.join("node_modules").join(package_name);
+    let mut foreign: HashSet<String> = HashSet::new();
+    let mut carriers: HashSet<String> = HashSet::new();
+    if let Ok(raw) = std::fs::read_to_string(pkg_dir.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(rel) = json
+                .get("dsh")
+                .and_then(|d| d.get("bundle"))
+                .and_then(|b| b.get("patch"))
+                .and_then(|p| p.as_str())
+            {
+                if let Ok(text) = std::fs::read_to_string(pkg_dir.join(rel.trim_start_matches("./"))) {
+                    collect(&text, &mut foreign, &mut carriers);
+                }
+            }
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(pkg_dir.join("cordis.patch.yml")) {
+        collect(&text, &mut foreign, &mut carriers);
+    }
+    let mut f: Vec<String> = foreign.into_iter().collect();
+    let mut c: Vec<String> = carriers.into_iter().collect();
+    f.sort();
+    c.sort();
+    (f, c)
+}
+
 /// 设置插件启用/停用。
 /// market #696 B：**两层同写** —— patch 行 `disabled` + `dsh.profile.bundles`，
 /// 只写一层就会「开关不同步」。inbox bundle 不动 bundles；带 foreign 行的组合包只写 patch。
@@ -738,28 +818,42 @@ async fn set_plugin_enabled_cmd(
         if !profile_dir.is_dir() {
             return Err(format!("profile 目录不存在: {}", profile_dir.display()));
         }
+        if !is_valid_npm_name(&package_name) {
+            return Err("非法插件包名".to_string());
+        }
+        if INBOX_BUNDLES.contains(&package_name.as_str()) && !enabled {
+            return Err(format!(
+                "「{package_name}」是基础组合包，停用会导致 profile 无法启动，已拒绝"
+            ));
+        }
         let patch_path = profile_dir.join("cordis.patch.yml");
         let service_map = load_service_map(&env, &profile);
         let entries = service_entries_for_plugin(&profile_dir, &service_map, &package_name);
 
+        // bundles 层开关决策（market #224/#147 stackToggle）
+        let (foreign, carriers) = package_patch_roles(&profile_dir, &package_name);
+        let stack_toggle = should_toggle_bundle_layer(
+            INBOX_BUNDLES.contains(&package_name.as_str()),
+            declares_bundle(&profile_dir, &package_name),
+            foreign.is_empty(),
+            !carriers.is_empty(),
+        );
+
         // 1) patch 行层（market `rowBlock` 格式）
-        let mut content = std::fs::read_to_string(&patch_path).unwrap_or_default();
+        let orig_patch = std::fs::read_to_string(&patch_path).unwrap_or_default();
+        let mut new_patch = orig_patch.clone();
         for (sid, mod_name) in &entries {
-            content =
-                patchfile::set_plugin_disabled_for(&content, sid, mod_name.as_deref(), !enabled)?;
-        }
-        let orig = std::fs::read_to_string(&patch_path).unwrap_or_default();
-        if content != orig {
-            std::fs::write(&patch_path, content).map_err(|e| format!("写入 patch 失败: {e}"))?;
+            new_patch =
+                patchfile::set_plugin_disabled_for(&new_patch, sid, mod_name.as_deref(), !enabled)?;
         }
 
-        // 2) bundles 层（market `addProfileBundle`/`removeProfileBundle`）
-        //    inbox bundle 永不改动；关闭保留依赖、只动 dsh.profile.bundles
-        const INBOX: [&str; 3] = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "@deepseek-ai/dsh-headless"];
-        if !INBOX.contains(&package_name.as_str()) && declares_bundle(&profile_dir, &package_name) {
-            let pj_path = profile_dir.join("package.json");
-            let pj_raw = std::fs::read_to_string(&pj_path).unwrap_or_default();
-            if let Ok(mut pj) = serde_json::from_str::<serde_json::Value>(&pj_raw) {
+        // 2) bundles 层（market `addProfileBundle`/`removeProfileBundle`）。
+        //    inbox / 邻居行组合包不动；关闭保留依赖、只动 dsh.profile.bundles
+        let pj_path = profile_dir.join("package.json");
+        let orig_pj = std::fs::read_to_string(&pj_path).unwrap_or_default();
+        let mut new_pj: Option<String> = None;
+        if stack_toggle {
+            if let Ok(mut pj) = serde_json::from_str::<serde_json::Value>(&orig_pj) {
                 let bundles = pj
                     .get_mut("dsh")
                     .and_then(|d| d.get_mut("profile"))
@@ -776,11 +870,24 @@ async fn set_plugin_enabled_cmd(
                     if enabled != has {
                         let out = serde_json::to_string_pretty(&pj)
                             .map_err(|e| format!("序列化 package.json 失败: {e}"))?;
-                        std::fs::write(&pj_path, out + "\n")
-                            .map_err(|e| format!("写入 package.json 失败: {e}"))?;
+                        new_pj = Some(out + "\n");
                     }
                 }
             }
+        }
+
+        // 两层同进同退（#696）：第二步失败回滚第一步，避免「行层已关、bundles 还在」
+        if new_patch != orig_patch {
+            std::fs::write(&patch_path, &new_patch)
+                .map_err(|e| format!("写入 patch 失败: {e}"))?;
+            if let Some(np) = new_pj {
+                if let Err(e) = std::fs::write(&pj_path, &np) {
+                    let _ = std::fs::write(&patch_path, &orig_patch);
+                    return Err(format!("写入 package.json 失败（patch 已回滚）: {e}"));
+                }
+            }
+        } else if let Some(np) = new_pj {
+            std::fs::write(&pj_path, np).map_err(|e| format!("写入 package.json 失败: {e}"))?;
         }
 
         // 返回新的禁用列表
@@ -2516,7 +2623,11 @@ async fn install_plugin_cmd(
     .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
-/// 卸载插件
+/// 卸载插件：`dsh plugin remove` + 磁盘真相收尾（market `removeAndReconcile` 等价）。
+/// - **运行中允许卸载**（与 market 一致）：文件被占用导致的半截失败由磁盘真相收尾兜底
+/// - 基础组合包拒绝；包名校验防路径穿越
+/// - 删除**前**捕获补丁行 id（包删掉后它的 bundle patch 就读不到了）
+/// - 结束后按磁盘真相清理：幽灵清单行 / host 悬空桥接链接 / orphan 停用行
 #[tauri::command]
 async fn remove_plugin_cmd(
     app: tauri::AppHandle,
@@ -2530,12 +2641,53 @@ async fn remove_plugin_cmd(
     if env.run_command.trim().is_empty() {
         return Err("该环境未绑定 dsh 运行时，无法卸载插件".to_string());
     }
+    if INBOX_BUNDLES.contains(&name.as_str()) {
+        return Err(format!("「{name}」是基础组合包，不支持卸载"));
+    }
+    if !is_valid_npm_name(&name) {
+        return Err("非法插件包名".to_string());
+    }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    let profile_dir = profiles_dir.join(&profile);
+    // 删除前捕获行 id 与 host 目录（删除后包 manifest / 投射链接语境会变）
+    let service_map = load_service_map(&env, &profile);
+    let row_ids: Vec<String> = service_entries_for_plugin(&profile_dir, &service_map, &name)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    let host_dir: Option<PathBuf> = runner::resolve_dsh_launcher(&env)
+        .ok()
+        .and_then(|(_, binjs)| std::path::Path::new(&binjs).parent().map(|p| p.to_path_buf()));
     let app2 = app.clone();
     let env2 = env.clone();
     // pnpm 子进程较久，放阻塞线程池
     tauri::async_runtime::spawn_blocking(move || {
-        Ok(installer::remove_plugin(&app2, &env2, &profile, &name, &profiles_dir))
+        let mut outcome = installer::remove_plugin(&app2, &env2, &profile, &name, &profiles_dir);
+        let note = profile_io::reconcile_after_remove(
+            &profile_dir,
+            host_dir.as_deref(),
+            &name,
+            &row_ids,
+            outcome.success,
+        );
+        // 半卸载被补全 = 卸载已最终完成，如实回报成功（不吓用户一脸「失败」）
+        if !outcome.success
+            && !profile_dir
+                .join("node_modules")
+                .join(&name)
+                .join("package.json")
+                .exists()
+        {
+            outcome.success = true;
+        }
+        if !note.is_empty() {
+            outcome.summary = if outcome.summary.is_empty() {
+                note
+            } else {
+                format!("{}；{}", outcome.summary, note)
+            };
+        }
+        Ok(outcome)
     })
     .await
     .map_err(|e| format!("后台任务失败：{e}"))?
@@ -3047,13 +3199,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.13_x64-setup.exe", "0.3.13"));
-        assert!(asset_matches("dsh-manager_0.3.13_x64-setup.exe", "0.3.13"));
-        assert!(asset_matches("任意名_0.3.13_x64-setup.exe", "0.3.13"));
-        assert!(!asset_matches("DSH-Manager-0.3.13-win-x64.exe", "0.3.13"));
-        assert!(!asset_matches("DSH Manager_0.3.13_x64-setup.exe.sha256", "0.3.13"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.13"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.13"));
+        assert!(asset_matches("DSH Manager_0.3.14_x64-setup.exe", "0.3.14"));
+        assert!(asset_matches("dsh-manager_0.3.14_x64-setup.exe", "0.3.14"));
+        assert!(asset_matches("任意名_0.3.14_x64-setup.exe", "0.3.14"));
+        assert!(!asset_matches("DSH-Manager-0.3.14-win-x64.exe", "0.3.14"));
+        assert!(!asset_matches("DSH Manager_0.3.14_x64-setup.exe.sha256", "0.3.14"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.14"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.14"));
     }
 
     #[test]
@@ -3186,10 +3338,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.13_x64-setup.exe", "0.3.13"));
+        assert!(asset_matches("DSH.Manager_0.3.14_x64-setup.exe", "0.3.14"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.13_x64-setup.exe", "0.3.13"));
-        assert!(asset_matches("DSH.MANAGER_0.3.13_X64-SETUP.EXE", "0.3.13"));
+        assert!(asset_matches("dsh.manager_0.3.14_x64-setup.exe", "0.3.14"));
+        assert!(asset_matches("DSH.MANAGER_0.3.14_X64-SETUP.EXE", "0.3.14"));
     }
 
     #[test]
@@ -3197,7 +3349,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.13", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.14", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }
@@ -3315,6 +3467,59 @@ mod tests {
             run_key("e1", p2, "web"),
             "同环境不同来源目录同 profile 应区分"
         );
+    }
+
+    #[test]
+    fn npm_name_validation_blocks_path_traversal() {
+        assert!(is_valid_npm_name("dshmarket"));
+        assert!(is_valid_npm_name("@michengai/dsh-codex-ui"));
+        assert!(is_valid_npm_name("dsh-plugin-edit-message"));
+        assert!(!is_valid_npm_name(""));
+        assert!(!is_valid_npm_name(".."));
+        assert!(!is_valid_npm_name("../evil"));
+        assert!(!is_valid_npm_name("..\\evil"));
+        assert!(!is_valid_npm_name("@a/../../x"));
+        assert!(!is_valid_npm_name("a/b"));
+        assert!(!is_valid_npm_name(".hidden"));
+        assert!(!is_valid_npm_name("_private"));
+        assert!(!is_valid_npm_name("@scope/"));
+    }
+
+    #[test]
+    fn bundle_layer_toggle_matches_market_stack_rules() {
+        // 普通组合包：照常动 bundles
+        assert!(should_toggle_bundle_layer(false, true, true, false));
+        // inbox：永不动
+        assert!(!should_toggle_bundle_layer(true, true, true, false));
+        // 非组合包：不动
+        assert!(!should_toggle_bundle_layer(false, false, true, false));
+        // 邻居行（重配他人，非载体）：不动（#147，摘掉会带走邻居配置）
+        assert!(!should_toggle_bundle_layer(false, true, false, false));
+        // 停用载体（停用他人）：必须动（#224，否则停用每个 boot 都生效）
+        assert!(should_toggle_bundle_layer(false, true, false, true));
+    }
+
+    /// 系统测试：对本机真实安装的包 patch 做载体/邻居行识别（#224 真实样本）
+    #[test]
+    fn package_patch_roles_detects_real_disable_carrier() {
+        let dir = std::path::Path::new(
+            "C:/Users/xiaolei/.dsh-packs/better-deepseek-harness/profiles/better-deepseek-harness-1",
+        );
+        if !dir.is_dir() {
+            return;
+        }
+        // @michengai/dsh-codex-ui：顶层停用官方 ui-sidebar 等 = 停用载体
+        let (foreign, carriers) = package_patch_roles(dir, "@michengai/dsh-codex-ui");
+        assert!(carriers.contains(&"ui-sidebar".to_string()), "载体行: {carriers:?}");
+        assert!(carriers.contains(&"ui-settings-general".to_string()), "{carriers:?}");
+        assert!(carriers.contains(&"session-title-llm".to_string()), "{carriers:?}");
+        assert!(!foreign.contains(&"codex-ui".to_string()), "insert 行不算 foreign: {foreign:?}");
+        // 载体停用时必须动 bundles（否则三条官方禁用每个 boot 都生效）
+        assert!(should_toggle_bundle_layer(false, true, foreign.is_empty(), !carriers.is_empty()));
+        // dshmarket：只 insert 自己 → 普通组合包路径
+        let (f2, c2) = package_patch_roles(dir, "dshmarket");
+        assert!(f2.is_empty() && c2.is_empty(), "dshmarket 不应有邻居行: {f2:?} {c2:?}");
+        assert!(should_toggle_bundle_layer(false, true, true, false));
     }
 
     #[test]

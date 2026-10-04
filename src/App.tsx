@@ -2643,7 +2643,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.13</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.14</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

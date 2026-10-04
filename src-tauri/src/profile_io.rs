@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -485,6 +485,175 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
+// ==================== 卸载收尾（market removeAndReconcile / dropFromManifest 等价） ====================
+
+/// 半卸载修复：`dsh plugin remove` 可能在删掉 node_modules 之后、写回
+/// package.json 之前失败（文件被占用中止）。磁盘上包已消失而清单还引用它时，
+/// 下次启动会因幽灵依赖直接挂掉。按磁盘真相补全：删 dependencies 与
+/// dsh.profile.bundles 里的残留行（market `dropFromManifest` 等价）。
+/// 临时文件 + rename 原子写，避免半截清单。返回清单是否被改动。
+pub fn drop_from_manifest(profile_dir: &Path, name: &str) -> Result<bool, String> {
+    let file = profile_dir.join("package.json");
+    let raw = fs::read_to_string(&file).map_err(|e| format!("读取 package.json 失败: {e}"))?;
+    let mut pj: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 package.json 失败: {e}"))?;
+    let mut touched = false;
+    if let Some(deps) = pj.get_mut("dependencies").and_then(|d| d.as_object_mut()) {
+        if deps.remove(name).is_some() {
+            touched = true;
+        }
+    }
+    if let Some(bundles) = pj
+        .get_mut("dsh")
+        .and_then(|d| d.get_mut("profile"))
+        .and_then(|p| p.get_mut("bundles"))
+        .and_then(|b| b.as_array_mut())
+    {
+        let before = bundles.len();
+        bundles.retain(|v| v.as_str() != Some(name));
+        if bundles.len() != before {
+            touched = true;
+        }
+    }
+    if !touched {
+        return Ok(false);
+    }
+    let out = serde_json::to_string_pretty(&pj).map_err(|e| format!("序列化失败: {e}"))?;
+    let tmp = profile_dir.join("package.json.dshpm-tmp");
+    fs::write(&tmp, out + "\n").map_err(|e| format!("写入临时清单失败: {e}"))?;
+    fs::rename(&tmp, &file).map_err(|e| format!("替换 package.json 失败: {e}"))?;
+    Ok(true)
+}
+
+/// host 部署目录对应的 node_modules 根（market `hostNodeModulesRoot` 等价）：
+/// CLI 布局 `<prefix>/node_modules/@deepseek-ai/dsh` → `<prefix>/node_modules`；
+/// 平铺布局（Desktop）→ `<dir>/node_modules`。
+pub fn host_node_modules_root(host_dir: &Path) -> PathBuf {
+    let p = host_dir;
+    let is_cli_layout = p.file_name().map(|n| n == "dsh").unwrap_or(false)
+        && p.parent()
+            .and_then(|x| x.file_name())
+            .map(|n| n == "@deepseek-ai")
+            .unwrap_or(false)
+        && p
+            .parent()
+            .and_then(|x| x.parent())
+            .and_then(|x| x.file_name())
+            .map(|n| n.eq_ignore_ascii_case("node_modules"))
+            .unwrap_or(false);
+    if is_cli_layout {
+        return p.parent().and_then(|x| x.parent()).unwrap_or(p).to_path_buf();
+    }
+    p.join("node_modules")
+}
+
+/// 归一化链接目标再比较（去 `\\?\` / `\??\` 设备前缀；Windows 大小写不敏感）
+fn points_at_profile_package(target: &Path, expected: &Path) -> bool {
+    fn normalize(p: &Path) -> PathBuf {
+        let s = p.to_string_lossy();
+        let s = s.strip_prefix(r"\\?\UNC\").map(|r| format!(r"\\{r}")).unwrap_or_else(|| s.to_string());
+        let s = s
+            .strip_prefix(r"\\?\")
+            .or_else(|| s.strip_prefix(r"\??\"))
+            .unwrap_or(&s)
+            .to_string();
+        PathBuf::from(s)
+    }
+    let left = normalize(target);
+    let right = normalize(expected);
+    if cfg!(windows) {
+        left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+    } else {
+        left == right
+    }
+}
+
+/// 官方启动会把 profile 的包以链接（Junction/Symlink）投射到 host 部署的
+/// node_modules，且从不回收；`dsh plugin remove` 也不知道它们的存在。
+/// 不清理的话坏链接会让 rg 等按 lstat 遍历的工具当场失败（market #662）。
+/// 只在「host 侧入口是链接、指向本 profile 的该包副本、且副本确已消失」时删除。
+/// 返回是否删掉了悬空桥。
+pub fn remove_dangling_host_bridge(host_dir: Option<&Path>, profile_dir: &Path, name: &str) -> bool {
+    let Some(host) = host_dir else {
+        return false;
+    };
+    let bridge = host_node_modules_root(host).join(name);
+    let unlinked = profile_dir.join("node_modules").join(name);
+    // 包还在磁盘上 → 桥仍有效，绝不动
+    if unlinked.join("package.json").exists() {
+        return false;
+    }
+    let Ok(md) = fs::symlink_metadata(&bridge) else {
+        return false;
+    };
+    if !md.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(target) = fs::read_link(&bridge) else {
+        return false;
+    };
+    if !points_at_profile_package(&target, &unlinked) {
+        return false;
+    }
+    // 目录链接（Junction/dir symlink）与文件链接的删除 API 不同；
+    // symlink_metadata 的 is_dir() 对链接恒为 false，故两种都试。
+    let removed = fs::remove_dir(&bridge).or_else(|_| fs::remove_file(&bridge));
+    removed.is_ok()
+}
+
+/// 卸载收尾总入口：按磁盘真相补全 CLI 可能没做完的清理。
+/// - CLI 成功：清单已由 CLI 调和，只清悬空桥 + 补丁行块
+/// - CLI 失败但包已消失（半卸载）：补删清单行 + 悬空桥 + 补丁行块
+/// - CLI 失败且包仍在：什么都不动（保留清单供重试）
+/// `row_ids` 必须在删除**前**捕获（删除后包的 bundle patch 已读不到）。
+/// 返回给用户看的收尾说明（可为空）。
+pub fn reconcile_after_remove(
+    profile_dir: &Path,
+    host_dir: Option<&Path>,
+    name: &str,
+    row_ids: &[String],
+    cli_ok: bool,
+) -> String {
+    let pkg_gone = !profile_dir
+        .join("node_modules")
+        .join(name)
+        .join("package.json")
+        .exists();
+    if !cli_ok && !pkg_gone {
+        return "卸载失败且插件仍在磁盘，清单已保留，可重试".to_string();
+    }
+    let mut notes: Vec<String> = Vec::new();
+    if pkg_gone {
+        match drop_from_manifest(profile_dir, name) {
+            Ok(true) => notes.push("已按磁盘真相补全 package.json 清理".to_string()),
+            Ok(false) => {}
+            Err(e) => notes.push(format!("package.json 清理失败: {e}")),
+        }
+        if remove_dangling_host_bridge(host_dir, profile_dir, name) {
+            notes.push("已清理 host node_modules 悬空桥接链接".to_string());
+        }
+    }
+    // 行块清理：CLI 成功或半卸载都要做，卸载后不应留 orphan disabled 行
+    let patch_path = profile_dir.join("cordis.patch.yml");
+    if let Ok(content) = fs::read_to_string(&patch_path) {
+        let next = crate::patchfile::remove_row_blocks(&content, row_ids);
+        if next != content {
+            if let Err(e) = fs::write(&patch_path, &next) {
+                notes.push(format!("补丁行清理失败: {e}"));
+            } else {
+                notes.push("已清理 cordis.patch.yml 中的残留停用行".to_string());
+            }
+        }
+    }
+    if !cli_ok {
+        notes.insert(
+            0,
+            "CLI 未正常结束但插件已从磁盘消失，已按磁盘真相完成卸载".to_string(),
+        );
+    }
+    notes.join("；")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +803,128 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         let r = import_profile(&zip, &target);
         assert!(r.is_err());
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    // ===== 卸载收尾：drop_from_manifest / 悬空桥 / reconcile =====
+
+    #[test]
+    fn test_drop_from_manifest_removes_dep_and_bundle() {
+        let work = std::env::temp_dir().join(format!("dshpm-dropman-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        fs::write(
+            work.join("package.json"),
+            r#"{"name":"p","dependencies":{"ghost":"1.0.0","keep":"2.0.0"},"dsh":{"profile":{"bundles":["keep","ghost"]}}}"#,
+        )
+        .unwrap();
+        assert!(drop_from_manifest(&work, "ghost").unwrap());
+        let raw = fs::read_to_string(work.join("package.json")).unwrap();
+        let pj: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(pj["dependencies"].get("ghost").is_none(), "{raw}");
+        assert_eq!(pj["dependencies"]["keep"], "2.0.0");
+        let bundles = pj["dsh"]["profile"]["bundles"].as_array().unwrap();
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0], "keep");
+        // 幂等：第二次无事可做
+        assert!(!drop_from_manifest(&work, "ghost").unwrap());
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn test_host_node_modules_root_layouts() {
+        // CLI 布局：<prefix>/node_modules/@deepseek-ai/dsh → <prefix>/node_modules
+        let cli = PathBuf::from(r"C:\dsh-versions\dsh-0.2.0-rc.1\node_modules\@deepseek-ai\dsh");
+        assert_eq!(
+            host_node_modules_root(&cli),
+            PathBuf::from(r"C:\dsh-versions\dsh-0.2.0-rc.1\node_modules")
+        );
+        // 平铺布局：<dir> → <dir>/node_modules
+        let flat = PathBuf::from(r"C:\app\dependencies\dsh");
+        assert_eq!(
+            host_node_modules_root(&flat),
+            PathBuf::from(r"C:\app\dependencies\dsh\node_modules")
+        );
+    }
+
+    /// 系统级功能测试：真实 Junction/目录符号链接的悬空桥清理
+    #[test]
+    fn test_remove_dangling_host_bridge() {
+        let work = std::env::temp_dir().join(format!("dshpm-bridge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        let profile = work.join("profiles").join("p1");
+        let host = work.join("host");
+        let pkg = profile.join("node_modules").join("my-plugin");
+        let host_nm = host.join("node_modules");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::create_dir_all(&host_nm).unwrap();
+        fs::write(pkg.join("package.json"), "{}").unwrap();
+
+        // 桥 = host node_modules 下指向 profile 包副本的目录符号链接
+        let bridge = host_nm.join("my-plugin");
+        std::os::windows::fs::symlink_dir(&pkg, &bridge).unwrap();
+
+        // 包还在 → 桥有效，不动
+        assert!(!remove_dangling_host_bridge(Some(&host), &profile, "my-plugin"));
+        assert!(bridge.exists() || fs::symlink_metadata(&bridge).is_ok());
+
+        // 包消失（半卸载）→ 悬空桥删除
+        fs::remove_file(pkg.join("package.json")).unwrap();
+        assert!(remove_dangling_host_bridge(Some(&host), &profile, "my-plugin"));
+        assert!(fs::symlink_metadata(&bridge).is_err(), "悬空桥应被删除");
+
+        // 指向别处的链接不删
+        let other = work.join("elsewhere");
+        fs::create_dir_all(&other).unwrap();
+        std::os::windows::fs::symlink_dir(&other, &bridge).unwrap();
+        assert!(!remove_dangling_host_bridge(Some(&host), &profile, "my-plugin"));
+        assert!(fs::symlink_metadata(&bridge).is_ok(), "他人链接必须保留");
+
+        // host 缺失 → no-op
+        assert!(!remove_dangling_host_bridge(None, &profile, "my-plugin"));
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    /// 系统级功能测试：半卸载（CLI 失败但包已消失）→ 补全清单 + 行块清理
+    #[test]
+    fn test_reconcile_after_remove_half_uninstall() {
+        let work = std::env::temp_dir().join(format!("dshpm-recon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        let profile = work.join("profiles").join("p1");
+        fs::create_dir_all(profile.join("node_modules")).unwrap();
+        fs::write(
+            profile.join("package.json"),
+            r#"{"name":"p","dependencies":{"ghost":"1.0.0"},"dsh":{"profile":{"bundles":["ghost"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            profile.join("cordis.patch.yml"),
+            "- id: ghost\n  disabled: true\n- id: other\n  disabled: true\n",
+        )
+        .unwrap();
+
+        // 半卸载：CLI 失败、包已不在磁盘
+        let note = reconcile_after_remove(&profile, None, "ghost", &["ghost".to_string()], false);
+        assert!(!note.is_empty(), "应有收尾说明");
+        let raw = fs::read_to_string(profile.join("package.json")).unwrap();
+        assert!(!raw.contains("ghost"), "幽灵依赖应被清掉: {raw}");
+        let patch = fs::read_to_string(profile.join("cordis.patch.yml")).unwrap();
+        assert!(!patch.contains("- id: ghost"), "orphan 行应被清掉: {patch}");
+        assert!(patch.contains("- id: other"), "他人行保留: {patch}");
+
+        // CLI 失败且包仍在 → 不动清单（可重试）
+        fs::create_dir_all(profile.join("node_modules").join("stillhere")).unwrap();
+        fs::write(profile.join("node_modules").join("stillhere").join("package.json"), "{}").unwrap();
+        fs::write(
+            profile.join("package.json"),
+            r#"{"name":"p","dependencies":{"stillhere":"1.0.0"}}"#,
+        )
+        .unwrap();
+        let note2 = reconcile_after_remove(&profile, None, "stillhere", &[], false);
+        assert!(note2.contains("重试"), "{note2}");
+        let raw2 = fs::read_to_string(profile.join("package.json")).unwrap();
+        assert!(raw2.contains("stillhere"), "失败且仍在磁盘时不得动清单: {raw2}");
+
         let _ = fs::remove_dir_all(&work);
     }
 }
