@@ -2,6 +2,7 @@
   "name": "dsh-manager",
   "private": true,
   "version": "0.3.14",
+  "license": "CC-BY-NC-SA-4.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

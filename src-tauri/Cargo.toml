@@ -4,6 +4,7 @@ version = "0.3.14"
 description = "DSH Manager - 图形化 DSH 环境与插件管理工具"
 authors = ["dshpm"]
 edition = "2021"
+license = "CC-BY-NC-SA-4.0"
 
 [lib]
 name = "dsh_manager_lib"
