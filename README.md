@@ -331,9 +331,7 @@ dshcjaz/
 | 应用设置（镜像源、DSH 下载目录）    | `%AppData%\dsh-plugin-manager\settings.json`           |
 | 排序与上次选择（localStorage） | 随应用数据目录                                                |
 | Profile（默认）           | `~/.dsh/profiles`                                      |
-
 | Profile 备注              | `%AppData%\dsh-plugin-manager\profile-notes.json`      |
-
 | 整合包下载缓存             | `%AppData%\dsh-plugin-manager\packs\`                 |
 | 运行日志                  | 系统临时目录 `dshpm-run-<profile>-<ts>.log`（供「打开界面」提取 token） |
 
