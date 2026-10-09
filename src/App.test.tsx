@@ -649,6 +649,139 @@ describe("App 主界面", () => {
     localStorage.removeItem("dshpm-browser");
   });
 
+  it("左栏 DSH 条目显示运行角标：绿点+数量，悬停显示实例详情", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_running_cmd") {
+        return Promise.resolve([
+          {
+            envId: "global",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            profile: "web",
+            pid: 1,
+            port: 3080,
+            startedAt: "",
+            url: "",
+            logPath: "C:\\t\\a.log",
+          },
+          {
+            envId: "global",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            profile: "headless",
+            pid: 2,
+            port: 3081,
+            startedAt: "",
+            url: "",
+            logPath: "C:\\t\\b.log",
+          },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    // 多实例：绿点 + 数量角标
+    await waitFor(() => {
+      expect(screen.getByRole("img", { name: /运行中 2 个实例/ })).toBeInTheDocument();
+    });
+    const pill = screen.getByRole("img", { name: /运行中 2 个实例/ });
+    expect(pill.textContent).toContain("2");
+    expect(pill.className).toContain("env-run-pill");
+    // 悬停详情：逐个实例 profile@端口（自定义提示 data-tip，弹出无系统延迟）
+    const tip = pill.getAttribute("data-tip") ?? "";
+    expect(tip).toContain("web@3080");
+    expect(tip).toContain("headless@3081");
+    expect(pill.getAttribute("aria-label")).toContain("web@3080");
+  });
+
+  it("单实例只亮绿点不带数量；无实例不显示角标", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_running_cmd") {
+        return Promise.resolve([
+          {
+            envId: "global",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            profile: "web",
+            pid: 1,
+            port: 3080,
+            startedAt: "",
+            url: "",
+            logPath: "C:\\t\\a.log",
+          },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    const { unmount } = render(<App />);
+    await waitFor(() => {
+      expect(screen.getByRole("img", { name: /运行中 1 个实例/ })).toBeInTheDocument();
+    });
+    const pill = screen.getByRole("img", { name: /运行中 1 个实例/ });
+    expect(pill.textContent?.trim()).toBe("●", "单实例只有绿点，不带数字");
+    unmount();
+
+    // 无实例：无角标
+    mockInvoke.mockImplementation((cmd: string) => mockAllDefault(cmd));
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/全局 CLI/)).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("img", { name: /运行中/ })).not.toBeInTheDocument();
+  });
+
+  it("点击运行角标是纯展示：仍只是选中该 DSH 环境", async () => {
+    const env2 = {
+      id: "manual1",
+      name: "手动 DSH",
+      source: "manual",
+      version: "0.2.0",
+      homeDir: "C:\\Users\\test\\.dsh2",
+      runCommand: "dsh2",
+      binPath: null,
+      scanProfilesDir: null,
+    };
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "scan_envs") {
+        return Promise.resolve([
+          {
+            id: "global",
+            name: "全局 CLI (dsh 0.1.0-rc.7)",
+            source: "globalCli",
+            version: "0.1.0-rc.7",
+            homeDir: "C:\\Users\\test\\.dsh",
+            runCommand: "dsh",
+            binPath: "C:\\Users\\test\\AppData\\Roaming\\npm\\dsh.cmd",
+            scanProfilesDir: null,
+          },
+          env2,
+        ]);
+      }
+      if (cmd === "list_running_cmd") {
+        return Promise.resolve([
+          {
+            envId: "manual1",
+            profilesDir: "C:\\Users\\test\\.dsh2\\profiles",
+            profile: "web",
+            pid: 1,
+            port: 3090,
+            startedAt: "",
+            url: "",
+            logPath: "C:\\t\\a.log",
+          },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByRole("img", { name: /运行中 1 个实例/ })).toBeInTheDocument();
+    });
+    // 点击角标 = 点击条目本身：选中该环境，不跳转 profile
+    await user.click(screen.getByRole("img", { name: /运行中 1 个实例/ }));
+    await waitFor(() => {
+      expect(screen.getByText(/手动 DSH/).closest(".env-item")?.className).toContain("active");
+    });
+  });
+
   it("按 F12 / Ctrl+Shift+I 调用 toggle_devtools 切换调试面板", async () => {
     mockInvoke.mockImplementation((cmd: string) => mockAllDefault(cmd));
     render(<App />);

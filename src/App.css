@@ -178,6 +178,15 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .pill { font-size: 12px; padding: 3px 10px; border-radius: 12px; }
 .pill.running { background: #1f3a31; color: var(--accent); }
 .pill.stopped { background: #2a3646; color: var(--text-dim); }
+/* 左栏 DSH 条目的运行状态角标：绿点 + 多实例数量（与右栏「● 运行中」同色系）。
+   放右下角：右上角是「移除」按钮，右下最空。
+   悬浮提示用自定义 ::after（原生 title 延迟是系统级 ~1s，太慢） */
+.env-run-pill { position: absolute; right: 8px; bottom: 8px; flex-shrink: 0; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: #1f3a31; color: var(--accent); white-space: nowrap; z-index: 10; cursor: help; }
+.env-run-pill:hover { z-index: 30; }
+.env-run-pill::after { content: attr(data-tip); position: absolute; right: 0; bottom: calc(100% + 6px); background: #1c2431; color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 11px; font-weight: 400; line-height: 1.5; white-space: normal; width: max-content; max-width: 240px; opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.08s ease 0.05s, visibility 0s linear 0.13s; }
+.env-run-pill:hover::after { opacity: 1; visibility: visible; transition-delay: 0.05s, 0s; }
+/* 右上「移除」、右下运行角标都是绝对定位：文字行统一右侧留白，名称/路径不会被盖住 */
+.env-item .env-name, .env-item .env-meta { padding-right: 44px; }
 .file-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
 
 /* 插件表格 */

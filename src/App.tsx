@@ -1374,45 +1374,55 @@ export default function App() {
           </div>
           <div className="env-list" ref={envReorder.listRef}>
             {envs.length === 0 && <div className="empty">未检测到 DSH，请下载或扫描目录</div>}
-            {envs.map((env, i) => (
-              <div
-                key={env.id}
-                className={`env-item drag-item ${env.id === selectedEnv ? "active" : ""}${envReorder.dragCls(i)}`}
-                {...envReorder.bind(i)}
-                onClick={() => setSelectedEnv(env.id)}
-              >
-                <div className="env-name">
-                  <span className="drag-handle" title="拖动排序">☰</span>
-                  <span className={`dot ${env.source === "globalCli" ? "global" : env.source === "manual" ? "manual" : "scan"}`} />
-                  {env.name}
-                </div>
-                <div className="env-meta">
-                  dsh {env.version} ·{" "}
-                  {env.source === "globalCli" ? "全局" : env.source === "manual" ? "手动" : "扫描目录"}
-                </div>
-                {env.binPath && (
-                  <div className="env-meta dim" title="dsh 本体（程序）所在目录">
-                    程序: {binDir(env.binPath)}
+            {envs.map((env, i) => {
+              const insts = runnings.filter((r) => r.envId === env.id);
+              return (
+                <div
+                  key={env.id}
+                  className={`env-item drag-item ${env.id === selectedEnv ? "active" : ""}${envReorder.dragCls(i)}`}
+                  {...envReorder.bind(i)}
+                  onClick={() => setSelectedEnv(env.id)}
+                >
+                  <div className="env-name">
+                    <span className="drag-handle" title="拖动排序">☰</span>
+                    <span className={`dot ${env.source === "globalCli" ? "global" : env.source === "manual" ? "manual" : "scan"}`} />
+                    {env.name}
                   </div>
-                )}
-                <div className="env-meta dim" title="该环境管理的 profile（DSH_HOME）目录">
-                  profiles: {env.homeDir}
-                </div>
-                {(env.source === "manual" || env.source === "scanDir") && (
-                  <>
-                    <button
-                      className="btn tiny danger-inline"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setConfirmRemoveEnv({ env, isManual: env.source === "manual" });
-                      }}
+                  <div className="env-meta">
+                    dsh {env.version} ·{" "}
+                    {env.source === "globalCli" ? "全局" : env.source === "manual" ? "手动" : "扫描目录"}
+                  </div>
+                  {env.binPath && (
+                    <div className="env-meta dim" title="dsh 本体（程序）所在目录">
+                      程序: {binDir(env.binPath)}
+                    </div>
+                  )}
+                  {(env.source === "manual" || env.source === "scanDir") && (
+                    <>
+                      <button
+                        className="btn tiny danger-inline"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setConfirmRemoveEnv({ env, isManual: env.source === "manual" });
+                        }}
+                      >
+                        移除
+                      </button>
+                    </>
+                  )}
+                  {insts.length > 0 && (
+                    <span
+                      className="env-run-pill"
+                      role="img"
+                      aria-label={`运行中 ${insts.length} 个实例：${insts.map((r) => `${r.profile}@${r.port}`).join("、")}`}
+                      data-tip={`运行中 ${insts.length} 个实例：${insts.map((r) => `${r.profile}@${r.port}`).join("、")}`}
                     >
-                      移除
-                    </button>
-                  </>
-                )}
-              </div>
-            ))}
+                      ●{insts.length > 1 ? ` ${insts.length}` : ""}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
           </div>
         </section>
 
