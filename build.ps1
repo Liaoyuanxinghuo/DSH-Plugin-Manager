@@ -49,8 +49,8 @@ if ($Version) {
         # Cargo.toml / Cargo.lock：只改 dsh-manager 自身块
         foreach ($f in @("$root\src-tauri\Cargo.toml", "$root\src-tauri\Cargo.lock")) {
             $t = [IO.File]::ReadAllText($f)
-            $pat = 'name = "dsh-manager"`r`nversion = "[^"]+"'
-            $repl = 'name = "dsh-manager"`r`nversion = "' + $Version + '"'
+            $pat = 'name = "dsh-manager"\r?\nversion = "[^"]+"'
+            $repl = "name = `"dsh-manager`"`r`nversion = `"$Version`""
             $n = [regex]::Replace($t, $pat, $repl)
             if ($n -eq $t) { Fail "$f 中未找到 dsh-manager 版本块" }
             [IO.File]::WriteAllText($f, $n, $utf8NoBom)

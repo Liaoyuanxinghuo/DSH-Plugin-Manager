@@ -65,12 +65,40 @@ pub fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 从 `$DSH_HOME/.credentials.yaml` 读出 browser-session 签名密钥（32 字节原始值）。
+/// 从 DSH_HOME 读出 browser-session 签名密钥（32 字节原始值）。
+/// 查找顺序：`dsh_home/.credentials.yaml` → `dsh_home/profiles/.credentials.yaml`
+/// → 父目录 `.credentials.yaml`（结构差异兜底）。
 /// 缺文件 / 缺记录 / 长度不对均返回 None——dsh 在 Connection 激活时才创建该密钥，
 /// 首次启动或写入失败时可能没有。
 pub fn read_browser_session_secret(dsh_home: &std::path::Path) -> Option<Vec<u8>> {
-    let path = dsh_home.join(".credentials.yaml");
-    let text = std::fs::read_to_string(&path).ok()?;
+    // 1. 直接在其自身目录下查找
+    let direct = dsh_home.join(".credentials.yaml");
+    if direct.is_file() {
+        if let Some(s) = read_secret_file(&direct) {
+            return Some(s);
+        }
+    }
+    // 2. 在 profiles 子目录下查找（部分打包结构放置于此）
+    let in_profiles = dsh_home.join("profiles").join(".credentials.yaml");
+    if in_profiles.is_file() {
+        if let Some(s) = read_secret_file(&in_profiles) {
+            return Some(s);
+        }
+    }
+    // 3. 上级目录兜底（例如当前传入的 dsh_home 本身是 profiles 子目录）
+    if let Some(parent) = dsh_home.parent() {
+        let p = parent.join(".credentials.yaml");
+        if p.is_file() {
+            if let Some(s) = read_secret_file(&p) {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+fn read_secret_file(path: &std::path::Path) -> Option<Vec<u8>> {
+    let text = std::fs::read_to_string(path).ok()?;
     let doc: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
     let secret_b64 = doc
         .get("records")?
@@ -121,15 +149,16 @@ pub fn mint_cookie_value(secret: &[u8], authority: &str, issued_at: i64, expires
     format!("v1.{body}.{sig}")
 }
 
-/// 一次性本地 HTTP 跳转：浏览器访问我们的临时端口 → Set-Cookie + 303 到 DSH。
-/// cookie 不区分端口，127.0.0.1 上铸的 cookie 对 DSH 端口同样生效。
+/// 一次性本地 HTTP 跳转：浏览器访问临时端口 → 响应带 Cookie 并重定向到 DSH。
+/// 循环响应连接直至收到主跳转请求或超时，防浏览器预连接/冷启动导致端口提前关闭。
 pub struct CookieHop {
     pub hop_url: String,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CookieHop {
-    /// 启动一次性跳转服务；返回应打开的 hop_url。
+    /// 启动跳转服务；返回应打开的 hop_url。
     pub fn start(
         cookie_name: String,
         cookie_value: String,
@@ -138,30 +167,92 @@ impl CookieHop {
     ) -> std::io::Result<CookieHop> {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
         let hop_url = format!("http://127.0.0.1:{port}/");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_cloned = shutdown.clone();
+
         let join = std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf);
-                let expires = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64 + max_age_seconds)
-                    .unwrap_or(0);
-                let resp = format!(
-                    "HTTP/1.1 303 See Other\r\nCache-Control: no-store\r\nLocation: {}\r\nSet-Cookie: {}={}; Max-Age={}; Path=/; Expires={}; HttpOnly; SameSite=Strict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    redirect_to,
-                    cookie_name,
-                    cookie_value,
-                    max_age_seconds,
-                    http_date(expires),
-                );
-                let _ = sock.write_all(resp.as_bytes());
-                let _ = sock.flush();
+            let start = std::time::Instant::now();
+            let max_serve_duration = std::time::Duration::from_secs(30);
+
+            while start.elapsed() < max_serve_duration && !shutdown_cloned.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut sock, _)) => {
+                        let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(1000)));
+                        // 读满请求头再响应：只读一次就关连接时，未读完的请求字节
+                        // 会让 Windows 发 RST（浏览器拿到连接重置 → 停在随机端口页面）。
+                        let mut req: Vec<u8> = Vec::with_capacity(4096);
+                        let mut chunk = [0u8; 2048];
+                        loop {
+                            match sock.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    req.extend_from_slice(&chunk[..n]);
+                                    if req.windows(4).any(|w| w == b"\r\n\r\n") || req.len() > 16_384 {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let req_str = String::from_utf8_lossy(&req);
+
+                        // 判断是否为针对根路径或普通页面的 GET 请求
+                        let is_get = req_str.starts_with("GET ");
+                        let is_favicon = req_str.contains("favicon.ico");
+
+                        let expires = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64 + max_age_seconds)
+                            .unwrap_or(0);
+
+                        if is_get && !is_favicon {
+                            // 主导航请求：发 303 + Set-Cookie，带 Location 重定向到 DSH
+                            // 顺便显式设置 HTML 兜底 meta refresh / JS window.location，即使浏览器拦截 303 也双重跳转
+                            let html_body = format!(
+                                r#"<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url={redirect_to}"><script>window.location.replace("{redirect_to}");</script></head><body>Redirecting to DSH...</body></html>"#
+                            );
+                            let resp = format!(
+                                "HTTP/1.1 303 See Other\r\n\
+Cache-Control: no-store\r\n\
+Location: {redirect_to}\r\n\
+Set-Cookie: {cookie_name}={cookie_value}; Max-Age={max_age_seconds}; Path=/; Expires={}; HttpOnly; SameSite=Strict\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n\
+{html_body}",
+                                http_date(expires),
+                                html_body.len()
+                            );
+                            let _ = sock.write_all(resp.as_bytes());
+                            let _ = sock.flush();
+                            // 稍微留 300ms 处理可能的并发请求（如某些浏览器并行的次级连接），然后退出
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            break;
+                        } else {
+                            // 预检、favicon 或其他请求：快速返回 204 或 303
+                            let resp = format!(
+                                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                            );
+                            let _ = sock.write_all(resp.as_bytes());
+                            let _ = sock.flush();
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
             }
         });
+
         Ok(CookieHop {
             hop_url,
+            shutdown,
             join: Some(join),
         })
     }
@@ -183,6 +274,12 @@ impl CookieHop {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         false
+    }
+}
+
+impl Drop for CookieHop {
+    fn drop(&mut self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -251,9 +348,9 @@ pub fn open_web_via_cookie_hop(
     let mut hop = CookieHop::start(name, value, max_age_days * 86_400, redirect_to)
         .map_err(|e| format!("启动登录跳转失败: {e}"))?;
     crate::browsers::open_url_with(browser_exe, &hop.hop_url)?;
-    // 等浏览器来取 cookie（最多 5s），之后线程自行结束
-    hop.wait(5_000);
-    Ok(hop.hop_url)
+    // 等浏览器来取 cookie 并完成重定向跳转（最多 15s），完成后线程自动结束
+    hop.wait(15_000);
+    Ok(hop.hop_url.clone())
 }
 
 #[cfg(test)]
@@ -367,6 +464,77 @@ mod tests {
         sock.read_to_string(&mut resp).unwrap();
         assert!(resp.contains("303"), "resp={resp}");
         assert!(resp.contains("Set-Cookie: dsh-auth-test=v1.abc.sig"), "resp={resp}");
+        assert!(resp.contains("Location: http://127.0.0.1:3081/"), "resp={resp}");
+        assert!(hop.wait(3000));
+    }
+
+    /// 密钥兜底查找：`dsh_home/profiles/.credentials.yaml` 与父目录结构均能读到。
+    #[test]
+    fn secret_found_in_profiles_subdir_or_parent_dir() {
+        use std::path::PathBuf;
+        let root = std::env::temp_dir().join(format!("dshpm-sec-locate-{}", std::process::id()));
+
+        // 场景 A：密钥在 dsh_home/profiles/.credentials.yaml（打包结构差异）
+        let home_a = root.join("home-a");
+        std::fs::create_dir_all(home_a.join("profiles")).unwrap();
+        std::fs::write(
+            home_a.join("profiles").join(".credentials.yaml"),
+            "version: 1\nrecords:\n  client-connection/browser-session:\n    kind: grant\n    payload:\n      version: 1\n      secret: _DJYygmRe3RXVZb-SQF5wvwV6byRld315unRnHRgwEU\n",
+        )
+        .unwrap();
+        let s = read_browser_session_secret(&home_a).expect("应从 profiles 子目录读到密钥");
+        assert_eq!(s.len(), 32);
+
+        // 场景 B：传入的是 profiles 目录本身，密钥在其父目录
+        let home_b_root = root.join("home-b");
+        let profiles_b: PathBuf = home_b_root.join("profiles");
+        std::fs::create_dir_all(&profiles_b).unwrap();
+        std::fs::write(
+            home_b_root.join(".credentials.yaml"),
+            "version: 1\nrecords:\n  client-connection/browser-session:\n    kind: grant\n    payload:\n      version: 1\n      secret: _DJYygmRe3RXVZb-SQF5wvwV6byRld315unRnHRgwEU\n",
+        )
+        .unwrap();
+        let s = read_browser_session_secret(&profiles_b).expect("应从父目录读到密钥");
+        assert_eq!(s.len(), 32);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 修复回归：浏览器先来预连接/favicon，再发真正的 GET，
+    /// 跳转服务必须继续循环监听并把真正的 GET 响应成 303 + Set-Cookie，
+    /// 不能在第一个连接就退出（否则浏览器停在随机端口页面）。
+    #[test]
+    fn cookie_hop_survives_prefetch_then_serves_real_get() {
+        use std::io::{Read, Write};
+        let mut hop = CookieHop::start(
+            "dsh-auth-test2".into(),
+            "v1.abc.sig2".into(),
+            3600,
+            "http://127.0.0.1:3081/".into(),
+        )
+        .unwrap();
+        let url = hop.hop_url.clone();
+        let port: u16 = url
+            .trim_start_matches("http://127.0.0.1:")
+            .trim_end_matches('/')
+            .parse()
+            .unwrap();
+
+        // 第一个连接：favicon 预检（应被快速 204 吃掉，服务继续活着）
+        let mut pre = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        pre.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .unwrap();
+        let mut pre_resp = String::new();
+        pre.read_to_string(&mut pre_resp).unwrap();
+        assert!(pre_resp.contains("204"), "预检应返回 204, resp={pre_resp}");
+
+        // 第二个连接：真正的导航请求（必须仍然是 303 + Set-Cookie + Location）
+        let mut sock = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        sock.read_to_string(&mut resp).unwrap();
+        assert!(resp.contains("303"), "resp={resp}");
+        assert!(resp.contains("Set-Cookie: dsh-auth-test2=v1.abc.sig2"), "resp={resp}");
         assert!(resp.contains("Location: http://127.0.0.1:3081/"), "resp={resp}");
         assert!(hop.wait(3000));
     }

@@ -2868,12 +2868,11 @@ async fn open_dsh_web_cmd(
         }
         let port = log_path.port;
         let profiles_dir = std::path::PathBuf::from(&log_path.profiles_dir);
-        // DSH_HOME = profiles_dir 的父目录（与启动注入语义一致）
+        // DSH_HOME 优先 profiles_dir 的父目录，找不到时在 webauth 里有多级候选兜底
         let dsh_home = profiles_dir
             .parent()
             .map(|p| p.to_path_buf())
-            .unwrap_or(profiles_dir);
-        // 快路径没 token → 免 token 铸 cookie 进入（dsh-mcp-connector 等会拖住 token 行）
+            .unwrap_or_else(|| profiles_dir.clone());
         if runner::is_port_open(port) {
             match webauth::open_web_via_cookie_hop(&dsh_home, port, &browser_exe) {
                 Ok(_) => {
@@ -3253,13 +3252,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.15_x64-setup.exe", "0.3.15"));
-        assert!(asset_matches("dsh-manager_0.3.15_x64-setup.exe", "0.3.15"));
-        assert!(asset_matches("任意名_0.3.15_x64-setup.exe", "0.3.15"));
-        assert!(!asset_matches("DSH-Manager-0.3.15-win-x64.exe", "0.3.15"));
-        assert!(!asset_matches("DSH Manager_0.3.15_x64-setup.exe.sha256", "0.3.15"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.15"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.15"));
+        assert!(asset_matches("DSH Manager_0.3.16_x64-setup.exe", "0.3.16"));
+        assert!(asset_matches("dsh-manager_0.3.16_x64-setup.exe", "0.3.16"));
+        assert!(asset_matches("任意名_0.3.16_x64-setup.exe", "0.3.16"));
+        assert!(!asset_matches("DSH-Manager-0.3.16-win-x64.exe", "0.3.16"));
+        assert!(!asset_matches("DSH Manager_0.3.16_x64-setup.exe.sha256", "0.3.16"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.16"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.16"));
     }
 
     #[test]
@@ -3392,10 +3391,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.15_x64-setup.exe", "0.3.15"));
+        assert!(asset_matches("DSH.Manager_0.3.16_x64-setup.exe", "0.3.16"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.15_x64-setup.exe", "0.3.15"));
-        assert!(asset_matches("DSH.MANAGER_0.3.15_X64-SETUP.EXE", "0.3.15"));
+        assert!(asset_matches("dsh.manager_0.3.16_x64-setup.exe", "0.3.16"));
+        assert!(asset_matches("DSH.MANAGER_0.3.16_X64-SETUP.EXE", "0.3.16"));
     }
 
     #[test]
@@ -3403,7 +3402,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.15", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.16", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }
