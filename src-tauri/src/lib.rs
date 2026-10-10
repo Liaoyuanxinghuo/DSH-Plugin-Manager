@@ -2,6 +2,7 @@
 
 mod browsers;
 mod buildpermit;
+mod complement;
 mod dsh_install;
 mod fsutil;
 mod ghnet;
@@ -2422,6 +2423,56 @@ async fn import_pack_cmd(
     .map_err(|e| format!("导入任务失败：{e}"))?
 }
 
+// ==================== 命令：插件补全 ====================
+
+/// 读某 profile 的插件清单快照（补全差集 / 源选择展示用）
+#[tauri::command]
+async fn complement_manifest_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    profile: String,
+    profiles_dir_str: String,
+) -> Result<complement::ProfileManifest, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    let profile_dir = profiles_dir.join(&profile);
+    // 纯 FS 读 → 阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || complement::read_manifest(&profile_dir))
+        .await
+        .map_err(|e| format!("后台任务失败：{e}"))?
+}
+
+/// 从已有 profile 文件级复制插件到当前 profile（不断网、保留精确版本）。
+/// 同名已存在 / inbox 基础包逐项跳过；单项失败不中断整体。
+#[tauri::command]
+async fn complement_copy_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    src_profile: String,
+    src_profiles_dir_str: String,
+    dst_profile: String,
+    dst_profiles_dir_str: String,
+    names: Vec<String>,
+) -> Result<Vec<complement::CopyItemResult>, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let src_dir = profiles_dir_arg(&src_profiles_dir_str, &env).join(&src_profile);
+    let dst_dir = profiles_dir_arg(&dst_profiles_dir_str, &env).join(&dst_profile);
+    // 大目录复制放阻塞线程池
+    tauri::async_runtime::spawn_blocking(move || complement::copy_plugins(&src_dir, &dst_dir, &names))
+        .await
+        .map_err(|e| format!("后台任务失败：{e}"))?
+}
+
+/// 只读 .dspack 的 manifest（不落盘、不新建 profile），返回清单预览供补全差集
+#[tauri::command]
+async fn peek_pack_cmd(pack_path: String) -> Result<packforge::PackPeekResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        packforge::peek_pack_manifest(std::path::Path::new(&pack_path))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败：{e}"))?
+}
+
 // ==================== 命令：profile 备注 ====================
 
 /// 读取全部 profile 备注
@@ -2988,6 +3039,9 @@ pub fn run() {
             market_packs_cmd,
             download_pack_cmd,
             import_pack_cmd,
+            complement_manifest_cmd,
+            complement_copy_cmd,
+            peek_pack_cmd,
             get_profile_notes_cmd,
             save_profile_note_cmd,
             npm_search_cmd,
@@ -3199,13 +3253,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.14_x64-setup.exe", "0.3.14"));
-        assert!(asset_matches("dsh-manager_0.3.14_x64-setup.exe", "0.3.14"));
-        assert!(asset_matches("任意名_0.3.14_x64-setup.exe", "0.3.14"));
-        assert!(!asset_matches("DSH-Manager-0.3.14-win-x64.exe", "0.3.14"));
-        assert!(!asset_matches("DSH Manager_0.3.14_x64-setup.exe.sha256", "0.3.14"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.14"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.14"));
+        assert!(asset_matches("DSH Manager_0.3.15_x64-setup.exe", "0.3.15"));
+        assert!(asset_matches("dsh-manager_0.3.15_x64-setup.exe", "0.3.15"));
+        assert!(asset_matches("任意名_0.3.15_x64-setup.exe", "0.3.15"));
+        assert!(!asset_matches("DSH-Manager-0.3.15-win-x64.exe", "0.3.15"));
+        assert!(!asset_matches("DSH Manager_0.3.15_x64-setup.exe.sha256", "0.3.15"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.15"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.15"));
     }
 
     #[test]
@@ -3338,10 +3392,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.14_x64-setup.exe", "0.3.14"));
+        assert!(asset_matches("DSH.Manager_0.3.15_x64-setup.exe", "0.3.15"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.14_x64-setup.exe", "0.3.14"));
-        assert!(asset_matches("DSH.MANAGER_0.3.14_X64-SETUP.EXE", "0.3.14"));
+        assert!(asset_matches("dsh.manager_0.3.15_x64-setup.exe", "0.3.15"));
+        assert!(asset_matches("DSH.MANAGER_0.3.15_X64-SETUP.EXE", "0.3.15"));
     }
 
     #[test]
@@ -3349,7 +3403,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.14", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.15", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

@@ -1,4 +1,4 @@
-﻿//! DSH-PackForge 整合包（.dspack v3 / manifest v5）导出、市场、下载、导入
+//! DSH-PackForge 整合包（.dspack v3 / manifest v5）导出、市场、下载、导入
 //! 契约来源：https://github.com/DSH-PackForge/DSH-PackForge
 //! - pack-structure v3：ZIP 根含 dspack.json（{format:"dspack", version:3}）+ manifest.json（v5）
 //! - profile 形态：overrides/ → profile 根，可选 home/ → $DSH_HOME
@@ -925,6 +925,117 @@ pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportRe
     })
 }
 
+// ==================== 补全 peek（只读 manifest，不落盘） ====================
+
+/// 补全用：单个 profile 单元的清单快照
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackPeekUnit {
+    pub key: String,
+    pub bundles: Vec<String>,
+    pub dependencies: HashMap<String, String>,
+}
+
+/// 补全用：.dspack 清单预览（不解压落盘、不新建 profile）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackPeekResult {
+    pub pack_name: String,
+    pub pack_version: String,
+    pub pack_type: String,
+    pub units: Vec<PackPeekUnit>,
+    pub dsh_hint: String,
+}
+
+/// 只读 zip 内的 dspack.json + manifest.json，返回清单预览。
+/// 不解压全部文件、不写 profiles、不碰 home，供「插件补全」做差集。
+pub fn peek_pack_manifest(pack_path: &Path) -> Result<PackPeekResult, String> {
+    let file = fs::File::open(pack_path).map_err(|e| format!("打开整合包失败: {e}"))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("解析整合包失败: {e}"))?;
+    let mut dspack_raw: Option<Vec<u8>> = None;
+    let mut manifest_raw: Option<Vec<u8>> = None;
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取包条目失败: {e}"))?;
+        let name = entry.name().to_string();
+        if name == "dspack.json" || name == "manifest.json" {
+            let mut buf = Vec::new();
+            std::io::copy(&mut entry, &mut buf)
+                .map_err(|e| format!("读取 {name} 失败: {e}"))?;
+            if name == "dspack.json" {
+                dspack_raw = Some(buf);
+            } else {
+                manifest_raw = Some(buf);
+            }
+        }
+    }
+    let dspack: serde_json::Value = serde_json::from_slice(
+        &dspack_raw.ok_or("不是有效的 .dspack：缺少 dspack.json")?,
+    )
+    .map_err(|e| format!("解析 dspack.json 失败: {e}"))?;
+    if dspack.get("format").and_then(|x| x.as_str()) != Some("dspack") {
+        return Err("不是有效的 .dspack：format 不是 dspack".to_string());
+    }
+    if dspack.get("version").and_then(|x| x.as_u64()) != Some(3) {
+        return Err("不支持的 .dspack 容器版本（仅支持 v3）".to_string());
+    }
+    let raw = manifest_raw.ok_or("不是有效的 .dspack：缺少 manifest.json")?;
+    let m: PackManifest =
+        serde_json::from_slice(&raw).map_err(|e| format!("解析 manifest 失败: {e}"))?;
+    if m.manifest_version != 5 {
+        return Err(format!(
+            "不支持的 manifest 版本 {}（仅支持 v5）",
+            m.manifest_version
+        ));
+    }
+    if m.pack_type != "profile" && m.pack_type != "dshhome" {
+        return Err(format!("不支持的整合包类型: {}", m.pack_type));
+    }
+    if m.name.is_empty() {
+        return Err("manifest 缺少 name".to_string());
+    }
+    let mut units: Vec<PackPeekUnit> = Vec::new();
+    if m.pack_type == "profile" {
+        units.push(PackPeekUnit {
+            key: m.profile_name
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| m.name.clone()),
+            bundles: m.bundles.clone(),
+            dependencies: m.dependencies.clone(),
+        });
+    } else {
+        let mut keys: Vec<String> = m.profiles.keys().cloned().collect();
+        keys.sort();
+        for k in keys {
+            if let Some(u) = m.profiles.get(&k) {
+                units.push(PackPeekUnit {
+                    key: k,
+                    bundles: u.bundles.clone(),
+                    dependencies: u.dependencies.clone(),
+                });
+            }
+        }
+        if units.is_empty() {
+            return Err("dshhome 整合包不含任何 profile".to_string());
+        }
+    }
+    let desc = display_str(m.description.as_ref(), "");
+    let name_desc = display_str(m.display_name.as_ref(), "");
+    let mut dsh_hint = extract_dsh_hint(m.dsh_version.as_deref().unwrap_or(""), &desc);
+    if dsh_hint.is_empty() {
+        dsh_hint = extract_dsh_hint("", &name_desc);
+    }
+    Ok(PackPeekResult {
+        pack_name: m.name,
+        pack_version: m.version,
+        pack_type: m.pack_type,
+        units,
+        dsh_hint,
+    })
+}
+
 // ==================== 备注存储 ====================
 
 pub fn notes_file() -> PathBuf {
@@ -1155,6 +1266,34 @@ mod tests {
         fs::write(&bad, "not a zip").unwrap();
         let r = import_pack(&bad, &dst);
         assert!(r.is_err());
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn test_peek_pack_reads_manifest_only() {
+        let work = tmpdir("peek");
+        let src_profiles = work.join("src").join("profiles");
+        make_profile(&src_profiles, "web", &["@deepseek-ai/dsh-base"]);
+        let pack = work.join("web-1.0.0.dspack");
+        export_pack(
+            &src_profiles.join("web"),
+            &src_profiles,
+            &pack,
+            "web",
+            "1.0.0",
+            "Web",
+            "0.1.7-rc.2",
+        )
+        .unwrap();
+        let r = peek_pack_manifest(&pack).unwrap();
+        assert_eq!(r.pack_name, "web");
+        assert_eq!(r.pack_type, "profile");
+        assert_eq!(r.units.len(), 1);
+        assert_eq!(r.units[0].dependencies.get("dsh-pet").map(String::as_str), Some("0.2.0"));
+        assert_eq!(r.dsh_hint, "0.1.7-rc.2");
+        // peek 不落盘：目标 profiles 不应被创建
+        assert!(!work.join("dst").exists());
+        assert!(peek_pack_manifest(&work.join("nope.dspack")).is_err());
         let _ = fs::remove_dir_all(&work);
     }
 

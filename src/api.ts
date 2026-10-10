@@ -2,10 +2,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   BrowserInfo,
+  ComplementCopyItem,
   DshEnv,
   PackExportResult,
   PackImportResult,
   PackMarketEntry,
+  PackPeekResult,
+  ProfileManifest,
   ProfileNotesMap,
   DshStatus,
   EnvPaths,
@@ -172,6 +175,27 @@ export const api = {
     invoke<string>("download_pack_cmd", { url, sha256, size }),
   importPack: (envId: string, packPath: string, profilesDir: string) =>
     invoke<PackImportResult>("import_pack_cmd", { envId, packPath, profilesDirStr: profilesDir }),
+  // 插件补全
+  complementManifest: (envId: string, profile: string, profilesDir: string) =>
+    invoke<ProfileManifest>("complement_manifest_cmd", { envId, profile, profilesDirStr: profilesDir }),
+  complementCopy: (
+    envId: string,
+    srcProfile: string,
+    srcProfilesDir: string,
+    dstProfile: string,
+    dstProfilesDir: string,
+    names: string[],
+  ) =>
+    invoke<ComplementCopyItem[]>("complement_copy_cmd", {
+      envId,
+      srcProfile,
+      srcProfilesDirStr: srcProfilesDir,
+      dstProfile,
+      dstProfilesDirStr: dstProfilesDir,
+      names,
+    }),
+  peekPack: (packPath: string) =>
+    invoke<PackPeekResult>("peek_pack_cmd", { packPath }),
   // profile 备注
   getProfileNotes: () => invoke<ProfileNotesMap>("get_profile_notes_cmd"),
   saveProfileNote: (profile: string, profilesDir: string, note: string, hintVersion: string) =>

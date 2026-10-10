@@ -298,4 +298,31 @@ export interface ProfileNote {
   hintVersion: string;
 }
 
+// ===== 插件补全 =====
+export interface ProfileManifest {
+  dependencies: Record<string, string>;
+  bundles: string[];
+}
+
+export interface ComplementCopyItem {
+  name: string;
+  ok: boolean;
+  skipped: boolean;
+  reason: string;
+}
+
+export interface PackPeekUnit {
+  key: string;
+  bundles: string[];
+  dependencies: Record<string, string>;
+}
+
+export interface PackPeekResult {
+  packName: string;
+  packVersion: string;
+  packType: string;
+  units: PackPeekUnit[];
+  dshHint: string;
+}
+
 export type ProfileNotesMap = Record<string, ProfileNote>;

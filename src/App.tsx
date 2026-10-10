@@ -3,6 +3,7 @@ import { api, formatSize, pickDspackFile, pickFolder, pickSavePackPath, pickSave
 import { listen } from "@tauri-apps/api/event";
 import { applyStoredOrder, migrateStoredOrder, moveItem, readStoredOrder } from "./reorder";
 import InstallDialog from "./InstallDialog";
+import ComplementDialog from "./ComplementDialog";
 import type {
   BrowserInfo,
   DshEnv,
@@ -239,6 +240,8 @@ export default function App() {
   // 在线安装对话框
   const [showInstall, setShowInstall] = useState(false);
   const [installTab, setInstallTab] = useState<"market" | "search" | "custom" | "local">("market");
+  // 插件补全对话框
+  const [showComplement, setShowComplement] = useState(false);
   // M3 插件管理
   const [updates, setUpdates] = useState<PluginUpdate[] | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
@@ -1775,6 +1778,14 @@ export default function App() {
                   <div className="title-actions">
                     <button
                       className="btn tiny"
+                      onClick={() => setShowComplement(true)}
+                      disabled={!selectedEnv || !selectedProfile}
+                      title="从已有 profile / 在线整合包 / 本地整合包补齐缺失插件（同名不同版本不处理）"
+                    >
+                      ⧉ 插件补全
+                    </button>
+                    <button
+                      className="btn tiny"
                       onClick={handleCheckUpdates}
                       disabled={checkingUpdates || !selectedEnvObj?.runCommand || plugins.length === 0}
                       title="并行查询 npm，检查各插件是否有新版本"
@@ -1970,6 +1981,21 @@ export default function App() {
           initialTab={installTab}
           onClose={() => setShowInstall(false)}
           onInstalled={() => {
+            api.listPlugins(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).then(setPlugins).catch(() => {});
+          }}
+        />
+      )}
+
+      {/* 插件补全对话框 */}
+      {showComplement && selectedEnvObj && selectedProfile && (
+        <ComplementDialog
+          env={selectedEnvObj}
+          profile={selectedProfile}
+          profilesDir={profileDirOf(selectedProfile)}
+          profiles={profiles}
+          currentPlugins={plugins.map((p) => p.name)}
+          onClose={() => setShowComplement(false)}
+          onDone={() => {
             api.listPlugins(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).then(setPlugins).catch(() => {});
           }}
         />
@@ -2653,7 +2679,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.14</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.15</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
