@@ -1138,6 +1138,88 @@ describe("新建/删除 Profile", () => {
     expect(mockInvoke).not.toHaveBeenCalledWith("create_profile_cmd", expect.anything());
   });
 
+  it("新建表单默认预填当前选中 profile 所在的 profiles 目录，可直接创建", async () => {
+    localStorage.removeItem("dshpm-sel-profile");
+    localStorage.removeItem("dshpm-sel-profile-dir");
+    const packDir = "C:\\Users\\test\\.dsh-packs\\pack-a\\profiles";
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_all_profiles") {
+        return Promise.resolve([
+          {
+            name: "alpha",
+            profilesDir: packDir,
+            path: `${packDir}\\alpha`,
+            pluginCount: 0,
+            dataSize: 0,
+            modified: "",
+            hasPatch: false,
+            hasLock: false,
+            hasPackage: true,
+          },
+        ]);
+      }
+      if (cmd === "create_profile_cmd") {
+        return Promise.resolve({ name: "beta", path: `${packDir}\\beta` });
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("＋新建")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("＋新建"));
+    await waitFor(() => {
+      expect(screen.getByText("新建 Profile")).toBeInTheDocument();
+    });
+    // 不点「选择目录」即已预填当前 profile 的来源目录（而非官方默认 ~/.dsh/profiles）
+    await waitFor(() => {
+      expect(screen.getByDisplayValue(packDir)).toBeInTheDocument();
+    });
+    await user.type(screen.getByPlaceholderText("如：dev / test / 0.1.7-rc.2"), "beta");
+    await user.click(screen.getByText("创建"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("create_profile_cmd", {
+        envId: "global",
+        name: "beta",
+        profilesDirStr: packDir,
+      });
+    });
+  });
+
+  it("未选中 profile 时新建表单默认预填官方默认 DSH_HOME 的 profiles 目录", async () => {
+    localStorage.removeItem("dshpm-sel-profile");
+    localStorage.removeItem("dshpm-sel-profile-dir");
+    const defDir = "C:\\Users\\test\\.dsh\\profiles";
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_all_profiles") return Promise.resolve([]);
+      if (cmd === "get_env_paths") {
+        return Promise.resolve({
+          homeDir: "C:\\Users\\test\\.dsh",
+          profileDir: null,
+          profilesDir: defDir,
+          defaultProfilesDir: defDir,
+          sessionsDir: "C:\\Users\\test\\.dsh\\sessions",
+          logsDir: "C:\\Users\\test\\.dsh\\logs",
+          binPath: null,
+        });
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("＋新建")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("＋新建"));
+    await waitFor(() => {
+      expect(screen.getByText("新建 Profile")).toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(screen.getByDisplayValue(defDir)).toBeInTheDocument();
+    });
+  });
+
   it("点击删除弹出确认框，确认后调用 delete_profile_cmd", async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "delete_profile_cmd") {

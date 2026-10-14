@@ -1006,6 +1006,11 @@ export default function App() {
     }
   };
 
+  // 新建 profile 的默认目标目录：当前选中 profile 所在的 profiles 目录；
+  // 未选中任何 profile 时用官方默认 DSH_HOME/profiles（~/.dsh/profiles）
+  const createDefaultDir =
+    (selectedProfile ? profileDirOf(selectedProfile) : "") || paths?.defaultProfilesDir || "";
+
   // F12 打开开发者工具（生产包亦可用）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -2085,6 +2090,7 @@ export default function App() {
             </p>
             <CreateProfileForm
               busy={creatingProfile}
+              defaultDir={createDefaultDir}
               onCancel={() => setShowCreateProfile(false)}
               onCreate={handleCreateProfile}
             />
@@ -2414,19 +2420,24 @@ function ExportOptions({
   );
 }
 
-/** 新建 profile 表单：必选 profiles 目录（不是则要求重新选） */
+/** 新建 profile 表单：必选 profiles 目录（默认预填当前 profile 的来源目录，不是 profiles 则要求重选） */
 function CreateProfileForm({
   busy,
+  defaultDir,
   onCancel,
   onCreate,
 }: {
   busy: boolean;
+  /** 预填的目标 profiles 目录（默认值，可被「选择目录」覆盖） */
+  defaultDir?: string;
   onCancel: () => void;
   onCreate: (name: string, profilesDir: string) => void;
 }) {
   const [name, setName] = useState("");
-  const [dir, setDir] = useState("");
+  const [dir, setDir] = useState(defaultDir ?? "");
   const [err, setErr] = useState("");
+  // 选到非 profiles 目录：预填值保留展示，但在重新选对之前不可提交
+  const [dirInvalid, setDirInvalid] = useState(false);
   const pick = async () => {
     setErr("");
     const p = await pickFolder("选择 profiles 目录（文件夹名须为 profiles）");
@@ -2434,9 +2445,11 @@ function CreateProfileForm({
     // 严格：必须是 profiles 文件夹本体，否则要求重新选
     const leaf = p.split(/[\\/]/).filter(Boolean).pop() ?? "";
     if (leaf.toLowerCase() !== "profiles") {
+      setDirInvalid(true);
       setErr("所选目录不是 profiles 文件夹（文件夹名须为 profiles），请重新选择");
       return;
     }
+    setDirInvalid(false);
     setDir(p);
   };
   const submit = () => {
@@ -2449,8 +2462,8 @@ function CreateProfileForm({
       setErr("名称不能包含 < > : \" / \\ | ? * 字符");
       return;
     }
-    if (!dir.trim()) {
-      setErr("请选择 profiles 目录");
+    if (!dir.trim() || dirInvalid) {
+      setErr("请选择 profiles 目录（文件夹名须为 profiles）");
       return;
     }
     onCreate(n, dir.trim());
@@ -2480,13 +2493,21 @@ function CreateProfileForm({
             选择目录
           </button>
         </div>
+        <div className="modal-hint" style={{ marginTop: 4, fontSize: 11 }}>
+          默认取当前选中 profile 所在的 profiles 目录（未选中 profile 时为官方默认 DSH_HOME 下的
+          profiles），可点「选择目录」更改
+        </div>
       </label>
       {err && <div className="modal-err">{err}</div>}
       <div className="modal-actions">
         <button className="btn" onClick={onCancel} disabled={busy}>
           取消
         </button>
-        <button className="btn primary" onClick={submit} disabled={busy || !name.trim() || !dir.trim()}>
+        <button
+          className="btn primary"
+          onClick={submit}
+          disabled={busy || !name.trim() || !dir.trim() || dirInvalid}
+        >
           {busy ? "创建中..." : "创建"}
         </button>
       </div>

@@ -151,6 +151,8 @@ export interface EnvPaths {
   /** 当前选中 profile 的目录（不存在时为 null） */
   profileDir: string | null;
   profilesDir: string;
+  /** 官方默认 DSH_HOME 下的 profiles 目录（~/.dsh/profiles）：新建 profile 未选中 profile 时的兜底默认目标目录 */
+  defaultProfilesDir?: string;
   sessionsDir: string;
   logsDir: string;
   binPath: string | null;

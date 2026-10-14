@@ -2162,6 +2162,11 @@ fn profiles_dir_of(env: &DshEnv) -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::Path::new(&env.home_dir).join("profiles"))
 }
 
+/// 官方默认 DSH_HOME 下的 profiles 目录（~/.dsh/profiles）：新建 profile 未选中 profile 时的兜底目标目录
+fn default_profiles_dir() -> std::path::PathBuf {
+    scanner::default_dsh_home().join("profiles")
+}
+
 /// 导出 profile 为 zip 压缩包
 #[tauri::command]
 async fn export_profile_cmd(
@@ -2988,6 +2993,7 @@ async fn get_env_paths(
         "dshHome": dsh_home.to_string_lossy().to_string(),
         "profileDir": profile_dir,
         "profilesDir": profiles_dir,
+        "defaultProfilesDir": default_profiles_dir().to_string_lossy().to_string(),
         "sessionsDir": dsh_home.join("sessions").to_string_lossy().to_string(),
         "logsDir": dsh_home.join("logs").to_string_lossy().to_string(),
         "binPath": env.bin_path,
@@ -3092,6 +3098,17 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 新建 profile 的兜底默认目标目录 = 官方默认 DSH_HOME/profiles（与 get_env_paths 返回的 defaultProfilesDir 一致）
+    #[test]
+    fn default_profiles_dir_is_under_default_dsh_home() {
+        let d = default_profiles_dir();
+        assert_eq!(
+            d.file_name().unwrap().to_string_lossy().to_lowercase(),
+            "profiles"
+        );
+        assert_eq!(d.parent().unwrap(), scanner::default_dsh_home());
+    }
 
     #[test]
     fn bundle_insert_ids_reads_real_ids_from_package_patch() {
