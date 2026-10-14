@@ -237,6 +237,8 @@ export default function App() {
   // 「打开界面」浏览器选择：全局记忆（localStorage，与 DSH/Profile 无关）；空串 = 系统默认
   const [browsers, setBrowsers] = useState<BrowserInfo[]>([]);
   const [browserExe, setBrowserExe] = useState<string>(() => localStorage.getItem("dshpm-browser") ?? "");
+  // 界面外观主题：全局记忆（localStorage），默认暗夜（dark）
+  const [theme, setTheme] = useState<string>(() => localStorage.getItem("dshpm-theme") || "dark");
   // 在线安装对话框
   const [showInstall, setShowInstall] = useState(false);
   const [installTab, setInstallTab] = useState<"market" | "search" | "custom" | "local">("market");
@@ -326,6 +328,11 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("dshpm-browser", browserExe);
   }, [browserExe]);
+  // 界面外观主题同步到 html 根节点与 localStorage
+  useEffect(() => {
+    localStorage.setItem("dshpm-theme", theme);
+    document.documentElement.setAttribute("data-theme", theme);
+  }, [theme]);
   // 启动时探测已安装浏览器；记住的浏览器已卸载则回退默认（空串）
   useEffect(() => {
     let alive = true;
@@ -2009,6 +2016,8 @@ export default function App() {
             setShowSettings(false);
             setInfo("设置已保存");
           }}
+          theme={theme}
+          onThemeChange={setTheme}
         />
       )}
 
@@ -2482,7 +2491,18 @@ const GITHUB_MIRROR_PRESETS: { value: string; label: string }[] = [
 ];
 
 /** 设置弹窗：npm 镜像源 + GitHub 镜像 + DSH 下载目录 */
-function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+function SettingsDialog({
+  onClose,
+  onSaved,
+  theme,
+  onThemeChange,
+}: {
+  onClose: () => void;
+  onSaved: () => void;
+  theme: string;
+  onThemeChange: (t: string) => void;
+}) {
+  const [currentTheme, setCurrentTheme] = useState(theme);
   const [registry, setRegistry] = useState("");
   const [downloadDir, setDownloadDir] = useState("");
   const [githubMirror, setGithubMirror] = useState("");
@@ -2563,6 +2583,41 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
     <div className="modal-mask" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h3>设置</h3>
+        <label>
+          界面外观主题
+          <div className="theme-segmented">
+            <button
+              type="button"
+              className={`theme-opt ${currentTheme === "dark" ? "active" : ""}`}
+              onClick={() => {
+                setCurrentTheme("dark");
+                onThemeChange("dark");
+              }}
+            >
+              <span className="theme-dot dark" /> 暗夜
+            </button>
+            <button
+              type="button"
+              className={`theme-opt ${currentTheme === "light" ? "active" : ""}`}
+              onClick={() => {
+                setCurrentTheme("light");
+                onThemeChange("light");
+              }}
+            >
+              <span className="theme-dot light" /> 浅白
+            </button>
+            <button
+              type="button"
+              className={`theme-opt ${currentTheme === "deepseek" ? "active" : ""}`}
+              onClick={() => {
+                setCurrentTheme("deepseek");
+                onThemeChange("deepseek");
+              }}
+            >
+              <span className="theme-dot deepseek" /> 浅蓝
+            </button>
+          </div>
+        </label>
         <p className="modal-hint">
           npm 镜像源用于：插件市场/搜索、包信息查询、DSH 下载、写各 profile 的 .npmrc（插件安装）。
           <b>留空 = 不使用镜像源</b>（走 npm 官方源）。大陆网络可填
@@ -2679,7 +2734,7 @@ function SettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: ()
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.16</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.17</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

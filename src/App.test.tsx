@@ -1740,7 +1740,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.16", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.17", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -1767,27 +1767,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.16", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.17", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.16_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.17_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.16"));
+    await user.click(screen.getByText("⬇ 下载 v0.3.17"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.16" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.17" });
     // 打开所在文件夹
     await user.click(screen.getByText("📂 打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.16_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.17_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("🔄 关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.16_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.17_x64-setup.exe" });
     });
   });
 });
@@ -1815,6 +1815,42 @@ describe("拖拽排序与箭头", () => {
     });
   };
 
+  it("设置弹窗支持切换主题（暗夜/浅白/浅蓝）并持久化到 localStorage 与 html", async () => {
+    localStorage.removeItem("dshpm-theme");
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings_cmd") {
+        return Promise.resolve({ npmRegistry: "", dshDownloadDir: "C:\\dsh-versions", githubMirror: "" });
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("⚙ 设置")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("⚙ 设置"));
+
+    // 默认应为 dark
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+
+    // 切换到浅白
+    const lightBtn = screen.getByText("浅白");
+    await user.click(lightBtn);
+    expect(document.documentElement.getAttribute("data-theme")).toBe("light");
+    expect(localStorage.getItem("dshpm-theme")).toBe("light");
+
+    // 切换到浅蓝（DeepSeek 蓝）
+    const deepseekBtn = screen.getByText("浅蓝");
+    await user.click(deepseekBtn);
+    expect(document.documentElement.getAttribute("data-theme")).toBe("deepseek");
+    expect(localStorage.getItem("dshpm-theme")).toBe("deepseek");
+
+    // 切换回暗夜
+    const darkBtn = screen.getByText("暗夜");
+    await user.click(darkBtn);
+    expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
+    expect(localStorage.getItem("dshpm-theme")).toBe("dark");
+  });
   it("拖动 profile 排序并持久化到 localStorage", async () => {
     mockRects();
     mockInvoke.mockImplementation((cmd: string) => {
