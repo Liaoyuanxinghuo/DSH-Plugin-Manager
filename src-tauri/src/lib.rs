@@ -13,6 +13,7 @@ mod npm;
 mod health;
 mod packforge;
 mod patchfile;
+mod portgit;
 mod settings;
 mod toolchain;
 mod profile_io;
@@ -1596,25 +1597,44 @@ async fn check_portable_runtime_cmd() -> bool {
         .unwrap_or(false)
 }
 
-/// 初始化便携运行时：完整下载 Node LTS 到 runtime 并安装 pnpm（已就绪则直接返回）。
-/// 不改系统 PATH；子进程一律用绝对路径。
+/// 检测 Git 来源（要求.md 二.6）："system"（系统已有，直接用）/ "portable"（便携 MinGit）/ "none"（缺，需初始化）。
+/// `git --version` 探测 spawn 子进程 → 阻塞线程池。
+#[tauri::command]
+async fn check_portable_git_cmd() -> String {
+    tauri::async_runtime::spawn_blocking(|| portgit::git_source().as_str().to_string())
+        .await
+        .unwrap_or_else(|_| "none".to_string())
+}
+
+/// 初始化便携环境：便携 Node LTS + pnpm + 便携 Git（MinGit）一并就绪。
+/// - 已就绪的部分直接跳过；系统已有 Git 则不下载便携 Git
+/// - 不改系统 PATH；子进程一律用绝对路径 / 运行时 PATH 注入
 #[tauri::command]
 async fn init_portable_runtime_cmd(app: tauri::AppHandle) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let mut parts: Vec<String> = Vec::new();
+        // 1) 便携 Node + pnpm
         if let Some(t) = toolchain::runtime_toolchain() {
-            return Ok(format!("便携运行时已就绪：{}", t.node.display()));
+            parts.push(format!("便携运行时已就绪：{}", t.node.display()));
+        } else {
+            let registry = settings::load_settings().npm_registry;
+            let tc = toolchain::ensure_force(&app, &registry)?;
+            parts.push(format!(
+                "便携运行时安装完成：node {}（{}）· pnpm {}",
+                tc.node.display(),
+                tc.node_dir.display(),
+                tc.pnpm
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "—".into())
+            ));
         }
-        let registry = settings::load_settings().npm_registry;
-        let tc = toolchain::ensure_force(&app, &registry)?;
-        Ok(format!(
-            "便携运行时安装完成：node {}（{}）· pnpm {}",
-            tc.node.display(),
-            tc.node_dir.display(),
-            tc.pnpm
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "—".into())
-        ))
+        // 2) Git：系统已有直接用；否则下载便携 MinGit
+        match portgit::ensure_git(&app)? {
+            None => parts.push("使用系统 Git".to_string()),
+            Some(exe) => parts.push(format!("便携 Git 就绪：{}", exe.display())),
+        }
+        Ok(parts.join("；"))
     })
     .await
     .map_err(|e| format!("后台任务失败: {e}"))?
@@ -3056,6 +3076,7 @@ pub fn run() {
             stop_all_dsh_cmd,
             check_portable_runtime_cmd,
             init_portable_runtime_cmd,
+            check_portable_git_cmd,
         ])
         .setup(|app| {
             // 按物理像素设置窗口初始尺寸：避免高 DPI 缩放下逻辑尺寸被放大
@@ -3252,13 +3273,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.17_x64-setup.exe", "0.3.17"));
-        assert!(asset_matches("dsh-manager_0.3.17_x64-setup.exe", "0.3.17"));
-        assert!(asset_matches("任意名_0.3.17_x64-setup.exe", "0.3.17"));
-        assert!(!asset_matches("DSH-Manager-0.3.17-win-x64.exe", "0.3.17"));
-        assert!(!asset_matches("DSH Manager_0.3.17_x64-setup.exe.sha256", "0.3.17"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.17"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.17"));
+        assert!(asset_matches("DSH Manager_0.3.18_x64-setup.exe", "0.3.18"));
+        assert!(asset_matches("dsh-manager_0.3.18_x64-setup.exe", "0.3.18"));
+        assert!(asset_matches("任意名_0.3.18_x64-setup.exe", "0.3.18"));
+        assert!(!asset_matches("DSH-Manager-0.3.18-win-x64.exe", "0.3.18"));
+        assert!(!asset_matches("DSH Manager_0.3.18_x64-setup.exe.sha256", "0.3.18"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.18"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.18"));
     }
 
     #[test]
@@ -3391,10 +3412,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.17_x64-setup.exe", "0.3.17"));
+        assert!(asset_matches("DSH.Manager_0.3.18_x64-setup.exe", "0.3.18"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.17_x64-setup.exe", "0.3.17"));
-        assert!(asset_matches("DSH.MANAGER_0.3.17_X64-SETUP.EXE", "0.3.17"));
+        assert!(asset_matches("dsh.manager_0.3.18_x64-setup.exe", "0.3.18"));
+        assert!(asset_matches("DSH.MANAGER_0.3.18_X64-SETUP.EXE", "0.3.18"));
     }
 
     #[test]
@@ -3402,7 +3423,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.17", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.18", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

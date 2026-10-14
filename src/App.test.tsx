@@ -148,6 +148,8 @@ function mockAll() {
         return Promise.resolve(null);
       case "check_portable_runtime_cmd":
         return Promise.resolve(true);
+      case "check_portable_git_cmd":
+        return Promise.resolve("system");
       case "init_portable_runtime_cmd":
         return Promise.resolve("便携运行时已就绪");
       case "list_scan_dirs":
@@ -1740,7 +1742,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.17", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.18", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -1767,27 +1769,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.17", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.18", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.17_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.18_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.17"));
+    await user.click(screen.getByText("⬇ 下载 v0.3.18"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.17" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.18" });
     // 打开所在文件夹
     await user.click(screen.getByText("📂 打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.17_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.18_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("🔄 关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.17_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.18_x64-setup.exe" });
     });
   });
 });
@@ -1974,10 +1976,73 @@ describe("整合包导入导出与备注", () => {
   });
 });
 
+describe("便携 Git 检测与初始化提示", () => {
+  /** 在 beforeEach 的 mockAll 之上只覆盖 git 状态，其余命令照旧 */
+  function withGitStatus(status: string) {
+    const prev = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "check_portable_git_cmd") return Promise.resolve(status);
+      return (prev as (c: string, a?: unknown) => Promise<unknown>)(cmd, args);
+    });
+  }
+
+  it("系统已装 Git：不提示、不下载便携 Git（无缺 Git 横幅）", async () => {
+    withGitStatus("system");
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/全局 CLI/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/尚未初始化便携环境/)).not.toBeInTheDocument();
+    expect(screen.queryByText("⚡ 初始化环境")).not.toBeInTheDocument();
+    expect(screen.getByText("⬇ 下载DSH")).toBeInTheDocument();
+  });
+
+  it("系统无 Git：启动时提示初始化便携 Git", async () => {
+    withGitStatus("none");
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/尚未初始化便携环境/)).toBeInTheDocument();
+    });
+    // 横幅点明缺 Git 与初始化入口（横幅 + 左栏各有一个「初始化环境」按钮）
+    expect(screen.getByText(/github:\/git\+ 依赖需要/)).toBeInTheDocument();
+    expect(screen.getAllByText("⚡ 初始化环境").length).toBeGreaterThan(0);
+    expect(screen.queryByText("⬇ 下载DSH")).not.toBeInTheDocument();
+  });
+
+  it("便携 Git 已就绪：不提示缺 Git", async () => {
+    withGitStatus("portable");
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/全局 CLI/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/尚未初始化便携环境/)).not.toBeInTheDocument();
+    expect(screen.getByText("⬇ 下载DSH")).toBeInTheDocument();
+  });
+
+  it("点「初始化环境」调用 init_portable_runtime_cmd（Node+Git 一并初始化）", async () => {
+    withGitStatus("none");
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("⚡ 初始化环境").length).toBeGreaterThan(0);
+    });
+    mockInvoke.mockClear();
+    const user = userEvent.setup();
+    await user.click(screen.getAllByText("⚡ 初始化环境")[0]);
+    await waitFor(() => {
+      expect(mockInvoke.mock.calls.some((c) => c[0] === "init_portable_runtime_cmd")).toBe(true);
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/便携环境就绪/)).toBeInTheDocument();
+    });
+  });
+});
+
 function mockAllDefault(cmd: string) {
   switch (cmd) {
     case "check_portable_runtime_cmd":
       return Promise.resolve(true);
+    case "check_portable_git_cmd":
+      return Promise.resolve("system");
     case "init_portable_runtime_cmd":
       return Promise.resolve("便携运行时已就绪");
     case "list_scan_dirs":

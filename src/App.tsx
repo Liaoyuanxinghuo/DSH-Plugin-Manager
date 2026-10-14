@@ -280,25 +280,33 @@ export default function App() {
   const [showDshDownload, setShowDshDownload] = useState(false);
   // 便携运行时（%AppData%\dsh-plugin-manager\runtime）是否就绪；未就绪时「下载DSH」变红色「初始化环境」
   const [portableReady, setPortableReady] = useState<boolean | null>(null);
+  // Git 来源："system" / "portable" / "none"（none = 需初始化便携 Git）
+  const [gitStatus, setGitStatus] = useState<string | null>(null);
   const [initingPortable, setInitingPortable] = useState(false);
   const [portableBannerOpen, setPortableBannerOpen] = useState(true);
   const [portableLogs, setPortableLogs] = useState<string[]>([]);
+  const gitMissing = gitStatus === "missing" || gitStatus === "none";
+  const needInit = portableReady === false || gitMissing;
 
-  // 检测便携运行时
+  // 检测便携运行时 + Git 来源（要求.md 二.6：与 Node 便携运行时一并检测）
   useEffect(() => {
     api
       .checkPortableRuntime()
       .then((ok) => setPortableReady(!!ok))
       .catch(() => setPortableReady(false));
+    api
+      .checkPortableGit()
+      .then((s) => setGitStatus(s || "none"))
+      .catch(() => setGitStatus("none"));
   }, []);
 
-  // 「便携运行时就绪」横幅 2s 后自动关闭
+  // 「便携环境就绪」横幅 2s 后自动关闭（Node 与 Git 都就绪才提示）
   useEffect(() => {
-    if (portableReady === true && portableBannerOpen) {
+    if (portableReady === true && !gitMissing && portableBannerOpen) {
       const t = setTimeout(() => setPortableBannerOpen(false), 2000);
       return () => clearTimeout(t);
     }
-  }, [portableReady, portableBannerOpen]);
+  }, [portableReady, gitMissing, portableBannerOpen]);
 
   // 加载 profile 备注（仅提示，无任何约束）
   useEffect(() => {
@@ -1023,12 +1031,12 @@ export default function App() {
     setShowInitBtn(false);
   }, [envs.length, profiles.length]);
 
-  // 初始化便携运行时（完整下载 Node LTS + pnpm 到 %AppData%\dsh-plugin-manager\runtime）
+  // 初始化便携环境（Node LTS + pnpm + 便携 Git 到 %AppData%\dsh-plugin-manager\runtime）
   // 通过 install-log 事件流显示进度，避免看起来像卡死
   const handleInitPortable = async () => {
     setInitingPortable(true);
     setError("");
-    setInfo("正在初始化便携运行时（下载 Node.js LTS + pnpm，约 40MB）…");
+    setInfo("正在初始化便携环境（下载 Node.js LTS + pnpm，缺 Git 时一并下载便携 Git）…");
     setPortableLogs([]);
     let unLog: (() => void) | undefined;
     try {
@@ -1044,23 +1052,28 @@ export default function App() {
     try {
       const msg = await api.initPortableRuntime();
       setPortableReady(true);
+      api
+        .checkPortableGit()
+        .then((s) => setGitStatus(s || "none"))
+        .catch(() => setGitStatus("none"));
       setPortableBannerOpen(true);
-      setInfo(`✅ 便携运行时就绪 — ${msg}`);
+      setInfo(`✅ 便携环境就绪 — ${msg}`);
     } catch (e) {
       setPortableReady(false);
-      setError(`初始化便携运行时失败：${e}`);
+      setError(`初始化便携环境失败：${e}（可更换 GitHub/npm 镜像后再次点「初始化环境」重试）`);
     } finally {
       unLog?.();
       setInitingPortable(false);
     }
   };
 
-  // 打开「下载 DSH」前强制检查便携包；缺失则走初始化
+  // 打开「下载 DSH」前强制检查便携包与 Git；缺失则走初始化
   const openDshDownload = async () => {
     try {
-      const ok = await api.checkPortableRuntime();
+      const [ok, git] = await Promise.all([api.checkPortableRuntime(), api.checkPortableGit()]);
       setPortableReady(!!ok);
-      if (!ok) {
+      setGitStatus(git || "none");
+      if (!ok || git === "none" || git === "missing") {
         await handleInitPortable();
         return;
       }
@@ -1315,13 +1328,20 @@ export default function App() {
           <button className="btn tiny" onClick={() => setInfo("")}>×</button>
         </div>
       )}
-      {portableReady === false && (
+      {needInit && (
         <div className="banner warn">
           <span>
-            ⚡ 尚未初始化便携运行时（Node.js LTS + pnpm）。请点
+            ⚡ 尚未初始化便携环境（
+            {[
+              portableReady === false && "Node.js LTS + pnpm",
+              gitMissing && "Git（github:/git+ 依赖需要）",
+            ]
+              .filter(Boolean)
+              .join("、")}
+            ）。请点
             <b>「初始化环境」</b>
             自动下载安装到 <code>%AppData%\dsh-plugin-manager\runtime\</code>
-            ，不改动系统 PATH。
+            ，不改动系统 PATH{gitMissing && "；无需安装系统 Git"}。
             {initingPortable && portableLogs.length > 0 && (
               <span style={{ display: "block", opacity: 0.85, marginTop: 4, fontFamily: "Consolas, monospace" }}>
                 {portableLogs[portableLogs.length - 1]}
@@ -1337,9 +1357,12 @@ export default function App() {
           </button>
         </div>
       )}
-      {portableReady === true && portableBannerOpen && (
+      {portableReady === true && !gitMissing && portableBannerOpen && (
         <div className="banner ready">
-          <span>✅ 便携运行时就绪：%AppData%\dsh-plugin-manager\runtime\</span>
+          <span>
+            ✅ 便携环境就绪：%AppData%\dsh-plugin-manager\runtime\
+            {gitStatus === "system" ? "（Git 用系统自带）" : ""}
+          </span>
           <button className="btn tiny" onClick={() => setPortableBannerOpen(false)}>×</button>
         </div>
       )}
@@ -1358,12 +1381,12 @@ export default function App() {
           <div className="panel-title">
             <h2>DSH 环境</h2>
             <div className="title-actions">
-              {portableReady === false || initingPortable ? (
+              {needInit || initingPortable ? (
                 <button
                   className="btn tiny danger"
                   disabled={initingPortable}
                   onClick={handleInitPortable}
-                  title="下载并安装便携运行时（Node.js LTS + pnpm）到 %AppData%\dsh-plugin-manager\runtime"
+                  title="下载并安装便携环境（Node.js LTS + pnpm；缺 Git 时一并装便携 Git）到 %AppData%\dsh-plugin-manager\runtime"
                 >
                   {initingPortable ? "初始化中…" : "⚡ 初始化环境"}
                 </button>
@@ -1371,7 +1394,7 @@ export default function App() {
                 <button
                   className="btn tiny"
                   onClick={openDshDownload}
-                  title="下载并安装 DSH 多版本到指定目录（需已初始化便携运行时）"
+                  title="下载并安装 DSH 多版本到指定目录（需已初始化便携环境）"
                 >
                   ⬇ 下载DSH
                 </button>
@@ -2734,7 +2757,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.17</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.18</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

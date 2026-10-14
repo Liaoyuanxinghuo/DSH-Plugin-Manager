@@ -148,8 +148,10 @@ export const api = {
   checkUpdate: () => invoke<UpdateInfo>("check_update_cmd"),
   /** 便携运行时是否已就绪（runtime 内 Node24+ + pnpm） */
   checkPortableRuntime: () => invoke<boolean>("check_portable_runtime_cmd"),
-  /** 初始化便携运行时（完整下载 Node LTS + pnpm，不改系统 PATH） */
+  /** 初始化便携环境（Node LTS + pnpm + 便携 Git，不改系统 PATH） */
   initPortableRuntime: () => invoke<string>("init_portable_runtime_cmd"),
+  /** Git 来源："system"（系统已有）/ "portable"（便携 MinGit）/ "none"（缺，需初始化） */
+  checkPortableGit: () => invoke<string>("check_portable_git_cmd"),
   downloadUpdate: (version: string) => invoke<string>("download_update_cmd", { version }),
   launchInstallerAndExit: (path: string) => invoke<void>("launch_installer_and_exit_cmd", { path }),
   setSettings: (npmRegistry: string, dshDownloadDir: string, githubMirror: string, githubMirrors?: string[]) =>

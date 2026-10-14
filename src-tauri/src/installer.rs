@@ -95,11 +95,11 @@ pub fn run_dsh_with_logs(
             }
         })
     };
-    // stderr 线程（顺带记下最后一条非空错误行，失败摘要用它说话而不是「详见日志」）
-    let last_err = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    // stderr 线程（收集全部非空错误行，失败摘要从中挑根因——不让 pnpm 英文堆栈裸奔）
+    let err_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let err_handle = {
         let app = app.clone();
-        let last_err = last_err.clone();
+        let err_lines = err_lines.clone();
         let stderr = child.stderr.take();
         std::thread::spawn(move || {
             if let Some(stderr) = stderr {
@@ -107,7 +107,10 @@ pub fn run_dsh_with_logs(
                 for line in reader.lines() {
                     if let Ok(l) = line {
                         if !l.trim().is_empty() {
-                            *last_err.lock().unwrap() = l.clone();
+                            let mut v = err_lines.lock().unwrap();
+                            if v.len() < 200 {
+                                v.push(l.clone());
+                            }
                         }
                         let _ = app.emit("install-log", serde_json::json!({ "line": l, "kind": "stderr" }));
                     }
@@ -128,34 +131,93 @@ pub fn run_dsh_with_logs(
         "install-done",
         serde_json::json!({ "success": success, "exitCode": exit_code }),
     );
-    let tail = last_err.lock().unwrap().clone();
+    let lines = err_lines.lock().unwrap().clone();
+    let git_ok = crate::portgit::git_available();
     InstallOutcome {
         success,
         exit_code,
-        summary: failure_summary(success, &tail),
+        summary: failure_summary(success, &lines, git_ok),
     }
 }
 
-/// 失败摘要：带上 stderr 最后一条错误行（CLI 的真实原因），没有才退回「详见日志」。
-/// 命中官方「Electron 应用独占管理」类拒绝时追加提示：可能是该 profile 被
-/// 官方桌面应用特别管理导致失败（不预检、不拦截，照常执行，仅失败时说明）。
-fn failure_summary(success: bool, last_stderr_line: &str) -> String {
+/// 从 stderr 行里挑根因：优先 pnpm/npm 错误码行，其次 git/可执行缺失类行，最后一条非空行。
+fn pick_root_cause(stderr_lines: &[String]) -> String {
+    let non_empty: Vec<&str> = stderr_lines
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        return String::new();
+    }
+    // 1) pnpm/npm 错误码行（ERR_PNPM_* / npm ERR! code）
+    for l in &non_empty {
+        if l.contains("ERR_PNPM_") {
+            return l.to_string();
+        }
+    }
+    // 2) git / 可执行缺失类根因行
+    for l in &non_empty {
+        let low = l.to_lowercase();
+        if low.contains("git ls-remote")
+            || low.contains("is not recognized as an internal or external command")
+            || low.contains("enoent")
+            || low.contains("not found")
+            || low.contains("command failed")
+        {
+            return l.to_string();
+        }
+    }
+    // 3) 兜底：最后一条非空行
+    non_empty.last().map(|s| s.to_string()).unwrap_or_default()
+}
+
+/// 缺失/不可用 Git 的典型报错（pnpm 解析 git 来源依赖失败）
+fn looks_like_git_error(line: &str) -> bool {
+    let l = line.to_lowercase();
+    l.contains("err_pnpm_git")
+        || l.contains("git ls-remote")
+        || l.contains("git_resolve")
+        || (l.contains("git")
+            && (l.contains("is not recognized")
+                || l.contains("enoent")
+                || l.contains("not found")
+                || l.contains("command not found")))
+}
+
+/// 失败摘要：带 stderr 根因行（CLI 的真实原因），没有才退回「详见日志」。
+/// - 根因指向 git 且本机缺 Git → 中文根因提示（初始化便携 Git / 装 Git for Windows 后重试）
+/// - 根因指向 git 但 Git 可用 → 提示多为网络问题（可换 GitHub 镜像）
+/// - 命中官方「Electron 应用独占管理」类拒绝 → 追加提示（不预检、不拦截，仅失败时说明）
+fn failure_summary(success: bool, stderr_lines: &[String], git_ok: bool) -> String {
     if success {
         return "执行成功".to_string();
     }
-    let tail = last_stderr_line.trim();
-    if tail.is_empty() {
+    let root = pick_root_cause(stderr_lines);
+    if root.is_empty() {
         return "执行失败，详见日志".to_string();
     }
-    let base = format!("执行失败：{tail}");
-    if tail.contains("managed exclusively") || tail.contains("Electron application") {
-        format!(
-            "{base}（提示：可能是该 profile 被官方 DSH Desktop 应用特别管理导致失败；\
-             可在官方桌面应用内操作，或克隆/改名后用本管理器管理）"
-        )
-    } else {
-        base
+    let base = format!("执行失败：{root}");
+    let mut hints = String::new();
+    if looks_like_git_error(&root) {
+        if !git_ok {
+            hints.push_str(
+                "（根因：本机缺少可用的 Git，无法解析 github:/git+ 等 git 来源依赖。\
+                 请点「初始化环境」下载便携 Git（或安装 Git for Windows）后重试）",
+            );
+        } else {
+            hints.push_str(
+                "（提示：Git 可用但仍拉取 git 来源依赖失败，多为网络问题，可更换 GitHub 镜像后重试）",
+            );
+        }
     }
+    if root.contains("managed exclusively") || root.contains("Electron application") {
+        hints.push_str(
+            "（提示：可能是该 profile 被官方 DSH Desktop 应用特别管理导致失败；\
+             可在官方桌面应用内操作，或克隆/改名后用本管理器管理）",
+        );
+    }
+    format!("{base}{hints}")
 }
 
 /// 在线安装插件：dsh plugin --profile <profile> add <spec>
@@ -265,20 +327,74 @@ mod tests {
     #[test]
     fn failure_summary_carries_real_cli_reason() {
         // 失败摘要必须带 stderr 真实原因，而不是干巴巴的「详见日志」
-        assert_eq!(failure_summary(true, "whatever"), "执行成功");
-        assert_eq!(failure_summary(false, ""), "执行失败，详见日志");
+        assert_eq!(failure_summary(true, &[], true), "执行成功");
+        assert_eq!(failure_summary(false, &[], true), "执行失败，详见日志");
         assert_eq!(
-            failure_summary(false, "some npm error"),
+            failure_summary(false, &["some npm error".to_string()], true),
             "执行失败：some npm error"
         );
         // 命中官方「特别管理」拒绝 → 追加可能原因提示（不拦截，仅失败时说明）
         let s = failure_summary(
             false,
-            "error: profile \"desktop\" is managed exclusively by the Electron application",
+            &["error: profile \"desktop\" is managed exclusively by the Electron application".to_string()],
+            true,
         );
         assert!(s.contains("执行失败：error: profile \"desktop\""), "{s}");
         assert!(s.contains("特别管理"), "应提示可能被特别管理: {s}");
         assert!(s.contains("可能"), "提示语气是「可能」: {s}");
+    }
+
+    #[test]
+    fn pick_root_cause_prefers_pnpm_error_code_over_stack_tail() {
+        let lines = vec![
+            "npm warn deprecated x".to_string(),
+            "ERR_PNPM_GIT_RESOLVE_FAILED  failed to resolve github:yukitakasama/dsh-agent-arena#25e2c55".to_string(),
+            "    at ChildProcess.<anonymous> (C:\\x\\y.js:1:1)".to_string(),
+            "    at emitOne (events.js:1:1)".to_string(),
+        ];
+        let root = pick_root_cause(&lines);
+        assert!(root.contains("ERR_PNPM_GIT_RESOLVE_FAILED"), "{root}");
+    }
+
+    #[test]
+    fn pick_root_cause_falls_back_to_last_non_empty() {
+        let lines = vec![
+            "warning: something".to_string(),
+            "Error: build failed".to_string(),
+        ];
+        assert_eq!(pick_root_cause(&lines), "Error: build failed");
+        assert_eq!(pick_root_cause(&[]), "");
+        assert_eq!(pick_root_cause(&["  ".to_string()]), "");
+    }
+
+    #[test]
+    fn failure_summary_missing_git_gives_chinese_root_cause() {
+        // 缺 Git 时不让 pnpm 英文堆栈裸奔：给根因中文提示 + 引导初始化/重试
+        let lines = vec![
+            "ERR_PNPM_GIT_RESOLVE_FAILED  failed to resolve github:yukitakasama/dsh-agent-arena#25e2c55".to_string(),
+        ];
+        let s = failure_summary(false, &lines, false);
+        assert!(s.contains("ERR_PNPM_GIT_RESOLVE_FAILED"), "{s}");
+        assert!(s.contains("根因"), "{s}");
+        assert!(s.contains("缺少可用的 Git"), "{s}");
+        assert!(s.contains("初始化环境"), "应引导去初始化: {s}");
+        assert!(s.contains("重试"), "{s}");
+    }
+
+    #[test]
+    fn failure_summary_git_error_but_git_ok_hints_network() {
+        let lines = vec![
+            "ERR_PNPM_GIT_RESOLVE_FAILED  failed to resolve github:a/b#abc".to_string(),
+        ];
+        let s = failure_summary(false, &lines, true);
+        assert!(s.contains("网络"), "Git 可用时提示网络问题: {s}");
+        assert!(!s.contains("缺少可用的 Git"), "{s}");
+    }
+
+    #[test]
+    fn failure_summary_plain_error_has_no_git_hint() {
+        let s = failure_summary(false, &["some npm error".to_string()], false);
+        assert_eq!(s, "执行失败：some npm error");
     }
 
     /// 真实验证：绝对路径 node 启动 dsh，**PATH 清空也能跑**（不靠 PATH、不置顶）。

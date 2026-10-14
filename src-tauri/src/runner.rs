@@ -383,6 +383,11 @@ pub fn start_dsh(env: &DshEnv, profile: &str, port: u16, dsh_home: Option<&str>)
             path_extra.push_str(&global_npm.to_string_lossy());
             path_extra.push(';');
         }
+        // 便携 Git：dsh 内部（如 web 界面装插件）会 spawn git 解析 github: 依赖
+        for d in crate::portgit::path_dirs() {
+            path_extra.push_str(&d);
+            path_extra.push(';');
+        }
         let full_path = format!("{path_extra}{}", std::env::var("PATH").unwrap_or_default());
         cmd.env("PATH", full_path);
         // 国内镜像：uvx/pip 走 pypi 镜像、npm 走用户设置 registry（否则 MCP 装包 pypi.org 超时卡 1-2 分钟）
@@ -414,6 +419,16 @@ pub fn start_dsh(env: &DshEnv, profile: &str, port: u16, dsh_home: Option<&str>)
     cmd.args(["/C", &full]);
     if let Some(home) = dsh_home {
         cmd.env("DSH_HOME", home);
+    }
+    // 便携 Git PATH 注入（shim 回退也一样：dsh 内部装 git 依赖时能找到 git）
+    let git_dirs = crate::portgit::path_dirs();
+    if !git_dirs.is_empty() {
+        let full_path = format!(
+            "{};{}",
+            git_dirs.join(";"),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        cmd.env("PATH", full_path);
     }
     // 国内镜像：uvx/pip 走 pypi 镜像、npm 走用户设置 registry
     apply_mirror_envs(&mut cmd);

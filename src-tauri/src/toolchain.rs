@@ -50,6 +50,8 @@ impl Toolchain {
         if self.node_dir.is_dir() {
             dirs.push(self.node_dir.display().to_string());
         }
+        // 便携 Git：PATH 前缀加 runtime\git\cmd（供 pnpm 解析 github:/git+ 依赖时找到 git）
+        dirs.extend(crate::portgit::path_dirs());
         if let Some(pnpm) = &self.pnpm {
             if let Some(d) = pnpm.parent() {
                 let s = d.display().to_string();
