@@ -2686,7 +2686,7 @@ async fn install_local_plugin_cmd(
     path: String,
 ) -> Result<installer::InstallOutcome, String> {
     let env = get_env_inner(&state, &env_id)?;
-    if env.run_command.trim().is_empty() {
+    if env.run_command.trim().is_empty() && !installer::is_official_desktop_profile(&profile) {
         return Err("该环境未绑定 dsh 运行时，无法安装插件".to_string());
     }
     let p = std::path::Path::new(&path);
