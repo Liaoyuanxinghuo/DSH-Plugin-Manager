@@ -486,3 +486,17 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .theme-dot.dark { background: #0f1419; border: 1px solid #3a4756; }
 .theme-dot.light { background: #ffffff; border: 1px solid #c0c6cc; }
 .theme-dot.deepseek { background: #4d6bfe; border: 1px solid #2b49e0; }
+
+/* 紧凑刷新按钮旋转动效 */
+@keyframes spin-anim {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.btn-icon-refresh.spinning {
+  animation: spin-anim 0.7s linear infinite;
+  pointer-events: none;
+  opacity: 0.7;
+}
+.btn-icon-refresh:hover:not(:disabled) {
+  color: var(--accent);
+}

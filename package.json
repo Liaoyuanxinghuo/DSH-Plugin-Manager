@@ -1,7 +1,7 @@
 {
   "name": "dsh-manager",
   "private": true,
-  "version": "0.3.19",
+  "version": "0.3.20",
   "license": "CC-BY-NC-SA-4.0",
   "type": "module",
   "scripts": {

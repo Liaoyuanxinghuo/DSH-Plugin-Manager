@@ -250,6 +250,7 @@ export default function App() {
   const [checkingUpdates, setCheckingUpdates] = useState(false);
   const [updatingName, setUpdatingName] = useState<string | null>(null);
   const [confirmUninstall, setConfirmUninstall] = useState<PluginInfo | null>(null);
+  const [refreshingPlugins, setRefreshingPlugins] = useState(false);
   // 新建 / 删除 profile
   const [showCreateProfile, setShowCreateProfile] = useState(false);
   const [confirmDeleteProfile, setConfirmDeleteProfile] = useState<ProfileInfo | null>(null);
@@ -850,6 +851,22 @@ export default function App() {
       setUpdates(null);
     } finally {
       setCheckingUpdates(false);
+    }
+  };
+
+  // 单独重新检测当前选中的 profile 的插件状态与列表
+  const handleRefreshPlugins = async () => {
+    if (!selectedEnv || !selectedProfile) return;
+    setRefreshingPlugins(true);
+    try {
+      const pdir = profileDirOf(selectedProfile);
+      const list = await api.listPlugins(selectedEnv, selectedProfile, pdir);
+      setPlugins(list);
+      setInfo(`已刷新插件状态：共 ${list.length} 个插件`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRefreshingPlugins(false);
     }
   };
 
@@ -1929,7 +1946,18 @@ export default function App() {
               {/* 插件列表 */}
               <div className="control-card grow">
                 <div className="card-title">
-                  已安装插件（{plugins.length}）
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    已安装插件（{plugins.length}）
+                    <button
+                      className={`btn tiny ghost btn-icon-refresh ${refreshingPlugins ? "spinning" : ""}`}
+                      onClick={handleRefreshPlugins}
+                      disabled={refreshingPlugins || !selectedEnv || !selectedProfile}
+                      title="刷新插件列表与状态"
+                      style={{ padding: "0 4px", minWidth: 22, height: 20, fontSize: 13, lineHeight: "18px" }}
+                    >
+                      ⟳
+                    </button>
+                  </span>
                   <div className="title-actions">
                     <button
                       className="btn tiny"
@@ -2898,7 +2926,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.19</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.20</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

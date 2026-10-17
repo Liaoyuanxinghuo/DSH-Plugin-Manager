@@ -1830,7 +1830,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.19", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.20", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -1857,27 +1857,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.19", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.20", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.19_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.20_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.19"));
+    await user.click(screen.getByText("⬇ 下载 v0.3.20"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.19" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.20" });
     // 打开所在文件夹
     await user.click(screen.getByText("📂 打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.19_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.20_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("🔄 关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.19_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.20_x64-setup.exe" });
     });
   });
 });
@@ -2200,6 +2200,22 @@ describe("官方桌面版 (desktop) 适配", () => {
     });
     expect(screen.getByText("⏹ 停止官方桌面")).toBeInTheDocument();
   });
+
+describe("插件列表紧凑刷新", () => {
+  it("点击插件列表标题旁的刷新按钮，重新调用 list_plugins 刷新当前 profile 插件", async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByTitle("刷新插件列表与状态")).toBeInTheDocument();
+    });
+    mockInvoke.mockClear();
+    await user.click(screen.getByTitle("刷新插件列表与状态"));
+    await waitFor(() => {
+      expect(mockInvoke.mock.calls.some((c) => c[0] === "list_plugins")).toBe(true);
+    });
+    expect(screen.getByText(/已刷新插件状态/)).toBeInTheDocument();
+  });
+});
 });
 
 function mockAllDefault(cmd: string) {
