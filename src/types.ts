@@ -129,6 +129,12 @@ export interface DshStatus {
   url?: string | null;
 }
 
+export interface OfficialDesktopStatus {
+  running: boolean;
+  pid: number | null;
+  exePath: string | null;
+}
+
 /** 孤儿 node 进程候选（同 bin.js + 同 profile 精确匹配，不在运行表；待用户确认后清理） */
 export interface OrphanProcess {
   pid: number;

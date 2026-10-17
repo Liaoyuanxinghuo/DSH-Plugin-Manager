@@ -156,6 +156,12 @@ function mockAll() {
         return Promise.resolve([]);
       case "list_profiles_from_dir":
         return Promise.resolve([]);
+      case "get_official_desktop_status_cmd":
+        return Promise.resolve({ running: false, pid: null, exePath: "C:\\Program Files\\DeepSeek Harness\\DeepSeek Harness.exe" });
+      case "start_official_desktop_cmd":
+        return Promise.resolve(12345);
+      case "stop_official_desktop_cmd":
+        return Promise.resolve(null);
       default:
         return Promise.resolve(null);
     }
@@ -1824,7 +1830,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.18", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.19", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -1851,27 +1857,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.18", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.19", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.18_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.19_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.18"));
+    await user.click(screen.getByText("⬇ 下载 v0.3.19"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.18" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.19" });
     // 打开所在文件夹
     await user.click(screen.getByText("📂 打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.18_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.19_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("🔄 关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.18_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.19_x64-setup.exe" });
     });
   });
 });
@@ -2119,6 +2125,83 @@ describe("便携 Git 检测与初始化提示", () => {
   });
 });
 
+describe("官方桌面版 (desktop) 适配", () => {
+  it("选中 desktop profile 时展示「官方桌面」徽标、隐藏删除按钮并展示客户端控制", async () => {
+    localStorage.setItem("dshpm-sel-profile", "desktop");
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_all_profiles") {
+        return Promise.resolve([
+          {
+            name: "desktop",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            path: "C:\\Users\\test\\.dsh\\profiles\\desktop",
+            pluginCount: 2,
+            dataSize: 1024,
+            modified: "2026-10-10",
+            hasPatch: true,
+            hasLock: true,
+            hasPackage: true,
+          },
+        ]);
+      }
+      if (cmd === "get_official_desktop_status_cmd") {
+        return Promise.resolve({
+          running: false,
+          pid: null,
+          exePath: "E:\\software\\DSHD\\DeepSeek Harness.exe",
+        });
+      }
+      return mockAllDefault(cmd);
+    });
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("官方桌面")).toBeInTheDocument();
+    });
+    // 官方桌面 profile 必须隐藏删除按钮
+    expect(screen.queryByText("🗑 删除")).not.toBeInTheDocument();
+    // 显示官方桌面客户端控制与启动按钮
+    expect(screen.getByText("官方桌面客户端控制")).toBeInTheDocument();
+    expect(screen.getByText("▶ 启动官方桌面")).toBeInTheDocument();
+    expect(screen.getByText("🖥 已在官方桌面窗口运行")).toBeInTheDocument();
+  });
+
+  it("官方桌面版运行中时展示运行状态与「⏹ 停止官方桌面」按钮", async () => {
+    localStorage.setItem("dshpm-sel-profile", "desktop");
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_all_profiles") {
+        return Promise.resolve([
+          {
+            name: "desktop",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            path: "C:\\Users\\test\\.dsh\\profiles\\desktop",
+            pluginCount: 2,
+            dataSize: 1024,
+            modified: "2026-10-10",
+            hasPatch: true,
+            hasLock: true,
+            hasPackage: true,
+          },
+        ]);
+      }
+      if (cmd === "get_official_desktop_status_cmd") {
+        return Promise.resolve({
+          running: true,
+          pid: 50504,
+          exePath: "E:\\software\\DSHD\\DeepSeek Harness.exe",
+        });
+      }
+      return mockAllDefault(cmd);
+    });
+
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/● 运行中（官方桌面）/)).toBeInTheDocument();
+    });
+    expect(screen.getByText("⏹ 停止官方桌面")).toBeInTheDocument();
+  });
+});
+
 function mockAllDefault(cmd: string) {
   switch (cmd) {
     case "check_portable_runtime_cmd":
@@ -2196,6 +2279,12 @@ function mockAllDefault(cmd: string) {
         logsDir: "C:\\Users\\test\\.dsh\\logs",
         binPath: null,
       });
+    case "get_official_desktop_status_cmd":
+      return Promise.resolve({ running: false, pid: null, exePath: "C:\\Program Files\\DeepSeek Harness\\DeepSeek Harness.exe" });
+    case "start_official_desktop_cmd":
+      return Promise.resolve(12345);
+    case "stop_official_desktop_cmd":
+      return Promise.resolve(null);
     default:
       return Promise.resolve(null);
   }

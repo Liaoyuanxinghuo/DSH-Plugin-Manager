@@ -1358,8 +1358,49 @@ async fn stop_all_dsh_cmd(state: State<'_, AppState>) -> Result<Vec<String>, Str
                 Err(e) => failed.push(e),
             }
         }
+
     }
     Ok(failed)
+}
+
+/// 获取官方桌面版运行状态与已安装 exe 路径
+#[tauri::command]
+async fn get_official_desktop_status_cmd() -> Result<runner::OfficialDesktopStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let running_info = runner::probe_official_desktop_running();
+        let (running, pid) = match running_info {
+            Some((p, _)) => (true, Some(p)),
+            None => (false, None),
+        };
+        let exe_path = runner::find_official_desktop_exe();
+        Ok(runner::OfficialDesktopStatus {
+            running,
+            pid,
+            exe_path,
+        })
+    })
+    .await
+    .map_err(|e| format!("探测官方桌面端失败: {e}"))?
+}
+
+/// 启动官方桌面客户端
+#[tauri::command]
+async fn start_official_desktop_cmd(custom_exe: Option<String>) -> Result<u32, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        runner::start_official_desktop(custom_exe.as_deref())
+    })
+    .await
+    .map_err(|e| format!("启动官方桌面端失败: {e}"))?
+}
+
+/// 停止官方桌面客户端
+#[tauri::command]
+async fn stop_official_desktop_cmd() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        runner::stop_official_desktop()
+    })
+    .await
+    .map_err(|e| format!("停止官方桌面端失败: {e}"))?
 }
 
 /// 就绪判定（可测试）：端口通 **且**（拿到带 token 的 web URL **或** web 已在 HTTP 服务）。
@@ -2067,7 +2108,7 @@ async fn fix_deps_cmd(
     profiles_dir_str: String,
 ) -> Result<installer::InstallOutcome, String> {
     let env = get_env_inner(&state, &env_id)?;
-    if env.run_command.trim().is_empty() {
+    if env.run_command.trim().is_empty() && !installer::is_official_desktop_profile(&profile) {
         return Err("该环境未绑定 dsh 运行时，无法修复依赖".to_string());
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
@@ -2080,6 +2121,18 @@ async fn fix_deps_cmd(
     let dsh_home = runner::dsh_home_of(&profiles_dir);
     let app2 = app.clone();
     let env2 = env.clone();
+    let app2 = app.clone();
+    let env2 = env.clone();
+    // 分流：官方桌面版（desktop）直接调用底层 pnpm install
+    if installer::is_official_desktop_profile(&profile) {
+        let args = ["install".to_string()];
+        return tauri::async_runtime::spawn_blocking(move || {
+            Ok(installer::run_pnpm_in_dir(&app2, &profile_dir, &args))
+        })
+        .await
+        .map_err(|e| format!("后台任务失败：{e}"))?;
+    }
+
     let args = ["plugin".to_string(), "--profile".to_string(), profile, "install".to_string()];
     // pnpm install 子进程较久，放阻塞线程池
     tauri::async_runtime::spawn_blocking(move || {
@@ -2685,7 +2738,7 @@ async fn install_plugin_cmd(
     spec: String,
 ) -> Result<installer::InstallOutcome, String> {
     let env = get_env_inner(&state, &env_id)?;
-    if env.run_command.trim().is_empty() {
+    if env.run_command.trim().is_empty() && !installer::is_official_desktop_profile(&profile) {
         return Err("该环境未绑定 dsh 运行时，无法安装插件".to_string());
     }
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
@@ -2714,7 +2767,7 @@ async fn remove_plugin_cmd(
     name: String,
 ) -> Result<installer::InstallOutcome, String> {
     let env = get_env_inner(&state, &env_id)?;
-    if env.run_command.trim().is_empty() {
+    if env.run_command.trim().is_empty() && !installer::is_official_desktop_profile(&profile) {
         return Err("该环境未绑定 dsh 运行时，无法卸载插件".to_string());
     }
     if INBOX_BUNDLES.contains(&name.as_str()) {
@@ -3083,6 +3136,9 @@ pub fn run() {
             check_portable_runtime_cmd,
             init_portable_runtime_cmd,
             check_portable_git_cmd,
+            get_official_desktop_status_cmd,
+            start_official_desktop_cmd,
+            stop_official_desktop_cmd,
         ])
         .setup(|app| {
             // 按物理像素设置窗口初始尺寸：避免高 DPI 缩放下逻辑尺寸被放大
@@ -3290,13 +3346,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.18_x64-setup.exe", "0.3.18"));
-        assert!(asset_matches("dsh-manager_0.3.18_x64-setup.exe", "0.3.18"));
-        assert!(asset_matches("任意名_0.3.18_x64-setup.exe", "0.3.18"));
-        assert!(!asset_matches("DSH-Manager-0.3.18-win-x64.exe", "0.3.18"));
-        assert!(!asset_matches("DSH Manager_0.3.18_x64-setup.exe.sha256", "0.3.18"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.18"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.18"));
+        assert!(asset_matches("DSH Manager_0.3.19_x64-setup.exe", "0.3.19"));
+        assert!(asset_matches("dsh-manager_0.3.19_x64-setup.exe", "0.3.19"));
+        assert!(asset_matches("任意名_0.3.19_x64-setup.exe", "0.3.19"));
+        assert!(!asset_matches("DSH-Manager-0.3.19-win-x64.exe", "0.3.19"));
+        assert!(!asset_matches("DSH Manager_0.3.19_x64-setup.exe.sha256", "0.3.19"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.19"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.19"));
     }
 
     #[test]
@@ -3429,10 +3485,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.18_x64-setup.exe", "0.3.18"));
+        assert!(asset_matches("DSH.Manager_0.3.19_x64-setup.exe", "0.3.19"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.18_x64-setup.exe", "0.3.18"));
-        assert!(asset_matches("DSH.MANAGER_0.3.18_X64-SETUP.EXE", "0.3.18"));
+        assert!(asset_matches("dsh.manager_0.3.19_x64-setup.exe", "0.3.19"));
+        assert!(asset_matches("DSH.MANAGER_0.3.19_X64-SETUP.EXE", "0.3.19"));
     }
 
     #[test]
@@ -3440,7 +3496,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.18", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.19", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

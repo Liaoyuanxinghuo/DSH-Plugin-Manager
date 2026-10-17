@@ -30,6 +30,7 @@ import type {
   PluginUpdate,
   ProfileInfo,
   RunningProcess,
+  OfficialDesktopStatus,
   ScanDirEntry,
   StartResult,
   UpdateInfo,
@@ -102,6 +103,13 @@ export const api = {
   /** 清理用户确认的孤儿进程（返回清理失败的 PID） */
   killOrphans: (pids: number[]) => invoke<number[]>("kill_orphans_cmd", { pids }),
   /** 停止全部运行中的 DSH（关闭软件前用）；返回停止失败项 */
+  /** 官方桌面版客户端状态探测与控制 */
+  getOfficialDesktopStatus: () =>
+    invoke<OfficialDesktopStatus>("get_official_desktop_status_cmd"),
+  startOfficialDesktop: (customExe?: string) =>
+    invoke<number>("start_official_desktop_cmd", { customExe }),
+  stopOfficialDesktop: () =>
+    invoke<void>("stop_official_desktop_cmd"),
   stopAllDsh: () => invoke<string[]>("stop_all_dsh_cmd"),
   openPath: (path: string) => invoke<void>("open_path", { path }),
   openUrl: (url: string) => invoke<void>("open_url_cmd", { url }),

@@ -525,6 +525,48 @@ pub fn drop_from_manifest(profile_dir: &Path, name: &str) -> Result<bool, String
     Ok(true)
 }
 
+/// 确保指定 bundle 存在于 package.json 的 `dsh.profile.bundles` 中（去重追加）。
+/// 官方桌面版激活插件依赖此声明。返回是否有改动。
+pub fn ensure_bundle_in_manifest(profile_dir: &Path, name: &str) -> Result<bool, String> {
+    let file = profile_dir.join("package.json");
+    if !file.is_file() {
+        return Ok(false);
+    }
+    let raw = fs::read_to_string(&file).map_err(|e| format!("读取 package.json 失败: {e}"))?;
+    let mut pj: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("解析 package.json 失败: {e}"))?;
+    let dsh = pj.as_object_mut().and_then(|o| {
+        if !o.contains_key("dsh") {
+            o.insert("dsh".to_string(), serde_json::json!({}));
+        }
+        o.get_mut("dsh").and_then(|d| d.as_object_mut())
+    });
+    let profile_obj = dsh.and_then(|d| {
+        if !d.contains_key("profile") {
+            d.insert("profile".to_string(), serde_json::json!({}));
+        }
+        d.get_mut("profile").and_then(|p| p.as_object_mut())
+    });
+    let Some(profile_obj) = profile_obj else {
+        return Ok(false);
+    };
+    if !profile_obj.contains_key("bundles") {
+        profile_obj.insert("bundles".to_string(), serde_json::json!([]));
+    }
+    let Some(bundles) = profile_obj.get_mut("bundles").and_then(|b| b.as_array_mut()) else {
+        return Ok(false);
+    };
+    if bundles.iter().any(|v| v.as_str() == Some(name)) {
+        return Ok(false);
+    }
+    bundles.push(serde_json::Value::String(name.to_string()));
+    let out = serde_json::to_string_pretty(&pj).map_err(|e| format!("序列化失败: {e}"))?;
+    let tmp = profile_dir.join("package.json.dshpm-tmp");
+    fs::write(&tmp, out + "\n").map_err(|e| format!("写入临时清单失败: {e}"))?;
+    fs::rename(&tmp, &file).map_err(|e| format!("替换 package.json 失败: {e}"))?;
+    Ok(true)
+}
+
 /// host 部署目录对应的 node_modules 根（market `hostNodeModulesRoot` 等价）：
 /// CLI 布局 `<prefix>/node_modules/@deepseek-ai/dsh` → `<prefix>/node_modules`；
 /// 平铺布局（Desktop）→ `<dir>/node_modules`。
@@ -926,5 +968,32 @@ mod tests {
         assert!(raw2.contains("stillhere"), "失败且仍在磁盘时不得动清单: {raw2}");
 
         let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn test_ensure_bundle_in_manifest() {
+        let tmp = std::env::temp_dir().join(format!("dshpm-bundle-add-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(
+            tmp.join("package.json"),
+            r#"{"name":"p","dependencies":{},"dsh":{"profile":{"bundles":["@deepseek-ai/dsh-base"]}}}"#,
+        )
+        .unwrap();
+
+        // 追加新 bundle
+        assert!(ensure_bundle_in_manifest(&tmp, "my-plugin").unwrap());
+        let raw = fs::read_to_string(tmp.join("package.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let b = v["dsh"]["profile"]["bundles"].as_array().unwrap();
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[1], "my-plugin");
+
+        // 重复追加应为 false 且不改变数组
+        assert!(!ensure_bundle_in_manifest(&tmp, "my-plugin").unwrap());
+        let raw2 = fs::read_to_string(tmp.join("package.json")).unwrap();
+        let v2: serde_json::Value = serde_json::from_str(&raw2).unwrap();
+        assert_eq!(v2["dsh"]["profile"]["bundles"].as_array().unwrap().len(), 2);
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

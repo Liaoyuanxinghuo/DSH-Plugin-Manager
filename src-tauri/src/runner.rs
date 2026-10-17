@@ -733,10 +733,181 @@ pub fn now_iso() -> String {
     format!("{year:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02}")
 }
 
+/// 官方桌面版（DeepSeek Harness.exe）运行状态
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OfficialDesktopStatus {
+    /// 是否正在运行
+    pub running: bool,
+    /// 主进程 PID
+    pub pid: Option<u32>,
+    /// 官方可执行文件绝对路径（已安装/找到时）
+    pub exe_path: Option<String>,
+}
+
+/// 探测当前系统中是否有正在运行的官方桌面客户端（DeepSeek Harness.exe 主进程）
+pub fn probe_official_desktop_running() -> Option<(u32, String)> {
+    // 1) 快路径：通过 tasklist 列出名为 "DeepSeek Harness.exe" 的进程 PID
+    let out = crate::fsutil::hidden_command("tasklist")
+        .args(["/FI", "IMAGENAME eq DeepSeek Harness.exe", "/FO", "CSV", "/NH"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut pids = Vec::new();
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.split(',').collect();
+        if parts.len() >= 2 {
+            let pid_str = parts[1].trim().trim_matches('"');
+            if let Ok(pid) = pid_str.parse::<u32>() {
+                pids.push(pid);
+            }
+        }
+    }
+    if pids.is_empty() {
+        return None;
+    }
+
+    // 2) 找到主进程 PID 及 exe 路径：用 powershell 查非 --type= 子进程
+    let script = r#"
+        $p = Get-CimInstance Win32_Process -Filter "Name='DeepSeek Harness.exe'" | Where-Object { -not $_.CommandLine.Contains('--type=') } | Select-Object -First 1 ProcessId, ExecutablePath;
+        if ($p) { Write-Output ($p.ProcessId.ToString() + "`t" + $p.ExecutablePath); exit 0 }
+        exit 1
+    "#;
+    let ps_out = crate::fsutil::hidden_command("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .ok();
+    if let Some(o) = ps_out {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let trimmed = s.trim();
+            let mut parts = trimmed.splitn(2, '\t');
+            if let (Some(p_str), Some(exe_str)) = (parts.next(), parts.next()) {
+                if let Ok(p) = p_str.parse::<u32>() {
+                    return Some((p, exe_str.to_string()));
+                }
+            }
+        }
+    }
+
+    // 兜底：取第一个 PID
+    let fallback_pid = pids[0];
+    let exe = find_official_desktop_exe().unwrap_or_default();
+    Some((fallback_pid, exe))
+}
+
+/// 查找系统中已安装的官方桌面客户端 exe 路径
+pub fn find_official_desktop_exe() -> Option<String> {
+    // 1. 若当前有运行进程，直接返回其路径
+    if let Some((_, exe)) = probe_official_desktop_running() {
+        if !exe.is_empty() && Path::new(&exe).is_file() {
+            return Some(exe);
+        }
+    }
+
+    // 2. 查注册表 Uninstall 列表中的 DeepSeek Harness 安装目录
+    let script = r#"
+        $roots = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*');
+        foreach ($r in $roots) {
+            $m = Get-ItemProperty $r -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'DeepSeek Harness' } | Select-Object -First 1;
+            if ($m) {
+                if ($m.InstallLocation) {
+                    $p = Join-Path $m.InstallLocation 'DeepSeek Harness.exe';
+                    if (Test-Path $p) { Write-Output $p; exit 0 }
+                }
+                if ($m.DisplayIcon) {
+                    $icon = $m.DisplayIcon.Split(',')[0].Trim('"');
+                    if (Test-Path $icon) { Write-Output $icon; exit 0 }
+                }
+            }
+        }
+        exit 1
+    "#;
+    let out = crate::fsutil::hidden_command("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .ok();
+    if let Some(o) = out {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if !s.is_empty() && Path::new(&s).is_file() {
+                return Some(s);
+            }
+        }
+    }
+
+    // 3. 常见默认安装路径兜底
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let p = Path::new(&local_app_data)
+            .join("Programs")
+            .join("DeepSeek Harness")
+            .join("DeepSeek Harness.exe");
+        if p.is_file() {
+            return Some(p.to_string_lossy().to_string());
+        }
+    }
+
+    None
+}
+
+/// 停止官方桌面客户端（taskkill 整棵进程树）
+pub fn stop_official_desktop() -> Result<(), String> {
+    let pids = probe_official_desktop_running();
+    let out = crate::fsutil::hidden_command("taskkill")
+        .args(["/IM", "DeepSeek Harness.exe", "/T", "/F"])
+        .output()
+        .map_err(|e| format!("执行 taskkill 失败: {e}"))?;
+    if out.status.success() || pids.map(|(pid, _)| !is_pid_alive(pid)).unwrap_or(true) {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(format!("停止官方桌面端失败: {}", err.trim()))
+    }
+}
+
+/// 启动官方桌面客户端
+pub fn start_official_desktop(custom_exe: Option<&str>) -> Result<u32, String> {
+    let exe = custom_exe
+        .map(|s| s.to_string())
+        .or_else(find_official_desktop_exe)
+        .ok_or_else(|| "未找到官方桌面客户端可执行文件（DeepSeek Harness.exe）".to_string())?;
+    if !Path::new(&exe).is_file() {
+        return Err(format!("官方可执行文件不存在: {exe}"));
+    }
+
+    let mut cmd = Command::new(&exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // 脱离当前进程独立启动
+        cmd.creation_flags(0x0000_0008); // DETACHED_PROCESS
+    }
+    let child = cmd.spawn().map_err(|e| format!("启动官方桌面客户端失败: {e}"))?;
+    Ok(child.id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn test_find_official_desktop_exe_or_none() {
+        // 测试不 panic，能正常返回 Some 或 None
+        let exe = find_official_desktop_exe();
+        if let Some(ref p) = exe {
+            assert!(Path::new(p).is_file());
+            assert!(p.to_lowercase().contains("deepseek harness.exe"));
+        }
+    }
+
+    #[test]
+    fn test_probe_official_desktop_running_no_panic() {
+        let _ = probe_official_desktop_running();
+    }
     #[test]
     #[ignore]
     fn real_start_with_empty_bin_path() {

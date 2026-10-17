@@ -174,6 +174,9 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .tag.hint { background: #3a3023; color: #e0b76e; }
 [data-theme="light"] .tag.hint { background: #ffffff; color: #111827; border: 1px solid #d0d7de; }
 [data-theme="deepseek"] .tag.hint { background: #dbeafe; color: #111827; border: 1px solid #bfdbfe; }
+.tag.official { background: #1e293b; color: #60a5fa; border: 1px solid #3b82f6; font-weight: 600; padding: 2px 7px; }
+[data-theme="light"] .tag.official { background: #ffffff; color: #1d4ed8; border: 1px solid #93c5fd; }
+[data-theme="deepseek"] .tag.official { background: #dbeafe; color: #1e40af; border: 1px solid #60a5fa; }
 /* 导入对话框 */
 .import-choices { display: flex; flex-direction: column; gap: 12px; margin: 12px 0; }
 .choice-card { text-align: left; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-bg); cursor: pointer; transition: border-color .15s; }

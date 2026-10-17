@@ -232,6 +232,30 @@ pub fn install_plugin(
     let profile_dir = profiles_dir.join(profile);
     let registry = crate::settings::load_settings().npm_registry;
     let _ = crate::dsh_install::ensure_profile_npmrc(&profile_dir, &registry);
+
+    // 分流：官方桌面版 profile（desktop）不走 dsh plugin CLI（避免 CLI 报拒绝或文件锁冲突），
+    // 改走底层 pnpm 在 profile 目录执行 add，并在成功后同步追加 bundle 到 package.json 的 dsh.profile.bundles
+    if is_official_desktop_profile(profile) {
+        let args = vec!["add".to_string(), spec.to_string()];
+        let outcome = run_pnpm_in_dir(app, &profile_dir, &args);
+        if outcome.success {
+            // 提取包名（去掉版本/tag，如 dsh-better-sidebar@0.24.1 -> dsh-better-sidebar）
+            let pkg_name = if let Some(stripped) = spec.strip_prefix('@') {
+                let mut parts = stripped.splitn(2, '/');
+                let scope = parts.next().unwrap_or_default();
+                let rest = parts.next().unwrap_or_default();
+                let name_only = rest.split('@').next().unwrap_or(rest);
+                format!("@{scope}/{name_only}")
+            } else {
+                spec.split('@').next().unwrap_or(spec).to_string()
+            };
+            // 同步追加 bundle 声明（已存在则幂等跳过）
+            let _ = crate::profile_io::ensure_bundle_in_manifest(&profile_dir, &pkg_name);
+        }
+        return outcome;
+    }
+
+    // Web 及普通 Profile 维持原有 CLI 安装链路不变
     let args = vec![
         "plugin".to_string(),
         "--profile".to_string(),
@@ -240,6 +264,147 @@ pub fn install_plugin(
         spec.to_string(),
     ];
     run_dsh_with_logs(app, env, &args, Some(&dsh_home_of(profiles_dir)))
+}
+
+/// 是否为官方桌面版的 profile（名称为 desktop，且来源为 profiles 目录）
+pub fn is_official_desktop_profile(profile: &str) -> bool {
+    profile.eq_ignore_ascii_case("desktop")
+}
+
+/// 直接在指定目录执行 pnpm 命令（流式日志），专用于官方桌面版 profile 的包安装与卸载
+pub fn run_pnpm_in_dir(
+    app: &tauri::AppHandle,
+    cwd: &std::path::Path,
+    args: &[String],
+) -> InstallOutcome {
+    let registry = crate::settings::load_settings().npm_registry;
+    let tc = match crate::toolchain::ensure(app, &registry) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = app.emit(
+                "install-log",
+                serde_json::json!({ "line": format!("工具链检查失败: {e}"), "kind": "stderr" }),
+            );
+            return InstallOutcome {
+                success: false,
+                exit_code: None,
+                summary: format!("工具链不可用：{e}"),
+            };
+        }
+    };
+
+    // 1) 优先用已安装的 pnpm.cmd 绝对路径
+    // 2) 兜底：若系统无全局 pnpm，尝试探测官方桌面端自带的 resources\runtime\pnpm
+    let mut cmd = if let Some(pnpm_exe) = tc.pnpm_exe() {
+        let mut c = Command::new(pnpm_exe);
+        for a in args {
+            c.arg(a);
+        }
+        c
+    } else {
+        // 探测官方桌面端自带 pnpm：DeepSeek Harness.exe + pnpm.mjs (ELECTRON_RUN_AS_NODE=1)
+        let desktop_exe = crate::runner::find_official_desktop_exe();
+        let mut found_desktop_pnpm = None;
+        if let Some(ref exe) = desktop_exe {
+            if let Some(parent) = std::path::Path::new(exe).parent() {
+                let pnpm_mjs = parent.join("resources").join("runtime").join("pnpm").join("bin").join("pnpm.mjs");
+                if pnpm_mjs.is_file() {
+                    found_desktop_pnpm = Some((exe.clone(), pnpm_mjs));
+                }
+            }
+        }
+
+        if let Some((exe, mjs)) = found_desktop_pnpm {
+            let mut c = Command::new(exe);
+            c.env("ELECTRON_RUN_AS_NODE", "1");
+            c.arg(mjs);
+            for a in args {
+                c.arg(a);
+            }
+            c
+        } else {
+            // 最后的兜底：调用 cmd /c pnpm
+            let mut full = "pnpm".to_string();
+            for a in args {
+                full.push(' ');
+                full.push_str(a);
+            }
+            let mut c = Command::new("cmd");
+            c.args(["/C", &format!("chcp 65001 >nul && {full}")]);
+            c
+        }
+    };
+
+    cmd.current_dir(cwd);
+    tc.apply_runtime_env(&mut cmd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = app.emit("install-log", serde_json::json!({ "line": format!("启动 pnpm 失败: {e}"), "kind": "stderr" }));
+            return InstallOutcome { success: false, exit_code: None, summary: format!("启动 pnpm 失败: {e}") };
+        }
+    };
+
+    let out_handle = {
+        let app = app.clone();
+        let stdout = child.stdout.take();
+        std::thread::spawn(move || {
+            if let Some(stdout) = stdout {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().flatten() {
+                    let _ = app.emit("install-log", serde_json::json!({ "line": line, "kind": "stdout" }));
+                }
+            }
+        })
+    };
+
+    let err_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let err_handle = {
+        let app = app.clone();
+        let err_lines = err_lines.clone();
+        let stderr = child.stderr.take();
+        std::thread::spawn(move || {
+            if let Some(stderr) = stderr {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().flatten() {
+                    if !line.trim().is_empty() {
+                        let mut v = err_lines.lock().unwrap();
+                        if v.len() < 200 {
+                            v.push(line.clone());
+                        }
+                    }
+                    let _ = app.emit("install-log", serde_json::json!({ "line": line, "kind": "stderr" }));
+                }
+            }
+        })
+    };
+
+    let _ = out_handle.join();
+    let _ = err_handle.join();
+    let status = child.wait();
+    let success = match &status {
+        Ok(s) => s.success(),
+        Err(_) => false,
+    };
+    let exit_code = status.ok().and_then(|s| s.code());
+    let _ = app.emit(
+        "install-done",
+        serde_json::json!({ "success": success, "exitCode": exit_code }),
+    );
+    let lines = err_lines.lock().unwrap().clone();
+    let git_ok = crate::portgit::git_available();
+    InstallOutcome {
+        success,
+        exit_code,
+        summary: failure_summary(success, &lines, git_ok),
+    }
 }
 
 /// DSH CLI 语义：profile 位于 `$DSH_HOME/profiles/<name>`。
@@ -260,6 +425,14 @@ pub fn remove_plugin(
     name: &str,
     profiles_dir: &std::path::Path,
 ) -> InstallOutcome {
+    let profile_dir = profiles_dir.join(profile);
+    // 分流：官方桌面版 profile（desktop）不走 dsh plugin CLI，改走底层 pnpm remove
+    if is_official_desktop_profile(profile) {
+        let args = vec!["remove".to_string(), name.to_string()];
+        return run_pnpm_in_dir(app, &profile_dir, &args);
+    }
+
+    // Web 及普通 Profile 维持原有 CLI 卸载链路不变
     let args = vec![
         "plugin".to_string(),
         "--profile".to_string(),
@@ -310,6 +483,7 @@ mod tests {
             run_command: "dsh".into(),
             bin_path: None,
             scan_profiles_dir: None,
+
         };
         let args = vec![
             "plugin".to_string(),
@@ -321,7 +495,17 @@ mod tests {
         assert_eq!(args[0], "plugin");
         assert_eq!(args[3], "add");
         assert_eq!(args[4], "dshmarket");
+
         let _ = &env;
+    }
+
+    #[test]
+    fn test_is_official_desktop_profile() {
+        assert!(is_official_desktop_profile("desktop"));
+        assert!(is_official_desktop_profile("Desktop"));
+        assert!(is_official_desktop_profile("DESKTOP"));
+        assert!(!is_official_desktop_profile("web"));
+        assert!(!is_official_desktop_profile("dev"));
     }
 
     #[test]

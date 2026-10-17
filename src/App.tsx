@@ -24,6 +24,7 @@ import type {
   DshVersionInfo,
   DshInstallResult,
   UpdateInfo,
+  OfficialDesktopStatus,
 } from "./types";
 import "./App.css";
 
@@ -252,6 +253,9 @@ export default function App() {
   // 新建 / 删除 profile
   const [showCreateProfile, setShowCreateProfile] = useState(false);
   const [confirmDeleteProfile, setConfirmDeleteProfile] = useState<ProfileInfo | null>(null);
+  // 官方桌面版（DeepSeek Harness.exe）运行状态探测
+  const [officialDesktopStatus, setOfficialDesktopStatus] = useState<OfficialDesktopStatus | null>(null);
+  const isDesktopProfile = selectedProfile.toLowerCase() === "desktop";
   // 启动前发现孤儿 node（同 bin.js × 同 profile，不在运行表）→ 严格匹配 + 手动确认
   const [orphanPrompt, setOrphanPrompt] = useState<{
     envId: string;
@@ -550,6 +554,23 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  useEffect(() => {
+    if (!isDesktopProfile) return;
+    let active = true;
+    const pollDesktop = async () => {
+      const st = await api.getOfficialDesktopStatus().catch(() => null);
+      if (active && st) {
+        setOfficialDesktopStatus(st);
+      }
+    };
+    pollDesktop();
+    const t = setInterval(pollDesktop, 3000);
+    return () => {
+      active = false;
+      clearInterval(t);
+    };
+  }, [isDesktopProfile]);
+
   // 关闭软件拦截：若有 DSH 在运行 → 阻止关闭并弹窗三选一
   useEffect(() => {
     let unsub: (() => void) | undefined;
@@ -749,6 +770,41 @@ export default function App() {
         setShowInitBtn(false);
       }
       setInfo(`已停止 ${pname}`);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 官方桌面端启动
+  const handleStartOfficialDesktop = async () => {
+    setBusy(true);
+    setError("");
+    setInfo("正在拉起官方桌面客户端（DeepSeek Harness.exe）...");
+    try {
+      const pid = await api.startOfficialDesktop();
+      setInfo(`已拉起官方桌面客户端（PID ${pid}）`);
+      // 立即刷新状态
+      const st = await api.getOfficialDesktopStatus().catch(() => null);
+      if (st) setOfficialDesktopStatus(st);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 官方桌面端停止
+  const handleStopOfficialDesktop = async () => {
+    setBusy(true);
+    setError("");
+    setInfo("正在停止官方桌面客户端...");
+    try {
+      await api.stopOfficialDesktop();
+      setInfo("已停止官方桌面客户端");
+      const st = await api.getOfficialDesktopStatus().catch(() => null);
+      if (st) setOfficialDesktopStatus(st);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1581,10 +1637,11 @@ export default function App() {
                   >
                     ⬆ 导出
                   </button>
-                  {/* 运行中隐藏删除按钮：停止/启动按钮已占位，删除按钮会超出列表最右侧 */}
-                  {!runnings.find(
-                    (r) => r.envId === selectedEnv && r.profile === p.name,
-                  ) && (
+                  {/* 运行中隐藏删除按钮；官方桌面版 profile（desktop）彻底隐藏删除按钮防止误删核心数据 */}
+                  {p.name.toLowerCase() !== "desktop" &&
+                    !runnings.find(
+                      (r) => r.envId === selectedEnv && r.profile === p.name,
+                    ) && (
                     <button
                       className="btn tiny uninstall"
                       onClick={(e) => {
@@ -1614,6 +1671,15 @@ export default function App() {
               <div className="panel-title">
                 <h2>
                   Profile: <code>{selectedProfile}</code>
+                  {isDesktopProfile && (
+                    <span
+                      className="tag official"
+                      style={{ marginLeft: 8, verticalAlign: "middle" }}
+                      title="此 Profile 归属于 DeepSeek Harness 官方桌面客户端。支持在桌面端运行中在线热管理（安装、卸载、热启用/禁用免重启）。"
+                    >
+                      官方桌面
+                    </span>
+                  )}
                 </h2>
                 {selectedProfilesDir && (
                   <div className="profile-src" title="该 profile 所在的 profiles 目录（任意 dsh × 任意来源组合）">
@@ -1622,101 +1688,155 @@ export default function App() {
                 )}
               </div>
 
-              {/* 启动控制（多实例：任意 env×profile 独立进程，端口自动分配） */}
-              <div className="control-card">
-                <div className="card-row">
-                  <label className="check-row" title="开启后从 3080 起自动分配空闲端口，多实例互不冲突">
-                    <input
-                      type="checkbox"
-                      checked={autoPort}
-                      onChange={(e) => setAutoPort(e.target.checked)}
-                    />
-                    自动分配端口
-                  </label>
-                  {!autoPort && (
-                    <>
-                      <label>端口</label>
-                      <input
-                        type="number"
-                        value={port}
-                        min={1}
-                        max={65535}
-                        onChange={(e) => setPort(Number(e.target.value))}
-                      />
-                    </>
-                  )}
-                  <div className="status-pill">
-                    {curRun ? (
-                      <span className="pill running">
-                        ● 运行中 PID {curRun.pid} · 端口 {curRun.port}
-                      </span>
+              {/* 启动控制：官方桌面版分流 vs 普通 Web profile 多实例 */}
+              {isDesktopProfile ? (
+                <div className="control-card">
+                  <div className="card-row">
+                    <div className="card-title" style={{ margin: 0 }}>
+                      官方桌面客户端控制
+                    </div>
+                    <div className="status-pill">
+                      {officialDesktopStatus?.running ? (
+                        <span className="pill running" title={`官方桌面客户端正在运行（PID ${officialDesktopStatus.pid}）`}>
+                          ● 运行中（官方桌面）{officialDesktopStatus.pid ? ` PID ${officialDesktopStatus.pid}` : ""}
+                        </span>
+                      ) : (
+                        <span className="pill stopped">○ 未运行</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="card-row actions">
+                    {officialDesktopStatus?.running ? (
+                      <button
+                        className="btn danger"
+                        onClick={handleStopOfficialDesktop}
+                        disabled={busy}
+                        title="停止运行中的官方桌面客户端（DeepSeek Harness.exe）"
+                      >
+                        ⏹ 停止官方桌面
+                      </button>
                     ) : (
-                      <span className="pill stopped">○ 已停止</span>
+                      <button
+                        className="btn primary"
+                        onClick={handleStartOfficialDesktop}
+                        disabled={busy}
+                        title="启动官方桌面客户端（DeepSeek Harness.exe）"
+                      >
+                        ▶ 启动官方桌面
+                      </button>
                     )}
+                    <button
+                      className="btn"
+                      disabled={true}
+                      title="官方桌面版为本地桌面窗口程序，无需在浏览器中打开 Web 界面"
+                    >
+                      🖥 已在官方桌面窗口运行
+                    </button>
+                  </div>
+                  <div className="run-hint">
+                    {officialDesktopStatus?.running
+                      ? "官方桌面端正在运行中。在此添加、卸载或切换插件开关，桌面端将通过文件监听（HMR）在线热重载，无需重启！"
+                      : officialDesktopStatus?.exePath
+                      ? `已检测到官方客户端程序：${officialDesktopStatus.exePath}。点击「启动官方桌面」即可打开。`
+                      : "未检测到已安装的 DeepSeek Harness.exe。若已安装，可点击启动或直接运行客户端。"}
                   </div>
                 </div>
-                <div className="card-row actions">
-                  {curRun ? (
-                    <button
-                      className="btn warn"
-                      onClick={handleRestart}
-                      disabled={busy}
-                      title={`停止并重启 ${selectedProfile}`}
-                    >
-                      ↻ 重启 DSH
-                    </button>
-                  ) : (
-                    <button
-                      className="btn primary"
-                      onClick={() => handleStart()}
-                      disabled={busy || !selectedProfile || !selectedEnvObj?.runCommand}
-                      title={selectedEnvObj && !selectedEnvObj.runCommand ? "该环境未配置 dsh 程序，无法启动" : ""}
-                    >
-                      ▶ 启动 DSH
-                    </button>
-                  )}
-                  <button
-                    className="btn danger"
-                    onClick={() => {
-                      // 初始化中的 web：结束初始化与普通停止都走停进程
-                      if (initRunning && selectedProfile === "web") {
-                        void handleStopInit();
-                      } else {
-                        void handleStop();
-                      }
-                    }}
-                    disabled={busy || (!curRun && !initRunning)}
-                    title={initRunning ? "停止初始化进程" : "停止当前 DSH"}
-                  >
-                    ■ 停止
-                  </button>
-                  {curRun && (
-                    <>
+              ) : (
+                <div className="control-card">
+                  <div className="card-row">
+                    <label className="check-row" title="开启后从 3080 起自动分配空闲端口，多实例互不冲突">
+                      <input
+                        type="checkbox"
+                        checked={autoPort}
+                        onChange={(e) => setAutoPort(e.target.checked)}
+                      />
+                      自动分配端口
+                    </label>
+                    {!autoPort && (
+                      <>
+                        <label>端口</label>
+                        <input
+                          type="number"
+                          value={port}
+                          min={1}
+                          max={65535}
+                          onChange={(e) => setPort(Number(e.target.value))}
+                        />
+                      </>
+                    )}
+                    <div className="status-pill">
+                      {curRun ? (
+                        <span className="pill running">
+                          ● 运行中 PID {curRun.pid} · 端口 {curRun.port}
+                        </span>
+                      ) : (
+                        <span className="pill stopped">○ 已停止</span>
+                      )}
+                    </div>
+                  </div>
+                  <div className="card-row actions">
+                    {curRun ? (
                       <button
-                        className="btn"
-                        title="打开 DSH web 界面（优先 token 地址，否则自动登录）"
-                        onClick={() => {
-                          setInfo("正在打开界面…");
-                          api
-                            .openDshWeb(curRun.envId, curRun.profile, curRun.profilesDir, browserExe)
-                            .then((msg) => setInfo(msg))
-                            .catch((e) => setError(String(e)));
-                        }}
+                        className="btn warn"
+                        onClick={handleRestart}
+                        disabled={busy}
+                        title={`停止并重启 ${selectedProfile}`}
                       >
-                        🌐 打开界面
+                        ↻ 重启 DSH
                       </button>
-                      <BrowserPick browsers={browsers} value={browserExe} onChange={setBrowserExe} />
-                    </>
-                  )}
+                    ) : (
+                      <button
+                        className="btn primary"
+                        onClick={() => handleStart()}
+                        disabled={busy || !selectedProfile || !selectedEnvObj?.runCommand}
+                        title={selectedEnvObj && !selectedEnvObj.runCommand ? "该环境未配置 dsh 程序，无法启动" : ""}
+                      >
+                        ▶ 启动 DSH
+                      </button>
+                    )}
+                    <button
+                      className="btn danger"
+                      onClick={() => {
+                        // 初始化中的 web：结束初始化与普通停止都走停进程
+                        if (initRunning && selectedProfile === "web") {
+                          void handleStopInit();
+                        } else {
+                          void handleStop();
+                        }
+                      }}
+                      disabled={busy || (!curRun && !initRunning)}
+                      title={initRunning ? "停止初始化进程" : "停止当前 DSH"}
+                    >
+                      ■ 停止
+                    </button>
+                    {curRun && (
+                      <>
+                        <button
+                          className="btn"
+                          title="打开 DSH web 界面（优先 token 地址，否则自动登录）"
+                          onClick={() => {
+                            setInfo("正在打开界面…");
+                            api
+                              .openDshWeb(curRun.envId, curRun.profile, curRun.profilesDir, browserExe)
+                              .then((msg) => setInfo(msg))
+                              .catch((e) => setError(String(e)));
+                          }}
+                        >
+                          🌐 打开界面
+                        </button>
+                        <BrowserPick browsers={browsers} value={browserExe} onChange={setBrowserExe} />
+                      </>
+                    )}
+                  </div>
+                  <div className="run-hint">
+                    {runnings.length === 0
+                      ? "当前无运行实例。多个 DSH 可同时运行：不同版本 × 不同 profile 各自独立进程与端口。"
+                      : `正在运行 ${runnings.length} 个实例：${runnings
+                          .map((r) => `${r.profile}@${r.port}`)
+                          .join("、")}`}
+                  </div>
                 </div>
-                <div className="run-hint">
-                  {runnings.length === 0
-                    ? "当前无运行实例。多个 DSH 可同时运行：不同版本 × 不同 profile 各自独立进程与端口。"
-                    : `正在运行 ${runnings.length} 个实例：${runnings
-                        .map((r) => `${r.profile}@${r.port}`)
-                        .join("、")}`}
-                </div>
-              </div>
+              )}
 
               {/* 文件入口 */}
               <div className="control-card">
@@ -1738,13 +1858,13 @@ export default function App() {
               <div className="control-card">
                 <div className="card-title">健康与维护</div>
                 <div className="card-row actions">
-                  <button className="btn tiny" onClick={handleCheckDeps} disabled={checkingDeps || !selectedEnvObj?.runCommand || !selectedProfile}>
+                  <button className="btn tiny" onClick={handleCheckDeps} disabled={checkingDeps || (!selectedEnvObj?.runCommand && !isDesktopProfile) || !selectedProfile}>
                     {checkingDeps ? "检查中..." : "⟳ 依赖检查"}
                   </button>
                   <button
                     className="btn tiny"
                     onClick={handleFixDeps}
-                    disabled={fixingDeps || !selectedEnvObj?.runCommand || !deps?.some((d) => !d.installed)}
+                    disabled={fixingDeps || (!selectedEnvObj?.runCommand && !isDesktopProfile) || !deps?.some((d) => !d.installed)}
                     title={deps?.some((d) => !d.installed) ? "运行 pnpm install 补齐缺失依赖" : "先做依赖检查，有缺失时可用"}
                   >
                     {fixingDeps ? "修复中..." : "⚙ 修复依赖"}
@@ -1833,8 +1953,8 @@ export default function App() {
                         setInstallTab("local");
                         setShowInstall(true);
                       }}
-                      disabled={!selectedEnvObj?.runCommand}
-                      title={selectedEnvObj && !selectedEnvObj.runCommand ? "该环境未配置 dsh 程序" : "从本地文件夹或 tgz 导入插件"}
+                      disabled={!selectedEnvObj?.runCommand && !isDesktopProfile}
+                      title={selectedEnvObj && !selectedEnvObj.runCommand && !isDesktopProfile ? "该环境未配置 dsh 程序" : "从本地文件夹或 tgz 导入插件"}
                     >
                       ＋本地导入
                     </button>
@@ -1844,8 +1964,8 @@ export default function App() {
                         setInstallTab("market");
                         setShowInstall(true);
                       }}
-                      disabled={!selectedEnvObj?.runCommand}
-                      title={selectedEnvObj && !selectedEnvObj.runCommand ? "该环境未配置 dsh 程序" : "在线安装插件（市场/npm/自定义源）"}
+                      disabled={!selectedEnvObj?.runCommand && !isDesktopProfile}
+                      title={selectedEnvObj && !selectedEnvObj.runCommand && !isDesktopProfile ? "该环境未配置 dsh 程序" : "在线安装插件（市场/npm/自定义源）"}
                     >
                       ＋安装插件
                     </button>
@@ -2778,7 +2898,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.18</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.19</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
