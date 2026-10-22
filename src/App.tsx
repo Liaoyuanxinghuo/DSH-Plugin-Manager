@@ -1592,7 +1592,19 @@ export default function App() {
                 }}
                 title="右键可添加备注"
               >
-                <div className="profile-name"><span className="drag-handle" title="拖动排序">☰</span>{p.name}</div>
+                <div className="profile-name">
+                  <span className="drag-handle" title="拖动排序">☰</span>
+                  {p.name}
+                  {p.name.toLowerCase() === "desktop" && (
+                    <span
+                      className="tag official"
+                      style={{ marginLeft: 8, verticalAlign: "middle" }}
+                      title="此 Profile 归属于 DeepSeek Harness 官方桌面客户端。支持在桌面端运行中在线热管理（安装、卸载、热启用/禁用免重启）。"
+                    >
+                      官方桌面
+                    </span>
+                  )}
+                </div>
                 {(() => {
                   const n = notes?.[`${p.name}::${p.profilesDir}`];
                   if (!n || (!n.note && !n.hintVersion)) return null;
@@ -1644,11 +1656,28 @@ export default function App() {
                           ■ 停止
                         </button>
                       </>
+                    ) : p.name.toLowerCase() === "desktop" ? (
+                      // 官方桌面 profile：中栏只负责「选中」，启动统一走右栏「▶ 启动官方桌面」
+                      <button
+                        className="btn tiny"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setSelectedProfile(p.name);
+                          setSelectedProfilesDir(p.profilesDir);
+                        }}
+                        title="选中该 profile（启动请用右侧「▶ 启动官方桌面」）"
+                      >
+                        选中
+                      </button>
                     ) : (
                       <button
                         className="btn tiny primary"
                         onClick={(e) => {
                           e.stopPropagation();
+                          // 体验优化：点启动同时把该 profile 设为当前选中，
+                          // 右侧详情/运行状态/按钮跟着切过来（不必再点一次整行）
+                          setSelectedProfile(p.name);
+                          setSelectedProfilesDir(p.profilesDir);
                           handleStart(selectedEnv, p.name);
                         }}
                         disabled={busy || !envCanStart(selectedEnv)}
@@ -1657,7 +1686,7 @@ export default function App() {
                             ? "该环境未配置 dsh 程序，无法启动"
                             : busy
                             ? "正在执行启动/停止操作"
-                            : `启动 ${p.name}`
+                            : `启动 ${p.name}（并切换到该 profile）`
                         }
                       >
                         ▶ 启动
@@ -2948,7 +2977,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.21</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.22</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

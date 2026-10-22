@@ -398,6 +398,112 @@ describe("App 主界面", () => {
     expect(startCalls).toBe(1);
   });
 
+  it("点中栏「▶ 启动」同时把该 profile 切为当前选中", async () => {
+    let startedProfile = "";
+    mockInvoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "start_dsh_cmd") {
+        startedProfile = (args as { profile?: string })?.profile ?? "";
+        return new Promise(() => {}); // 启动进行中：不返回
+      }
+      if (cmd === "list_all_profiles") {
+        return Promise.resolve([
+          {
+            name: "web",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            path: "C:\\Users\\test\\.dsh\\profiles\\web",
+            pluginCount: 1,
+            dataSize: 0,
+            modified: "",
+            hasPatch: false,
+            hasLock: false,
+            hasPackage: true,
+          },
+          {
+            name: "headless",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            path: "C:\\Users\\test\\.dsh\\profiles\\headless",
+            pluginCount: 0,
+            dataSize: 0,
+            modified: "",
+            hasPatch: false,
+            hasLock: false,
+            hasPackage: false,
+          },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    // 默认选中 web（第一个）；点 headless 那一行的启动按钮（中栏按列表顺序渲染）
+    const startBtns = await screen.findAllByText("▶ 启动");
+    expect(startBtns).toHaveLength(2);
+    await act(async () => {
+      startBtns[1].click();
+    });
+    // 启动的是 headless
+    expect(startedProfile).toBe("headless");
+    // 选中项已切到 headless（右侧详情跟着切过去）
+    expect(document.querySelector(".profile-item.active")?.textContent).toContain("headless");
+    // 清理选中态：避免泄漏到后续用例（其它用例依赖默认选中 web）
+    localStorage.removeItem("dshpm-sel-profile");
+    localStorage.removeItem("dshpm-sel-profile-dir");
+  });
+
+  it("官方桌面（desktop）行只显示「选中」：不启动，仅切换选中", async () => {
+    let startCalls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_dsh_cmd") {
+        startCalls += 1;
+        return new Promise(() => {});
+      }
+      if (cmd === "list_all_profiles") {
+        return Promise.resolve([
+          {
+            name: "web",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            path: "C:\\Users\\test\\.dsh\\profiles\\web",
+            pluginCount: 3,
+            dataSize: 1024,
+            modified: "2026-09-27 10:00",
+            hasPatch: true,
+            hasLock: true,
+            hasPackage: true,
+          },
+          {
+            name: "desktop",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            path: "C:\\Users\\test\\.dsh\\profiles\\desktop",
+            pluginCount: 1,
+            dataSize: 2048,
+            modified: "2026-09-27 10:00",
+            hasPatch: true,
+            hasLock: true,
+            hasPackage: true,
+          },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    // desktop 行是「选中」按钮；中栏只剩一个「▶ 启动」（web 那行）
+    const selectBtn = await screen.findByText("选中");
+    expect(screen.getAllByText("▶ 启动")).toHaveLength(1);
+    // 中栏 desktop 行标题右侧有「官方桌面」标签（此刻右栏选中的是 web，故只有这一个）
+    expect(screen.getByText("官方桌面").className).toContain("official");
+    await act(async () => {
+      selectBtn.click();
+    });
+    // 只切选中，不发起启动
+    expect(startCalls).toBe(0);
+    expect(document.querySelector(".profile-item.active")?.textContent).toContain("desktop");
+    // 选中 desktop 后：中栏行标题 + 右栏标题各一个「官方桌面」标签
+    expect(screen.getAllByText("官方桌面")).toHaveLength(2);
+    // 清理选中态：避免泄漏到后续用例（其它用例依赖默认选中 web）
+    localStorage.removeItem("dshpm-sel-profile");
+    localStorage.removeItem("dshpm-sel-profile-dir");
+  });
+
+
   it("启动就绪后不再自动打开浏览器，点「打开界面」才打开带 token 的地址", async () => {
     mockInvoke.mockImplementation((cmd: string, args?: unknown) => {
       if (cmd === "start_dsh_cmd") {
@@ -417,7 +523,8 @@ describe("App 主界面", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("web")).toBeInTheDocument();
+      // profile 名会同时出现在中栏列表与右栏标题，用 getAllByText 避免歧义
+      expect(screen.getAllByText("web").length).toBeGreaterThan(0);
     });
     await user.click(screen.getByText("▶ 启动 DSH"));
     // 启动就绪后（portOpen=true）不应自动调用 open_url_cmd
@@ -1877,7 +1984,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.21", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.22", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -1904,27 +2011,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.21", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.22", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.21_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.22_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.21"));
+    await user.click(screen.getByText("⬇ 下载 v0.3.22"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.21" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.22" });
     // 打开所在文件夹
     await user.click(screen.getByText("📂 打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.21_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.22_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("🔄 关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.21_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.22_x64-setup.exe" });
     });
   });
 });
