@@ -311,6 +311,23 @@ export default function App() {
   const [cleaningJunk, setCleaningJunk] = useState(false);
   const [confirmCleanJunk, setConfirmCleanJunk] = useState(false);
   const [diagExporting, setDiagExporting] = useState(false);
+  // 卡片折叠：文件系统默认折叠、健康维护默认展开；记住用户选择（localStorage）
+  const [foldFs, setFoldFs] = useState<boolean>(() => localStorage.getItem("dshpm-fold-fs") !== "expanded");
+  const [foldHealth, setFoldHealth] = useState<boolean>(() => localStorage.getItem("dshpm-fold-health") === "collapsed");
+  const toggleFoldFs = () => {
+    setFoldFs((v) => {
+      const nv = !v;
+      localStorage.setItem("dshpm-fold-fs", nv ? "collapsed" : "expanded");
+      return nv;
+    });
+  };
+  const toggleFoldHealth = () => {
+    setFoldHealth((v) => {
+      const nv = !v;
+      localStorage.setItem("dshpm-fold-health", nv ? "collapsed" : "expanded");
+      return nv;
+    });
+  };
   // 关闭软件时仍有 DSH 在运行 → 三选一弹窗（关闭所有 / 放生 / 取消）
   const [closeCheck, setCloseCheck] = useState<number | null>(null);
   const [closingAll, setClosingAll] = useState(false);
@@ -2012,23 +2029,35 @@ export default function App() {
 
               {/* 文件入口 */}
               <div className="control-card">
-                <div className="card-title">文件系统快捷入口</div>
-                <div className="file-buttons">
-                  {fileButtons.map((b) => (
-                    <button
-                      key={b.label}
-                      className="btn"
-                      onClick={() => api.openPath(b.path!).catch((x) => setError(String(x)))}
-                    >
-                      📂 {b.label}
-                    </button>
-                  ))}
+                <div className={`card-title foldable${foldFs ? " collapsed" : ""}`} onClick={toggleFoldFs} title="点击折叠/展开">
+                  <span>文件系统快捷入口</span>
+                  <span className="chevron">▾</span>
+                </div>
+                <div className={`fold-body${foldFs ? " collapsed" : ""}`}>
+                  <div className="fold-inner">
+                    <div className="file-buttons">
+                      {fileButtons.map((b) => (
+                        <button
+                          key={b.label}
+                          className="btn"
+                          onClick={() => api.openPath(b.path!).catch((x) => setError(String(x)))}
+                        >
+                          📂 {b.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </div>
               </div>
 
               {/* M4 健康与维护 */}
               <div className="control-card">
-                <div className="card-title">健康与维护</div>
+                <div className={`card-title foldable${foldHealth ? " collapsed" : ""}`} onClick={toggleFoldHealth} title="点击折叠/展开">
+                  <span>健康与维护</span>
+                  <span className="chevron">▾</span>
+                </div>
+                <div className={`fold-body${foldHealth ? " collapsed" : ""}`}>
+                  <div className="fold-inner">
                 <div className="card-row actions">
                   <button className="btn tiny" onClick={handleCheckDeps} disabled={checkingDeps || (!selectedEnvObj?.runCommand && !isDesktopProfile) || !selectedProfile}>
                     {checkingDeps ? "检查中..." : "⟳ 依赖检查"}
@@ -2096,6 +2125,8 @@ export default function App() {
                     )}
                   </div>
                 )}
+                  </div>
+                </div>
               </div>
 
               {/* 插件列表 */}
@@ -3130,7 +3161,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.22</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.23</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

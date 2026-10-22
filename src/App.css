@@ -469,6 +469,15 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 /* Firefox 兜底 */
 * { scrollbar-color: var(--scrollbar-thumb) var(--bg); scrollbar-width: thin; }
 
+/* 可折叠卡片（文件系统快捷入口 / 健康与维护） */
+.card-title.foldable { cursor: pointer; user-select: none; border-radius: 4px; transition: color 0.15s ease; }
+.card-title.foldable:hover { color: var(--text); }
+.card-title.foldable .chevron { display: inline-flex; align-items: center; font-size: 12px; color: var(--text-dim); transition: transform 0.2s ease; transform: rotate(-90deg); }
+.card-title.foldable.collapsed .chevron { transform: rotate(0deg); }
+.fold-body { display: grid; grid-template-rows: 1fr; opacity: 1; transition: grid-template-rows 0.22s ease, opacity 0.18s ease; }
+.fold-body.collapsed { grid-template-rows: 0fr; opacity: 0; visibility: hidden; transition: grid-template-rows 0.22s ease, opacity 0.18s ease, visibility 0s linear 0.22s; }
+.fold-inner { overflow: hidden; min-height: 0; }
+
 /* 日志：warn 黄色 / error 红色 */
 .log-warn { color: #e6c85c; }
 .log-err { color: #ffb3ad; }
