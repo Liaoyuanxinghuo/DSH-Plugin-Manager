@@ -128,7 +128,11 @@ pub struct RunningProcess {
     /// 带 token 的 web 访问地址（用户点「打开界面」时使用）
     pub url: String,
     /// 本次运行日志文件（保留，供「打开界面」实时提取最新 token）
+    /// 本次运行日志文件（保留，供「打开界面」实时提取最新 token）
     pub log_path: String,
+    /// 是否为「认领」实例（本软件启动后放生/遗留、重启后被重新接管的进程）
+    #[serde(default)]
+    pub adopted: bool,
 }
 
 /// DSH 运行状态

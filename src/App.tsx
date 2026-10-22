@@ -208,6 +208,7 @@ export default function App() {
   // 增量扫描/重排时锚定选中项，防止异步 setState 竞态把选中踢掉
   const selectedProfileRef = useRef(selectedProfile);
   const selectedDirRef = useRef(selectedProfilesDir);
+  const startingRef = useRef(false); // 启动防抖：连点「启动」不重复拉起（后端另有 per-key 互斥）
   useEffect(() => {
     selectedProfileRef.current = selectedProfile;
     selectedDirRef.current = selectedProfilesDir;
@@ -669,10 +670,13 @@ export default function App() {
   };
 
   const handleStart = async (envIdArg?: string, profileArg?: string) => {
+    if (startingRef.current) return; // 防抖：启动进行中忽略重复点击（后端另有 per-key 互斥）
+    startingRef.current = true;
     const eid = envIdArg ?? selectedEnv;
     const pname = profileArg ?? selectedProfile;
     if (!eid || !pname) {
       setError("请先选择环境和 Profile");
+      startingRef.current = false;
       return;
     }
     setBusy(true);
@@ -685,6 +689,7 @@ export default function App() {
     if (!pdir) {
       setError(`未找到 profile「${pname}」的来源目录`);
       setBusy(false);
+      startingRef.current = false;
       return;
     }
     try {
@@ -693,6 +698,7 @@ export default function App() {
       if (orphans.length > 0) {
         setOrphanPrompt({ envId: eid, profile: pname, pdir, list: orphans });
         setBusy(false);
+        startingRef.current = false;
         return;
       }
       await startAndPoll(eid, pname, pdir);
@@ -700,6 +706,7 @@ export default function App() {
       setError(String(e));
     } finally {
       setBusy(false);
+      startingRef.current = false;
     }
   };
 
@@ -707,6 +714,8 @@ export default function App() {
   const startWithOrphanChoice = async (clean: boolean) => {
     const t = orphanPrompt;
     if (!t) return;
+    if (startingRef.current) return; // 防抖：启动进行中忽略重复点击
+    startingRef.current = true;
     setOrphanPrompt(null);
     setBusy(true);
     setError("");
@@ -725,6 +734,7 @@ export default function App() {
       setError(String(e));
     } finally {
       setBusy(false);
+      startingRef.current = false;
     }
   };
 
@@ -1617,7 +1627,10 @@ export default function App() {
                     );
                     return rp ? (
                       <>
-                        <span className="run-pill" title={`运行中：PID ${rp.pid}，端口 ${rp.port}`}>
+                        <span
+                          className="run-pill"
+                          title={`${rp.adopted ? "已接管（放生找回）" : "运行中"}：PID ${rp.pid}，端口 ${rp.port}`}
+                        >
                           ● :{rp.port}
                         </span>
                         <button
@@ -1638,8 +1651,14 @@ export default function App() {
                           e.stopPropagation();
                           handleStart(selectedEnv, p.name);
                         }}
-                        disabled={!envCanStart(selectedEnv)}
-                        title={envCanStart(selectedEnv) ? `启动 ${p.name}` : "该环境未配置 dsh 程序，无法启动"}
+                        disabled={busy || !envCanStart(selectedEnv)}
+                        title={
+                          !envCanStart(selectedEnv)
+                            ? "该环境未配置 dsh 程序，无法启动"
+                            : busy
+                            ? "正在执行启动/停止操作"
+                            : `启动 ${p.name}`
+                        }
                       >
                         ▶ 启动
                       </button>
@@ -1783,8 +1802,11 @@ export default function App() {
                     )}
                     <div className="status-pill">
                       {curRun ? (
-                        <span className="pill running">
-                          ● 运行中 PID {curRun.pid} · 端口 {curRun.port}
+                        <span
+                          className="pill running"
+                          title={curRun.adopted ? "本软件启动后放生/遗留的实例，重启软件后已自动接管" : undefined}
+                        >
+                          ● 运行中{curRun.adopted ? "（认领）" : ""} PID {curRun.pid} · 端口 {curRun.port}
                         </span>
                       ) : (
                         <span className="pill stopped">○ 已停止</span>
@@ -2926,7 +2948,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.20</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.21</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。

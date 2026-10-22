@@ -351,6 +351,53 @@ describe("App 主界面", () => {
     });
     expect(screen.getByText("▶ 启动 DSH")).toBeInTheDocument();
   });
+  it("认领实例（放生找回）：显示「认领」标记，按钮状态对应为运行中", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_running_cmd") {
+        return Promise.resolve([
+          {
+            envId: "global",
+            profile: "web",
+            profilesDir: "C:\\Users\\test\\.dsh\\profiles",
+            pid: 123,
+            port: 3080,
+            startedAt: "2026-09-27 12:00",
+            adopted: true,
+          },
+        ]);
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    await screen.findByText("■ 停止");
+    // 认领标记只在右栏状态胶囊体现；中栏胶囊保持简洁的 `● :端口` 样式
+    expect(screen.getByText("● :3080")).toBeInTheDocument();
+    expect(screen.queryByText(/·认领/)).not.toBeInTheDocument();
+    expect(screen.getByText(/运行中（认领）/)).toBeInTheDocument();
+    // 状态对应：不显示启动按钮，显示重启与停止（可直接接管操作）
+    expect(screen.queryByText("▶ 启动 DSH")).not.toBeInTheDocument();
+    expect(screen.getByText("↻ 重启 DSH")).toBeInTheDocument();
+  });
+
+  it("连点「启动」只调用一次 start_dsh_cmd（防重复拉起）", async () => {
+    let startCalls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "start_dsh_cmd") {
+        startCalls += 1;
+        return new Promise(() => {}); // 启动进行中：不返回
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    const btn = await screen.findByText("▶ 启动 DSH");
+    await act(async () => {
+      btn.click();
+      btn.click();
+      btn.click();
+    });
+    expect(startCalls).toBe(1);
+  });
+
   it("启动就绪后不再自动打开浏览器，点「打开界面」才打开带 token 的地址", async () => {
     mockInvoke.mockImplementation((cmd: string, args?: unknown) => {
       if (cmd === "start_dsh_cmd") {
@@ -1830,7 +1877,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.20", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.21", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -1857,27 +1904,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.20", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.21", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.20_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.21_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.20"));
+    await user.click(screen.getByText("⬇ 下载 v0.3.21"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.20" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.21" });
     // 打开所在文件夹
     await user.click(screen.getByText("📂 打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.20_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.21_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("🔄 关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.20_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.21_x64-setup.exe" });
     });
   });
 });

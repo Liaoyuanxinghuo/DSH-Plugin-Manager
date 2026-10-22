@@ -117,6 +117,8 @@ export interface RunningProcess {
   url: string;
   /** 本次运行日志文件（保留，供「打开界面」实时提取最新 token） */
   logPath: string;
+  /** 是否为「认领」实例：本软件启动后放生/遗留、重启软件后被重新接管的进程 */
+  adopted?: boolean;
 }
 
 export interface DshStatus {

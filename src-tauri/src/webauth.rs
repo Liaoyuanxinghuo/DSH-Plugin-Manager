@@ -345,12 +345,17 @@ pub fn open_web_via_cookie_hop(
     let name = cookie_name(&authority);
     let value = mint_cookie_value(&secret, &authority, now_ms, expires_at);
     let redirect_to = format!("http://{authority}/");
-    let mut hop = CookieHop::start(name, value, max_age_days * 86_400, redirect_to)
+    let hop = CookieHop::start(name, value, max_age_days * 86_400, redirect_to)
         .map_err(|e| format!("启动登录跳转失败: {e}"))?;
     crate::browsers::open_url_with(browser_exe, &hop.hop_url)?;
-    // 等浏览器来取 cookie 并完成重定向跳转（最多 15s），完成后线程自动结束
-    hop.wait(15_000);
-    Ok(hop.hop_url.clone())
+    // 等浏览器来取 cookie 并完成跳转 → 后台线程（最多 15s）。
+    // 旧实现同步 wait：浏览器未及时响应时「打开界面」要干等最多 15s（按钮假死）。
+    let hop_url = hop.hop_url.clone();
+    std::thread::spawn(move || {
+        let mut hop = hop;
+        hop.wait(15_000);
+    });
+    Ok(hop_url)
 }
 
 #[cfg(test)]

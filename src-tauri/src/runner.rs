@@ -448,64 +448,42 @@ fn launcher_err_blocks_shim(e: &str) -> bool {
     e.contains("可运行该 DSH 的 Node")
 }
 
-/// 进程是否存活（tasklist 探测；直接执行避免 cmd 引号嵌套问题）
+/// 进程是否存活（原生 Win32 探测，微秒级、零子进程——绝不用 tasklist，轮询会卡）
 pub fn is_pid_alive(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    let out = Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW：禁止弹出控制台黑框
-        .output();
-    match out {
-        Ok(o) => {
-            o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&format!("{pid}"))
-        }
-        Err(_) => false,
-    }
+    crate::winproc::is_pid_alive(pid)
 }
 
-/// 批量探测 PID 存活集合（单次 tasklist 列全表，避免每 PID 起一个子进程）。
-/// 必须在阻塞线程池调用——内部会 spawn 子进程，绝不能跑在主线程。
+/// 批量探测 PID 存活集合（单次 Toolhelp32 快照，零子进程）。
+/// 旧实现 spawn `tasklist` 列全表（每次 30-80ms + 控制台隐藏开销），是轮询卡顿元凶。
 pub fn alive_pids(pids: &[u32]) -> std::collections::HashSet<u32> {
-    use std::os::windows::process::CommandExt;
-    use std::collections::HashSet;
-    let mut alive = HashSet::new();
-    if pids.is_empty() {
-        return alive;
+    crate::winproc::alive_pids(pids)
+}
+
+/// 记账中的运行实例是否仍在运行（「放生进程接管」与「启动防重复拉起」共用判据）。
+/// PID 存活 + （端口仍在服务 或 映像名为 DSH 相关进程）双重佐证，防 PID 被系统复用后误接管。
+pub fn instance_still_running(p: &crate::models::RunningProcess) -> bool {
+    if !is_pid_alive(p.pid) {
+        return false;
     }
-    let out = Command::new("tasklist")
-        .args(["/FO", "CSV", "/NH"])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            // 行格式："name.exe","1234","Console","1,234 K"
-            for line in String::from_utf8_lossy(&o.stdout).lines() {
-                let line = line.trim();
-                if !line.starts_with('"') {
-                    continue;
-                }
-                let fields: Vec<&str> = line.split("\",\"").collect();
-                if fields.len() < 2 {
-                    continue;
-                }
-                if let Ok(pid) = fields[1].parse::<u32>() {
-                    if pids.contains(&pid) {
-                        alive.insert(pid);
-                    }
-                }
-            }
-            alive
-        }
-        _ => {
-            // tasklist 失败：退回逐个探测
-            for &p in pids {
-                if is_pid_alive(p) {
-                    alive.insert(p);
-                }
-            }
-            alive
-        }
+    if p.port > 0 && is_port_open(p.port) {
+        return true;
     }
+    // 端口未通（可能仍在启动/正在重启）：按映像名兜底判活
+    let name = crate::winproc::image_name(p.pid).unwrap_or_default();
+    matches!(name.as_str(), "node.exe" | "cmd.exe" | "deepseek harness.exe")
+}
+
+/// 等待端口完全释放（停止→立即启动的竞态：taskkill 异步生效，端口可能仍被
+/// TIME_WAIT 或未死透的子进程占用）。返回 true = 已释放；最多等 `timeout_ms`。
+pub fn wait_port_closed(port: u16, timeout_ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_millis() < timeout_ms as u128 {
+        if !is_port_open(port) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    !is_port_open(port)
 }
 
 /// 读取日志文件尾部（诊断 dsh 启动失败原因）
@@ -745,58 +723,29 @@ pub struct OfficialDesktopStatus {
     pub exe_path: Option<String>,
 }
 
-/// 探测当前系统中是否有正在运行的官方桌面客户端（DeepSeek Harness.exe 主进程）
+/// 探测当前系统中是否有正在运行的官方桌面客户端（DeepSeek Harness.exe 主进程）。
+/// 原生进程快照 + 映像路径：微秒级、零子进程（UI 每 3s 轮询，旧实现 spawn tasklist +
+/// powershell 每次上百毫秒，是卡顿元凶）。
+///
+/// 主进程识别：Electron 子进程的父进程都是主进程 → 取「父进程不在候选集合内」的根进程。
+/// 注意：**不得**回查 `find_official_desktop_exe`（旧实现在 powershell 失败时二者互相调用，
+/// 直接栈溢出崩溃），映像路径一律用 `QueryFullProcessImageNameW` 现取。
 pub fn probe_official_desktop_running() -> Option<(u32, String)> {
-    // 1) 快路径：通过 tasklist 列出名为 "DeepSeek Harness.exe" 的进程 PID
-    let out = crate::fsutil::hidden_command("tasklist")
-        .args(["/FI", "IMAGENAME eq DeepSeek Harness.exe", "/FO", "CSV", "/NH"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let candidates: Vec<crate::winproc::ProcEntry> = crate::winproc::snapshot()
+        .into_iter()
+        .filter(|p| p.name.eq_ignore_ascii_case("deepseek harness.exe"))
+        .collect();
+    if candidates.is_empty() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut pids = Vec::new();
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 2 {
-            let pid_str = parts[1].trim().trim_matches('"');
-            if let Ok(pid) = pid_str.parse::<u32>() {
-                pids.push(pid);
-            }
-        }
-    }
-    if pids.is_empty() {
-        return None;
-    }
-
-    // 2) 找到主进程 PID 及 exe 路径：用 powershell 查非 --type= 子进程
-    let script = r#"
-        $p = Get-CimInstance Win32_Process -Filter "Name='DeepSeek Harness.exe'" | Where-Object { -not $_.CommandLine.Contains('--type=') } | Select-Object -First 1 ProcessId, ExecutablePath;
-        if ($p) { Write-Output ($p.ProcessId.ToString() + "`t" + $p.ExecutablePath); exit 0 }
-        exit 1
-    "#;
-    let ps_out = crate::fsutil::hidden_command("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .ok();
-    if let Some(o) = ps_out {
-        if o.status.success() {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let trimmed = s.trim();
-            let mut parts = trimmed.splitn(2, '\t');
-            if let (Some(p_str), Some(exe_str)) = (parts.next(), parts.next()) {
-                if let Ok(p) = p_str.parse::<u32>() {
-                    return Some((p, exe_str.to_string()));
-                }
-            }
-        }
-    }
-
-    // 兜底：取第一个 PID
-    let fallback_pid = pids[0];
-    let exe = find_official_desktop_exe().unwrap_or_default();
-    Some((fallback_pid, exe))
+    let ids: std::collections::HashSet<u32> = candidates.iter().map(|p| p.pid).collect();
+    let main = candidates
+        .iter()
+        .find(|p| !ids.contains(&p.ppid))
+        .or_else(|| candidates.first())
+        .cloned()?;
+    let exe = crate::winproc::image_path(main.pid).unwrap_or_default();
+    Some((main.pid, exe))
 }
 
 /// 查找系统中已安装的官方桌面客户端 exe 路径
@@ -892,6 +841,68 @@ pub fn start_official_desktop(custom_exe: Option<&str>) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 认领判活用运行记录
+    fn running_record(pid: u32, port: u16) -> crate::models::RunningProcess {
+        crate::models::RunningProcess {
+            env_id: "e1".into(),
+            profiles_dir: String::new(),
+            profile: "web".into(),
+            pid,
+            port,
+            started_at: String::new(),
+            url: String::new(),
+            log_path: String::new(),
+            adopted: false,
+        }
+    }
+
+    /// 本进程 + 自己监听的端口 → 认为仍在运行（可接管）
+    #[test]
+    fn instance_still_running_accepts_live_pid_with_open_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(instance_still_running(&running_record(
+            std::process::id(),
+            port
+        )));
+    }
+
+    /// 已退出的 PID → 不接管（即使端口字段是残留值）
+    #[test]
+    fn instance_still_running_rejects_dead_pid() {
+        assert!(!instance_still_running(&running_record(u32::MAX - 1, 1)));
+    }
+
+    /// 端口未通且映像名不是 DSH 相关进程 → 判为不存活（防 PID 复用误接管）
+    #[test]
+    fn instance_still_running_falls_back_to_image_name() {
+        // 测试宿主映像是测试二进制（非 node/cmd），端口 1 不通 → 判为不存活
+        assert!(!instance_still_running(&running_record(std::process::id(), 1)));
+    }
+
+    /// 空闲端口：立即判定已释放
+    #[test]
+    fn wait_port_closed_immediate_when_free() {
+        let free = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(wait_port_closed(free, 300));
+    }
+
+    /// 端口占用中，释放后返回 true（「停止→立即启动」竞态的关键路径）
+    #[test]
+    fn wait_port_closed_waits_until_released() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(listener);
+        });
+        assert!(wait_port_closed(port, 5_000), "释放后应返回 true");
+        t.join().unwrap();
+    }
+
 
 
     #[test]

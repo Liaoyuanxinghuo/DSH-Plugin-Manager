@@ -18,6 +18,8 @@ mod settings;
 mod toolchain;
 mod profile_io;
 mod runner;
+mod runlog;
+mod winproc;
 mod scanner;
 mod webauth;
 
@@ -1050,6 +1052,48 @@ async fn start_dsh_cmd(
     if env.run_command.trim().is_empty() {
         return Err("该环境未绑定 dsh 运行时，无法启动".to_string());
     }
+    // profile 来源目录（任意 dsh × 任意来源 profile 组合：注入 DSH_HOME）
+    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    let key = run_key(&env_id, &profiles_dir, &profile);
+    // ① 启动前接管检查：同一组合已有本软件启动过、现仍在运行的实例（放生/上次遗留）
+    //    → 直接接管为「运行中」，绝不重复拉起（连点启动、重启管理器后再点启动都安全）
+    if let Some(existing) = state.running.lock().unwrap().get(&key).cloned() {
+        return Err(format!(
+            "「{profile}」在该环境下已在运行（PID {}，端口 {}），请先停止",
+            existing.pid, existing.port
+        ));
+    }
+    if let Some(recorded) = runlog::load().get(&key).cloned() {
+        let probe = recorded.clone();
+        let alive =
+            tauri::async_runtime::spawn_blocking(move || runner::instance_still_running(&probe))
+                .await
+                .map_err(|e| format!("接管探测失败：{e}"))?;
+        if alive {
+            let mut adopted = recorded.clone();
+            adopted.adopted = true;
+            let (pid, port, url) = (recorded.pid, recorded.port, recorded.url.clone());
+            state.running.lock().unwrap().insert(key.clone(), adopted);
+            return Ok(StartResult {
+                success: true,
+                pid: Some(pid),
+                message: format!(
+                    "已接管正在运行的 dsh「{profile}」（PID {pid}，端口 {port}），未重复拉起"
+                ),
+                port,
+                url,
+            });
+        }
+    }
+    // ② per-key 启动互斥：并发双击同一组合时，第二次直接拒绝（防双开/抢端口）。
+    //    尽早加锁，覆盖后续工具链检查/依赖安装的耗时窗口。
+    let _start_guard = {
+        let mut starting = state.starting.lock().unwrap();
+        if !starting.insert(key.clone()) {
+            return Err(format!("「{profile}」正在启动中，请稍候"));
+        }
+        StartLockGuard { key: key.clone(), state_starting: &state.starting }
+    };
 
     // 启动前确保 node/npm/pnpm 可用（电脑未装时自动下载安装，日志流式）。
     // ensure 内部含 blocking 网络调用（拉取 node 版本索引 / 下载），放阻塞线程池执行。
@@ -1063,8 +1107,6 @@ async fn start_dsh_cmd(
             .map_err(|e| format!("工具链检查失败：{e}（请检查网络或镜像源）"))?;
     }
 
-    // profile 来源目录（任意 dsh × 任意来源 profile 组合：注入 DSH_HOME）
-    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
     // 启动前兜底：profile 缺依赖（新建未装/导入未装）时自动 pnpm install（日志流式）；
     // 内置模板名（web/headless/acp/sdk/sdk-minimal）目录不存在时跳过——
     // 让 dsh 首次运行自行创建并初始化（官方自举行为，等价 npx @deepseek-ai/dsh web）
@@ -1085,15 +1127,6 @@ async fn start_dsh_cmd(
             return Err(format!("profile 依赖检查失败：{e}"));
         }
     }
-    let key = run_key(&env_id, &profiles_dir, &profile);
-    // per-key 启动互斥：并发双击同一组合时，第二次直接拒绝（防双开/抢端口）
-    let _start_guard = {
-        let mut starting = state.starting.lock().unwrap();
-        if !starting.insert(key.clone()) {
-            return Err(format!("「{profile}」正在启动中，请稍候"));
-        }
-        StartLockGuard { key: key.clone(), state_starting: &state.starting }
-    };
     // 锁操作包在独立作用域内：guard 在块尾自动释放。
     // （MutexGuard 非 Send，若跨 await 存活会让 command future 无法跨线程发送）
     // pick_port 内部 TCP 探测端口占用 → 快照 used 后放阻塞线程池，锁不跨 await
@@ -1192,6 +1225,7 @@ async fn start_dsh_cmd(
         started_at: runner::now_iso(),
         url: url.clone(),
         log_path: log_path.clone(),
+        adopted: false,
     };
     // 重新加锁插入（旧锁已在跨 await 前释放）；插入前二次校验，
     // 防「检查未运行 → 释放锁 → 启动期间另一并发请求已插入」的双开竞态
@@ -1203,6 +1237,9 @@ async fn start_dsh_cmd(
         }
         running.insert(key.clone(), proc.clone());
     }
+    // 记账：启动即写账、停止才销账。软件退出（放生/崩溃）后账目保留，
+    // 重启软件时由 adopt_released_async 按账目接管仍在运行的实例
+    let _ = runlog::upsert(&key, &proc);
 
     Ok(StartResult {
         success: true,
@@ -1262,6 +1299,70 @@ async fn prune_dead_async(state: &State<'_, AppState>) {
     }
 }
 
+/// 认领决策（纯函数，便于单测）：账目 × 已跟踪 key × 存活判据 →（保留账目，待认领实例）。
+/// - 已在运行表跟踪 → 保留账目、不重复认领
+/// - 仍在运行 → 认领 + 保留账目（管理器再次退出后还能再接管）
+/// - 已退出 → 不进账目 = 销账
+fn plan_adoption<F: Fn(&RunningProcess) -> bool>(
+    ledger: HashMap<String, RunningProcess>,
+    tracked: &std::collections::HashSet<String>,
+    alive: F,
+) -> (HashMap<String, RunningProcess>, Vec<(String, RunningProcess)>) {
+    let mut kept = HashMap::new();
+    let mut adopted = Vec::new();
+    for (key, p) in ledger {
+        if tracked.contains(&key) {
+            kept.insert(key, p);
+            continue;
+        }
+        if alive(&p) {
+            adopted.push((key.clone(), p.clone()));
+            kept.insert(key, p);
+        }
+    }
+    (kept, adopted)
+}
+
+/// 接管「放生/遗留」的运行实例（核心：重启软件后状态与按钮自动回到运行中）。
+///
+/// 按**记账表**（本软件启动即写账、停止才销账）找回现仍在运行的 DSH，注入运行表后，
+/// UI 的状态胶囊 / 启动·停止·打开界面按钮随轮询自动对应；账目里已退出的进程顺手销账。
+/// 只认领本软件启动过的实例，绝不误认领你在终端手动跑的 dsh。
+///
+/// 进程/端口探测 → 阻塞线程池，锁内只做纯内存插入。
+async fn adopt_released_async(state: &State<'_, AppState>) {
+    // 1) 快照已在跟踪的 key（锁内纯内存，锁不跨 await）
+    let tracked: std::collections::HashSet<String> = {
+        let running = state.running.lock().unwrap();
+        running.keys().cloned().collect()
+    };
+    // 2) 读账 + 认领决策 + 存活校验 → 阻塞线程池（OpenProcess/端口探测，零子进程）
+    let adopted = tauri::async_runtime::spawn_blocking(move || {
+        let ledger = runlog::load();
+        let total = ledger.len();
+        let (kept, adopted) = plan_adoption(ledger, &tracked, runner::instance_still_running);
+        if kept.len() != total {
+            let _ = runlog::save(&kept); // 顺手销掉已退出实例的账目
+        }
+        adopted
+    }).await;
+    let Ok(adopted) = adopted else {
+        return;
+    };
+    // 3) 注入运行表（锁内纯内存）：认领实例标记 adopted，UI 显示「运行中（认领）」
+    if adopted.is_empty() {
+        return;
+    }
+    let mut running = state.running.lock().unwrap();
+    for (key, mut p) in adopted {
+        if running.contains_key(&key) {
+            continue;
+        }
+        p.adopted = true;
+        running.insert(key, p);
+    }
+}
+
 /// 停止指定 env×profile 的进程（每个停止按钮只结束特定进程）
 /// 用**解析后的 profiles 目录**做 key；键找不到时再按 env+profile 宽松匹配（避免目录字符串不一致停不掉）。
 #[tauri::command]
@@ -1292,9 +1393,14 @@ async fn stop_dsh_cmd(
         }
         proc
     };
+    // 运行表没有但账目里有（刚启动软件还没轮询到认领）→ 按账目停，避免「停不掉」
+    if proc.is_none() {
+        proc = runlog::load().get(&key).cloned();
+    }
     if let Some(p) = proc.take() {
-        // tasklist / taskkill 都是子进程 → 阻塞线程池
+        // taskkill 是子进程 → 阻塞线程池；停完再等端口完全释放（防「停止→立即启动」撞车）
         let pid = p.pid;
+        let port = p.port;
         let stop_result = tauri::async_runtime::spawn_blocking(move || {
             if !runner::is_pid_alive(pid) {
                 // 进程已自行退出，视为停止成功
@@ -1305,7 +1411,17 @@ async fn stop_dsh_cmd(
         .await
         .map_err(|e| format!("停止任务失败：{e}"))?;
         match stop_result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // 销账：已停止的实例不再是「放生可接管」对象
+                let _ = runlog::remove(&key);
+                if port > 0 {
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        runner::wait_port_closed(port, 2_000)
+                    })
+                    .await;
+                }
+                Ok(())
+            }
             Err(e) => {
                 // taskkill 失败但进程可能已退出：把记录放回去
                 state.running.lock().unwrap().insert(key, p);
@@ -1313,7 +1429,8 @@ async fn stop_dsh_cmd(
             }
         }
     } else {
-        // 未在运行视为已停止
+        // 未在运行视为已停止；账目一并清理，防幽灵记录被反复接管
+        let _ = runlog::remove(&key);
         Ok(())
     }
 }
@@ -1353,7 +1470,10 @@ async fn stop_all_dsh_cmd(state: State<'_, AppState>) -> Result<Vec<String>, Str
             .await
             .map_err(|e| format!("{key}: 停止任务失败：{e}"));
             match r {
-                Ok(Ok(_)) => {}
+                Ok(Ok(_)) => {
+                    // 销账：已停止的实例不再是「放生可接管」对象
+                    let _ = runlog::remove(&k);
+                }
                 Ok(Err(e)) => failed.push(e),
                 Err(e) => failed.push(e),
             }
@@ -1423,6 +1543,7 @@ async fn dsh_status(
     profiles_dir_str: String,
 ) -> Result<DshStatus, String> {
     prune_dead_async(&state).await;
+    adopt_released_async(&state).await; // 接管放生/遗留实例（认领后状态/按钮自动对应）
     let key = run_key(
         &env_id,
         std::path::Path::new(profiles_dir_str.trim()),
@@ -1487,6 +1608,7 @@ async fn dsh_status(
 #[tauri::command]
 async fn list_running_cmd(state: State<'_, AppState>) -> Result<Vec<RunningProcess>, String> {
     prune_dead_async(&state).await;
+    adopt_released_async(&state).await; // 接管放生/遗留实例（认领后状态/按钮自动对应）
     let running = state.running.lock().unwrap();
     Ok(running.values().cloned().collect())
 }
@@ -3155,6 +3277,73 @@ pub fn run() {
 mod tests {
     use super::*;
 
+    /// 认领测试用运行记录
+    fn adopt_sample(key: &str, pid: u32) -> (String, RunningProcess) {
+        (
+            key.to_string(),
+            RunningProcess {
+                env_id: "e1".into(),
+                profiles_dir: "C:\\Users\\t\\.dsh\\profiles".into(),
+                profile: "web".into(),
+                pid,
+                port: 3080,
+                started_at: "2026-02-20 10:00:00".into(),
+                url: "http://127.0.0.1:3080".into(),
+                log_path: "C:\\tmp\\dsh.log".into(),
+                adopted: false,
+            },
+        )
+    }
+
+    /// 已放生（未跟踪）且仍在运行 → 认领；账目保留，管理器再次退出后还能接管
+    #[test]
+    fn plan_adoption_adopts_alive_untracked() {
+        let (k, p) = adopt_sample("e1::pd::web", 111);
+        let ledger = HashMap::from([(k.clone(), p)]);
+        let (kept, adopted) = plan_adoption(ledger, &std::collections::HashSet::new(), |_| true);
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].0, k);
+        assert!(kept.contains_key(&k), "认领后账目应保留");
+    }
+
+    /// 已在运行表跟踪 → 不重复认领，账目保留
+    #[test]
+    fn plan_adoption_skips_tracked() {
+        let (k, p) = adopt_sample("e1::pd::web", 111);
+        let ledger = HashMap::from([(k.clone(), p)]);
+        let tracked = std::collections::HashSet::from([k.clone()]);
+        let (kept, adopted) = plan_adoption(ledger, &tracked, |_| true);
+        assert!(adopted.is_empty(), "已在跟踪不应重复认领");
+        assert!(kept.contains_key(&k));
+    }
+
+    /// 已退出 → 不认领且销账（不留幽灵记录）
+    #[test]
+    fn plan_adoption_drops_dead_entries() {
+        let (k, p) = adopt_sample("e1::pd::web", 111);
+        let ledger = HashMap::from([(k.clone(), p)]);
+        let (kept, adopted) = plan_adoption(ledger, &std::collections::HashSet::new(), |_| false);
+        assert!(adopted.is_empty());
+        assert!(kept.is_empty(), "已退出实例应销账");
+    }
+
+    /// 混合场景：一条认领、一条销账、一条已在跟踪
+    #[test]
+    fn plan_adoption_mixed() {
+        let (k1, p1) = adopt_sample("e1::pd::web", 111);
+        let (k2, p2) = adopt_sample("e1::pd::api", 222);
+        let (k3, p3) = adopt_sample("e1::pd::db", 333);
+        let ledger = HashMap::from([(k1.clone(), p1), (k2.clone(), p2), (k3.clone(), p3)]);
+        let tracked = std::collections::HashSet::from([k3.clone()]);
+        // 只有 pid 222 仍在运行
+        let (kept, adopted) = plan_adoption(ledger, &tracked, |p| p.pid == 222);
+        assert_eq!(adopted.len(), 1);
+        assert_eq!(adopted[0].0, k2);
+        assert!(!kept.contains_key(&k1), "已退出应销账");
+        assert!(kept.contains_key(&k2), "认领的账目保留");
+        assert!(kept.contains_key(&k3), "已跟踪的账目保留");
+    }
+
     /// 新建 profile 的兜底默认目标目录 = 官方默认 DSH_HOME/profiles（与 get_env_paths 返回的 defaultProfilesDir 一致）
     #[test]
     fn default_profiles_dir_is_under_default_dsh_home() {
@@ -3346,13 +3535,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.20_x64-setup.exe", "0.3.20"));
-        assert!(asset_matches("dsh-manager_0.3.20_x64-setup.exe", "0.3.20"));
-        assert!(asset_matches("任意名_0.3.20_x64-setup.exe", "0.3.20"));
-        assert!(!asset_matches("DSH-Manager-0.3.20-win-x64.exe", "0.3.20"));
-        assert!(!asset_matches("DSH Manager_0.3.20_x64-setup.exe.sha256", "0.3.20"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.20"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.20"));
+        assert!(asset_matches("DSH Manager_0.3.21_x64-setup.exe", "0.3.21"));
+        assert!(asset_matches("dsh-manager_0.3.21_x64-setup.exe", "0.3.21"));
+        assert!(asset_matches("任意名_0.3.21_x64-setup.exe", "0.3.21"));
+        assert!(!asset_matches("DSH-Manager-0.3.21-win-x64.exe", "0.3.21"));
+        assert!(!asset_matches("DSH Manager_0.3.21_x64-setup.exe.sha256", "0.3.21"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.21"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.21"));
     }
 
     #[test]
@@ -3485,10 +3674,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.20_x64-setup.exe", "0.3.20"));
+        assert!(asset_matches("DSH.Manager_0.3.21_x64-setup.exe", "0.3.21"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.20_x64-setup.exe", "0.3.20"));
-        assert!(asset_matches("DSH.MANAGER_0.3.20_X64-SETUP.EXE", "0.3.20"));
+        assert!(asset_matches("dsh.manager_0.3.21_x64-setup.exe", "0.3.21"));
+        assert!(asset_matches("DSH.MANAGER_0.3.21_X64-SETUP.EXE", "0.3.21"));
     }
 
     #[test]
@@ -3496,7 +3685,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.20", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.21", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }
