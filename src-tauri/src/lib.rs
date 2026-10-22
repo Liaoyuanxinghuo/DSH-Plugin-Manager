@@ -530,10 +530,15 @@ async fn list_profiles_from_dir(path: String) -> Result<Vec<ProfileInfo>, String
     .map_err(|e| format!("扫描 profiles 失败: {e}"))?
 }
 
-/// 逐条流式扫描 profiles：扫到一个就 emit 一个 `profile-found`，全部结束 emit `profiles-scan-done`。
+/// 逐条流式扫描 profiles：扫到一个 emit 一个 `profile-found`，全部结束 emit `profiles-scan-done`，
+/// 然后在**后台线程**里慢慢算体积并逐条 emit `profile-size`（带 mtime 缓存）。
+///
+/// 体积**不能**放在扫描同步路径里：一个带 node_modules 的 profile 有数万文件（实测 16~21s），
+/// 会把「列表出现」拖成一条一条卡顿。UI 先显示 —，算好一条补一条。
 #[tauri::command]
 async fn scan_profiles_live(app: tauri::AppHandle, paths: Vec<String>) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
         for path in paths {
             let p = if path.trim().is_empty() {
                 scanner::default_dsh_home().join("profiles")
@@ -546,8 +551,44 @@ async fn scan_profiles_live(app: tauri::AppHandle, paths: Vec<String>) -> Result
             scanner::list_profiles_from_each(&p, |info| {
                 let _ = app.emit("profile-found", &info);
             });
+            dirs.push(p);
         }
         let _ = app.emit("profiles-scan-done", true);
+
+        // —— 体积回填：起独立线程慢慢算，**绝不阻塞命令返回** ——
+        // 命令若把体积算完才返回，前端 `await scanProfilesLive` 会被拖住（冷启动实测 16~21s），
+        // 期间 `profilesReady` 一直是 false（列表底部挂着「正在扫描更多 Profiles…」），
+        // 而且命令返回后的 `setProfiles(重建列表)` 还会把已经回填的体积**覆盖回 0**。
+        // 所以：命令立刻返回，体积算好一条 emit 一条，前端按 name::目录 回填。
+        let app_sizes = app.clone();
+        std::thread::spawn(move || {
+            // 先让 UI 渲染一帧再开工，避免和首屏抢磁盘。
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            for dir in dirs {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if !p.is_dir() {
+                        continue;
+                    }
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') || name == "node_modules" {
+                        continue;
+                    }
+                    let size = scanner::dir_size(&p);
+                    let _ = app_sizes.emit(
+                        "profile-size",
+                        serde_json::json!({
+                            "name": name,
+                            "profilesDir": dir.to_string_lossy(),
+                            "dataSize": size,
+                        }),
+                    );
+                }
+            }
+        });
         Ok(())
     })
     .await

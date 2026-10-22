@@ -369,14 +369,14 @@ describe("App 主界面", () => {
       return mockAllDefault(cmd);
     });
     render(<App />);
-    await screen.findByText("■ 停止");
+    // 中栏「● :端口」胶囊要等 listRunning 异步结果落地才渲染（右栏停止按钮恒在，不能作为就绪信号）
+    expect(await screen.findByText("● :3080")).toBeInTheDocument();
     // 认领标记只在右栏状态胶囊体现；中栏胶囊保持简洁的 `● :端口` 样式
-    expect(screen.getByText("● :3080")).toBeInTheDocument();
     expect(screen.queryByText(/·认领/)).not.toBeInTheDocument();
-    expect(screen.getByText(/运行中（认领）/)).toBeInTheDocument();
+    expect(await screen.findByText(/运行中（认领）/)).toBeInTheDocument();
     // 状态对应：不显示启动按钮，显示重启与停止（可直接接管操作）
+    expect(await screen.findByText("↻ 重启 DSH")).toBeInTheDocument();
     expect(screen.queryByText("▶ 启动 DSH")).not.toBeInTheDocument();
-    expect(screen.getByText("↻ 重启 DSH")).toBeInTheDocument();
   });
 
   it("连点「启动」只调用一次 start_dsh_cmd（防重复拉起）", async () => {
@@ -447,6 +447,25 @@ describe("App 主界面", () => {
     // 清理选中态：避免泄漏到后续用例（其它用例依赖默认选中 web）
     localStorage.removeItem("dshpm-sel-profile");
     localStorage.removeItem("dshpm-sel-profile-dir");
+  });
+
+  it("点「⬆ 导出」立即弹出弹窗（node_modules 体积后台算，不阻塞弹窗）", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "profile_node_modules_size") {
+        // 体积永远算不完：模拟 3.3 万文件 / 693MB 需要十几秒的磁盘递归
+        return new Promise(() => {});
+      }
+      return mockAllDefault(cmd);
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("web").length).toBeGreaterThan(0);
+    });
+    await user.click(screen.getByText("⬆ 导出"));
+    // 关键回归：体积还没算完，弹窗也必须已经出现
+    expect(await screen.findByText(/导出 Profile「web」/)).toBeInTheDocument();
+    expect(screen.getByText("计算中…")).toBeInTheDocument();
   });
 
   it("官方桌面（desktop）行只显示「选中」：不启动，仅切换选中", async () => {
@@ -1699,8 +1718,8 @@ describe("M5 设置与 DSH 下载", () => {
       return mockAllDefault(cmd);
     });
     render(<App />);
-    // 扫描未出结果时的空态提示
-    expect(screen.getByText("正在扫描 Profiles…")).toBeInTheDocument();
+    // 扫描未出结果时显示骨架屏（替代旧的「正在扫描 Profiles…」一行字）
+    expect(document.querySelector(".skeleton-list")).toBeInTheDocument();
     // 等监听注册完成（loadProfiles 内 await import 之后）
     await waitFor(() => {
       expect(eventBus.listeners.get("profile-found")?.size ?? 0).toBeGreaterThan(0);
@@ -1733,6 +1752,65 @@ describe("M5 设置与 DSH 下载", () => {
     });
   });
 
+  it("profile 体积异步回填：列表重建不会把已回填的体积打回「—」", async () => {
+    const dir = "C:\\Users\\test\\.dsh\\profiles";
+    let resolveScan: (() => void) | undefined;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "scan_profiles_live") {
+        // 挂起：模拟扫描命令尚未返回（体积事件可能先到）
+        return new Promise<void>((r) => {
+          resolveScan = r;
+        });
+      }
+      return mockAllDefault(cmd);
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(eventBus.listeners.get("profile-found")?.size ?? 0).toBeGreaterThan(0);
+    });
+    act(() => {
+      eventBus.emit("profile-found", {
+        name: "web",
+        profilesDir: dir,
+        path: `${dir}\\web`,
+        pluginCount: 1,
+        dataSize: 0,
+        modified: "",
+        hasPatch: false,
+        hasLock: false,
+        hasPackage: true,
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/1 插件 · —/)).toBeInTheDocument();
+    });
+    // 体积事件先到（后端在后台线程算体积，可能早于扫描命令返回）
+    await waitFor(() => {
+      expect(eventBus.listeners.get("profile-size")?.size ?? 0).toBeGreaterThan(0);
+    });
+    act(() => {
+      eventBus.emit("profile-size", {
+        name: "web",
+        profilesDir: dir,
+        dataSize: Math.round(693.1 * 1024 * 1024),
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/693\.1 MB/)).toBeInTheDocument();
+    });
+    // 扫描返回 → 列表按 profile-found 的快照重建（dataSize:0）。
+    // 回归点：旧实现会把已回填的体积覆盖成「—」，新实现按体积账回填。
+    await act(async () => {
+      resolveScan?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("正在扫描更多 Profiles…")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText(/693\.1 MB/)).toBeInTheDocument();
+    expect(screen.queryByText(/1 插件 · —/)).not.toBeInTheDocument();
+  });
+
   it("webReady=false 继续等，webReady=true 即报「服务已就绪」并展示地址", async () => {
     // 第一次轮询：端口通但尚未就绪（webReady=false）
     let calls = 0;
@@ -1757,7 +1835,8 @@ describe("M5 设置与 DSH 下载", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("web")).toBeInTheDocument();
+      // profile 名会同时出现在中栏列表与右栏标题，用 getAllByText 避免歧义
+      expect(screen.getAllByText("web").length).toBeGreaterThan(0);
     });
     await user.click(screen.getByText("▶ 启动 DSH"));
     // 未就绪阶段：不应出现「服务已就绪」

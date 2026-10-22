@@ -334,7 +334,9 @@ pub fn list_profiles_from_each(profiles_dir: &Path, mut on_item: impl FnMut(Prof
             profiles_dir: profiles_dir.to_string_lossy().to_string(),
             path: path.to_string_lossy().to_string(),
             plugin_count,
-            data_size: dir_size(&path),
+            // 体积**不在**这里算：一个带 node_modules 的 profile 有数万文件（实测 16~21s），
+            // 会让列表"一条一条卡着冒出来"。先给 0（UI 显示 —），由 profile-size 事件异步回填。
+            data_size: 0,
             modified: fmt_modified(&path),
             has_patch: path.join("cordis.patch.yml").exists(),
             has_lock: path.join("pnpm-lock.yaml").exists(),
@@ -414,21 +416,12 @@ pub fn read_profile_package_full(profile_dir: &Path) -> Option<ProfilePackage> {
     })
 }
 
-/// 计算目录大小（递归）
+/// 计算目录大小（递归，带 mtime 缓存）
+///
+/// **不要在扫描 profile 列表的同步路径里调用**：一个带 node_modules 的 profile
+/// 有数万文件，实测 16~21 秒。列表体积改由 `profile-size` 事件异步回填。
 pub fn dir_size(path: &Path) -> u64 {
-    let mut total: u64 = 0;
-    let Ok(entries) = fs::read_dir(path) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            total += dir_size(&p);
-        } else if let Ok(md) = fs::metadata(&p) {
-            total += md.len();
-        }
-    }
-    total
+    crate::profile_io::dir_size_cached(path)
 }
 
 fn fmt_modified(path: &Path) -> String {

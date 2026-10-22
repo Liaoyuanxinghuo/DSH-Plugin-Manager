@@ -196,10 +196,31 @@ function BrowserPick({
   );
 }
 
+/**
+ * profile 体积缓存的键。
+ * Windows 路径大小写不敏感、尾部可能带分隔符，统一规范化后再比。
+ */
+function profileSizeKey(name: string, profilesDir: string): string {
+  return `${name.toLowerCase()}::${profilesDir.replace(/[\\/]+$/, "").toLowerCase()}`;
+}
+
 export default function App() {
   const [envs, setEnvs] = useState<DshEnv[]>([]);
   const [selectedEnv, setSelectedEnv] = useState<string>(() => localStorage.getItem("dshpm-sel-env") ?? "");
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+  // profile 体积缓存：后端在独立线程里算体积、逐条 emit `profile-size`，
+  // 而列表重建（扫描结束 / 初始化后刷新）会拿到 `dataSize: 0` 的新对象。
+  // 这张表兜住已算好的体积，任何一次 setProfiles 都按表回填，不会被打回「—」。
+  const profileSizesRef = useRef<Map<string, number>>(new Map());
+  /** 把已知体积贴回列表（无记录的保持原样） */
+  const applyKnownSizes = useCallback(
+    (list: ProfileInfo[]) =>
+      list.map((p) => {
+        const s = profileSizesRef.current.get(profileSizeKey(p.name, p.profilesDir));
+        return s === undefined || s === p.dataSize ? p : { ...p, dataSize: s };
+      }),
+    [],
+  );
   const [selectedProfile, setSelectedProfile] = useState<string>(() => localStorage.getItem("dshpm-sel-profile") ?? "");
   // 来源目录一并记住：启动后立即显示「来源」并可直接启动，不必等扫描
   const [selectedProfilesDir, setSelectedProfilesDir] = useState<string>(
@@ -214,6 +235,7 @@ export default function App() {
     selectedDirRef.current = selectedProfilesDir;
   }, [selectedProfile, selectedProfilesDir]);
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
+  const [pluginsLoading, setPluginsLoading] = useState(false);
   const [pluginQuery, setPluginQuery] = useState("");
   // 多实例：全部运行中的 DSH 进程（跨环境跨 profile）
   const [runnings, setRunnings] = useState<RunningProcess[]>([]);
@@ -225,8 +247,21 @@ export default function App() {
   const [error, setError] = useState<string>("");
   const [info, setInfo] = useState<string>("");
   // 导出/导入状态
-  const [exportTarget, setExportTarget] = useState<{ profile: string; profilesDir: string; nmSize: number } | null>(null);
+  const [exportTarget, setExportTarget] = useState<{ profile: string; profilesDir: string; nmSize: number | null } | null>(null);
+  // 长任务（导出 zip / 打包整合包 / 克隆 profile）状态：只驱动进度提示，
+  // **不占用**全局 busy —— 长任务期间界面其余部分照常可用。
+  const [exporting, setExporting] = useState<null | "zip" | "pack" | "clone">(null);
+  const [exportElapsed, setExportElapsed] = useState(0);
   // 整合包导入对话框
+  // 长任务计时（用于「已运行 Ns」提示，让用户知道还在动）
+  useEffect(() => {
+    if (exporting === null) {
+      setExportElapsed(0);
+      return;
+    }
+    const t = setInterval(() => setExportElapsed((e) => e + 1), 1000);
+    return () => clearInterval(t);
+  }, [exporting]);
   const [showImportDialog, setShowImportDialog] = useState(false);
   // profile 备注
   const [notes, setNotes] = useState<ProfileNotesMap>({});
@@ -416,10 +451,11 @@ export default function App() {
         return applyStoredOrder(list, keyOf, stored);
       };
       // 扫到一个 → 进列表数据（不在 UI 展现，但 profiles.length 已 >0）
+      // 贴一次体积账：重新扫描时命中缓存，列表不会先从「—」闪一下再填
       const pushOne = (p: ProfileInfo) => {
         if (!p) return;
         seen.set(keyOf(p), p);
-        setProfiles(sortAll([...seen.values()]));
+        setProfiles(sortAll(applyKnownSizes([...seen.values()])));
       };
 
       const { listen } = await import("@tauri-apps/api/event");
@@ -438,8 +474,8 @@ export default function App() {
         const all = (await api.listAllProfiles().catch(() => [])) ?? [];
         for (const p of all) pushOne(p);
       }
-      // 扫描结束：按拖拽顺序一次性显示
-      const finalList = sortAll([...seen.values()]);
+      // 扫描结束：按拖拽顺序一次性显示（体积按账回填，避免被 dataSize:0 覆盖）
+      const finalList = sortAll(applyKnownSizes([...seen.values()]));
       setProfiles(finalList);
       setProfilesReady(true);
 
@@ -467,7 +503,7 @@ export default function App() {
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [applyKnownSizes]);
 
   useEffect(() => {
     loadProfiles();
@@ -497,6 +533,7 @@ export default function App() {
   useEffect(() => {
     if (!selectedEnv || !selectedProfile) {
       setPlugins([]);
+      setPluginsLoading(false);
       setUpdates(null);
       return;
     }
@@ -506,13 +543,16 @@ export default function App() {
     if (!p) {
       // 记住的 profile 不在当前合并列表中（来源目录未扫到）：静默跳过，不报错
       setPlugins([]);
+      setPluginsLoading(false);
       setUpdates(null);
       return;
     }
+    setPluginsLoading(true);
     api
       .listPlugins(selectedEnv, selectedProfile, p.profilesDir)
       .then(setPlugins)
-      .catch((e) => setError(String(e)));
+      .catch((e) => setError(String(e)))
+      .finally(() => setPluginsLoading(false));
     setUpdates(null);
   }, [selectedEnv, selectedProfile, selectedProfilesDir, profiles]);
 
@@ -527,39 +567,82 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedEnv, selectedProfile, selectedProfilesDir, profiles]);
 
-  // 运行实例轮询（全局，跨环境跨 profile，3s 一次：进程退出后按钮/状态快速自动纠正）
-  // webReady（HTTP 可访问）即可打开——打开时走免 token 自动登录，不再等 token 行。
+  // profile 体积异步回填：后端在列表出完之后才在后台线程统计（一个带 node_modules 的
+  // profile 有数万文件，实测 16~21 秒），算好一条补一条 —— 列表本身不再被体积拖住。
+  // 注意：事件可能早于/晚于 `setProfiles` 落地，所以先记账再改列表，
+  // 列表重建时由 applyKnownSizes 按账回填（否则会被 dataSize:0 的新对象覆盖成「—」）。
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    let active = true;
+    listen<{ name: string; profilesDir: string; dataSize: number }>("profile-size", (e) => {
+      const p = e.payload;
+      if (!active || !p) return;
+      profileSizesRef.current.set(profileSizeKey(p.name, p.profilesDir), p.dataSize);
+      setProfiles((prev) =>
+        prev.map((x) =>
+          x.name === p.name && x.profilesDir === p.profilesDir ? { ...x, dataSize: p.dataSize } : x,
+        ),
+      );
+    })
+      .then((f) => {
+        if (active) un = f;
+        else f();
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+      un?.();
+    };
+  }, []);
+
   useEffect(() => {
     const tick = async () => {
+      // 窗口不可见（最小化 / 切到别的窗口）时跳过：后台轮询没意义，白烧 IPC 与磁盘
+      // 窗口不可见（最小化 / 切到别的窗口）时跳过：后台轮询没意义，白烧 IPC 与磁盘。
+      // 用 visibilityState 而不是 document.hidden：后者在非可视宿主（jsdom "prerender"）
+      // 里恒为 true，会把轮询整个掐掉。
+      if (document.visibilityState === "hidden") return;
       const l = await api.listRunning().catch(() => null);
-      setRunnings(l ?? []);
-      for (const r of l ?? []) {
-        const st = await api.dshStatus(r.envId, r.profile, r.profilesDir).catch(() => null);
-        if (st?.webReady) {
-          const u = st.url || `http://127.0.0.1:${r.port}/`;
-          const label = u.includes("token=") ? u : `${u}（点「打开界面」自动登录）`;
-          setInfo((prev) => {
-            // 可设置：空 / 等待中 / 或「自动登录」版升级为 token 地址版
-            const replaceable =
-              prev === "" ||
-              prev.includes("正在等待服务就绪") ||
-              prev.includes("启动中") ||
-              (prev.includes("自动登录") && u.includes("token="));
-            return replaceable ? `服务已就绪：${label}` : prev;
-          });
-          return;
-        }
-      }
+      // 拉取失败（null）时保持原状态：清空会让按钮瞬间从「停止」跳回「启动」
+      if (l) setRunnings(l);
+      // 并行探测（旧实现 for + await 串行：N 个实例 = N 次串行往返）
+      const probed = await Promise.all(
+        (l ?? []).map(async (r) => ({
+          r,
+          st: await api.dshStatus(r.envId, r.profile, r.profilesDir).catch(() => null),
+        })),
+      );
+      const hit = probed.find((x) => x.st?.webReady);
+      if (!hit) return;
+      const u = hit.st?.url || `http://127.0.0.1:${hit.r.port}/`;
+      const label = u.includes("token=") ? u : `${u}（点「打开界面」自动登录）`;
+      setInfo((prev) => {
+        // 可设置：空 / 等待中 / 或「自动登录」版升级为 token 地址版
+        const replaceable =
+          prev === "" ||
+          prev.includes("正在等待服务就绪") ||
+          prev.includes("启动中") ||
+          (prev.includes("自动登录") && u.includes("token="));
+        return replaceable ? `服务已就绪：${label}` : prev;
+      });
     };
     tick();
     const t = setInterval(tick, 3000);
-    return () => clearInterval(t);
+    const onVisible = () => {
+      if (document.visibilityState !== "hidden") void tick();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, []);
 
   useEffect(() => {
     if (!isDesktopProfile) return;
     let active = true;
     const pollDesktop = async () => {
+      if (document.visibilityState === "hidden") return; // 窗口不可见时不轮询
       const st = await api.getOfficialDesktopStatus().catch(() => null);
       if (active && st) {
         setOfficialDesktopStatus(st);
@@ -948,21 +1031,31 @@ export default function App() {
     }
   };
 
-  // 导出 profile：先查 node_modules 大小，弹窗让用户决定是否排除
+  // 导出 profile：**立即弹窗**，node_modules 体积后台算（算好再填进去）
+  //
+  // 旧实现在弹窗前 `await profileNodeModulesSize(...)`：那是一次全量磁盘递归，
+  // 实测 3.3 万文件 / 693MB 要 16~21 秒，用户点了导出要干等十几秒才见到弹窗。
   const handleExport = async (profile: string) => {
     if (!selectedEnv) return;
+    const pdir = profiles.find((x) => x.name === profile)?.profilesDir ?? "";
+    setExportTarget({ profile, profilesDir: pdir, nmSize: null });
     try {
-      const pdir = profiles.find((x) => x.name === profile)?.profilesDir ?? "";
       const nmSize = await api.profileNodeModulesSize(selectedEnv, profile, pdir);
-      setExportTarget({ profile, profilesDir: pdir, nmSize });
-    } catch (e) {
-      setError(String(e));
+      // 只在弹窗还停在同一 profile 上时回填（用户可能已关掉或换了目标）
+      setExportTarget((cur) =>
+        cur && cur.profile === profile && cur.profilesDir === pdir ? { ...cur, nmSize } : cur,
+      );
+    } catch {
+      // 体积只是提示信息，拿不到就当 0，不打断导出流程
+      setExportTarget((cur) =>
+        cur && cur.profile === profile && cur.profilesDir === pdir ? { ...cur, nmSize: 0 } : cur,
+      );
     }
   };
 
   const doExport = async (excludeNodeModules: boolean) => {
     if (!selectedEnv || !exportTarget) return;
-    setBusy(true);
+    setExporting("zip");
     setError("");
     setInfo("");
     try {
@@ -977,7 +1070,7 @@ export default function App() {
     } catch (e) {
       setError(String(e));
     } finally {
-      setBusy(false);
+      setExporting(null);
       setExportTarget(null);
     }
   };
@@ -1004,7 +1097,7 @@ export default function App() {
     dshHint?: string,
   ) => {
     if (!selectedEnv || !exportTarget) return;
-    setBusy(true);
+    setExporting("pack");
     setError("");
     setInfo("");
     try {
@@ -1031,15 +1124,15 @@ export default function App() {
     } catch (e) {
       setError(String(e));
     } finally {
-      setBusy(false);
+      setExporting(null);
       setExportTarget(null);
     }
   };
 
   // 复制并重命名 profile 副本（同目录，自动 -1 递增；node_modules 一并复制，立即可用）
   const doClone = async () => {
-    if (!selectedEnv || !exportTarget || busy) return;
-    setBusy(true);
+    if (!selectedEnv || !exportTarget || busy || exporting !== null) return;
+    setExporting("clone");
     try {
       const newName = await api.cloneProfile(selectedEnv, exportTarget.profile, exportTarget.profilesDir);
       setInfo(`已复制为副本「${newName}」（与「${exportTarget.profile}」同目录，node_modules 已一并复制）`);
@@ -1048,7 +1141,7 @@ export default function App() {
     } catch (e) {
       setError(String(e));
     } finally {
-      setBusy(false);
+      setExporting(null);
     }
   };
 
@@ -1183,7 +1276,7 @@ export default function App() {
       await startAndPoll(selectedEnv, "web", "");
       api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
       const ps = await api.listAllProfiles().catch(() => []);
-      setProfiles(ps);
+      setProfiles(applyKnownSizes(ps));
       setSelectedProfile("web");
       setShowInitHint(false);
       setShowInitBtn(false);
@@ -1205,7 +1298,7 @@ export default function App() {
       setInfo("初始化进程已停止");
       api.listRunning().then((l) => setRunnings(l ?? [])).catch(() => {});
       const ps = await api.listAllProfiles().catch(() => []);
-      setProfiles(ps);
+      setProfiles(applyKnownSizes(ps));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1575,7 +1668,18 @@ export default function App() {
             </div>
           </div>
           <div className="profile-list" ref={profileReorder.listRef}>
-            {!profilesReady && profiles.length === 0 && <div className="empty">正在扫描 Profiles…</div>}
+            {/* 首屏骨架屏：扫描期间先给结构感，别只留一行字干等 */}
+            {!profilesReady && profiles.length === 0 && (
+              <div className="skeleton-list" aria-label="正在扫描 Profiles">
+                {[0, 1, 2].map((i) => (
+                  <div className="skeleton-card" key={i}>
+                    <div className="skeleton-line w40" />
+                    <div className="skeleton-line w70" />
+                    <div className="skeleton-line w30" />
+                  </div>
+                ))}
+              </div>
+            )}
             {profilesReady && profiles.length === 0 && <div className="empty">该环境暂无 profile</div>}
             {profiles.map((p, i) => (
               <div
@@ -1616,7 +1720,7 @@ export default function App() {
                   );
                 })()}
                 <div className="profile-meta">
-                  {p.pluginCount} 插件 · {formatSize(p.dataSize)}
+                  {p.pluginCount} 插件 · {p.dataSize > 0 ? formatSize(p.dataSize) : "—"}
                 </div>
                 <div className="profile-meta dim">更新于 {p.modified}</div>
                 <div className="profile-flags">
@@ -2051,7 +2155,15 @@ export default function App() {
                   </div>
                 </div>
                 {plugins.length === 0 ? (
-                  <div className="empty">暂无插件</div>
+                  pluginsLoading ? (
+                    <div className="skeleton-list" aria-label="正在加载插件">
+                      <div className="skeleton-row" />
+                      <div className="skeleton-row" />
+                      <div className="skeleton-row" />
+                    </div>
+                  ) : (
+                    <div className="empty">暂无插件</div>
+                  )
                 ) : (
                   <>
                     <input
@@ -2334,7 +2446,9 @@ export default function App() {
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>删除 profile「{confirmDeleteProfile.name}」？</h3>
             <p className="modal-hint">
-              将删除整个目录（含 node_modules，{formatSize(confirmDeleteProfile.dataSize)}），
+                  将删除整个目录（含 node_modules，
+                  {confirmDeleteProfile.dataSize > 0 ? formatSize(confirmDeleteProfile.dataSize) : "体积未知"}
+                  ），
               该操作<strong>不可恢复</strong>。如需保留可先用「⬇ 导出」备份。
             </p>
             <div className="modal-actions">
@@ -2372,15 +2486,38 @@ export default function App() {
 
       {/* 导出确认弹窗 */}
       {exportTarget && (
-        <div className="modal-mask" onClick={() => setExportTarget(null)}>
+        <div className="modal-mask" onClick={() => exporting === null && setExportTarget(null)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>导出 Profile「{exportTarget.profile}」</h3>
             <p className="modal-hint">
-              node_modules 体积：{formatSize(exportTarget.nmSize)}
-              {exportTarget.nmSize > 20 * 1024 * 1024
+              node_modules 体积：
+              {exportTarget.nmSize === null ? (
+                <span className="size-pending" title="正在后台统计目录体积（数万文件，需要几秒）">
+                  计算中…
+                </span>
+              ) : (
+                formatSize(exportTarget.nmSize)
+              )}
+              {exportTarget.nmSize !== null && exportTarget.nmSize > 20 * 1024 * 1024
                 ? "（较大，建议排除后导入再重建依赖）"
                 : ""}
             </p>
+            {/* 长任务进度：导出/打包/克隆期间给明确反馈（不确定进度 → 滚动条 + 已运行秒数） */}
+            {exporting !== null && (
+              <div className="install-progress">
+                <div className="bar">
+                  <div className="bar-fill indeterminate" />
+                </div>
+                <div className="bar-text">
+                  {exporting === "zip"
+                    ? "正在打包 profile zip"
+                    : exporting === "pack"
+                    ? "正在打包整合包"
+                    : "正在复制 profile（含 node_modules）"}
+                  …已运行 {exportElapsed}s，请勿关闭窗口
+                </div>
+              </div>
+            )}
             <ExportOptions
               profile={exportTarget.profile}
               nmSize={exportTarget.nmSize}
@@ -2391,7 +2528,7 @@ export default function App() {
               }
               onClone={doClone}
               onCancel={() => setExportTarget(null)}
-              busy={busy}
+              busy={busy || exporting !== null}
             />
           </div>
         </div>
@@ -2515,7 +2652,7 @@ function ExportOptions({
   busy,
 }: {
   profile: string;
-  nmSize: number;
+  nmSize: number | null;
   versions: string[];
   onConfirmZip: (exclude: boolean) => void;
   onConfirmPack: (name: string, version: string, displayName: string, dshHint: string) => void;
@@ -2524,7 +2661,16 @@ function ExportOptions({
   busy: boolean;
 }) {
   const [mode, setMode] = useState<"zip" | "pack">("zip");
-  const [exclude, setExclude] = useState(nmSize > 20 * 1024 * 1024);
+  // 体积未知（还在后台算）时默认勾上「排除 node_modules」——大包占多数，先给安全默认；
+  // 算出来之后若其实很小，且用户没手动改过，再自动取消勾选。
+  const [exclude, setExclude] = useState(nmSize === null ? true : nmSize > 20 * 1024 * 1024);
+  const excludeTouched = useRef(false);
+  const excludeAutoDone = useRef(nmSize !== null);
+  useEffect(() => {
+    if (nmSize === null || excludeAutoDone.current) return;
+    excludeAutoDone.current = true;
+    if (!excludeTouched.current) setExclude(nmSize > 20 * 1024 * 1024);
+  }, [nmSize]);
   const [packName, setPackName] = useState(profile);
   const [packVersion, setPackVersion] = useState("1.0.0");
   const [displayName, setDisplayName] = useState("");
@@ -2542,7 +2688,14 @@ function ExportOptions({
       </div>
       {mode === "zip" ? (
         <label className="check-row">
-          <input type="checkbox" checked={exclude} onChange={(e) => setExclude(e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={exclude}
+            onChange={(e) => {
+              excludeTouched.current = true;
+              setExclude(e.target.checked);
+            }}
+          />
           排除 node_modules（压缩包更小；导入后可重建依赖）
         </label>
       ) : (

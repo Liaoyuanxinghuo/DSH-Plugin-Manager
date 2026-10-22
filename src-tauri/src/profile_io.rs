@@ -461,23 +461,73 @@ pub struct CreateProfileResult {
     pub path: String,
 }
 
-/// 列出 profile 内 node_modules 大小（用于导出前提示）
+/// 目录体积缓存：路径 → (目录 mtime 纳秒, 体积)。
+///
+/// 实测一个 DSH profile 的 `node_modules` 有 3.3 万文件 / 693MB，全量扫描要 16~21 秒。
+/// 缓存后同一目录（mtime 未变）再问体积直接 0ms 返回；`node_modules` 增删包会改变其
+/// 自身目录 mtime，因此用它做失效判据足够可靠。
+static SIZE_CACHE: std::sync::Mutex<
+    Option<std::collections::HashMap<std::path::PathBuf, (u128, u64)>>,
+> = std::sync::Mutex::new(None);
+
+fn dir_mtime_nanos(p: &Path) -> u128 {
+    fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// 目录体积（带 mtime 缓存）。供导出提示、profile 列表体积回填等复用。
+pub fn dir_size_cached(path: &Path) -> u64 {
+    let stamp = dir_mtime_nanos(path);
+    if stamp != 0 {
+        if let Some(map) = SIZE_CACHE.lock().unwrap().as_ref() {
+            if let Some((s, sz)) = map.get(path) {
+                if *s == stamp {
+                    return *sz;
+                }
+            }
+        }
+    }
+    let size = dir_size(path);
+    if stamp != 0 {
+        SIZE_CACHE
+            .lock()
+            .unwrap()
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(path.to_path_buf(), (stamp, size));
+    }
+    size
+}
+
+/// 列出 profile 内 node_modules 大小（用于导出前提示）。带缓存。
 pub fn node_modules_size(profile_dir: &Path) -> u64 {
     let nm = profile_dir.join("node_modules");
     if !nm.is_dir() {
         return 0;
     }
-    dir_size(&nm)
+    dir_size_cached(&nm)
 }
 
+/// 递归统计目录体积（**性能敏感**）。
+///
+/// - 用 `DirEntry::file_type()` / `DirEntry::metadata()`：Windows 下直接复用目录枚举
+///   已返回的数据，省掉「每个文件重新解析路径 + 一次 stat」。旧实现用 `fs::metadata(p)`
+///   对 3.3 万文件要 16~21 秒，这里能砍掉绝大部分系统调用。
+/// - 跳过 symlink / 目录联接：避免符号链接环导致死循环或重复计数。
 fn dir_size(path: &Path) -> u64 {
     let mut total = 0u64;
-    if let Ok(entries) = fs::read_dir(path) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                total += dir_size(&p);
-            } else if let Ok(md) = fs::metadata(&p) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return 0;
+    };
+    for e in entries.flatten() {
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_dir() {
+            total += dir_size(&e.path());
+        } else if ft.is_file() {
+            if let Ok(md) = e.metadata() {
                 total += md.len();
             }
         }

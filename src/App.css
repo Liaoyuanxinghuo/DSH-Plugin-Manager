@@ -500,3 +500,80 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 .btn-icon-refresh:hover:not(:disabled) {
   color: var(--accent);
 }
+
+/* ==================== 交互与动效（体验打磨） ==================== */
+
+/* 尊重系统「减少动态效果」偏好：关掉位移/脉冲类动效 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* 主题切换：颜色平滑过渡（只过渡颜色，不触发布局） */
+html, body { transition: background-color 0.25s ease, color 0.25s ease; }
+
+/* —— 按钮：悬停提亮 / 按压缩放 / 键盘焦点环 —— */
+.btn {
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease,
+    transform 0.08s ease, box-shadow 0.15s ease, filter 0.15s ease;
+}
+.btn:hover:not(:disabled) { filter: brightness(1.08); }
+.btn:active:not(:disabled) { transform: scale(0.97); }
+.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+/* —— 列表项：悬停轻微位移 + 底色过渡；选中态柔和投影 —— */
+.env-item, .profile-item {
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.12s ease,
+    box-shadow 0.15s ease;
+}
+.env-item:hover, .profile-item:hover { transform: translateX(1px); }
+.env-item.active, .profile-item.active { box-shadow: 0 1px 8px rgba(0, 0, 0, 0.12); }
+
+/* —— 模态框：遮罩淡入 + 面板轻微上浮（所有弹窗统一生效） —— */
+.modal-mask, .modal-overlay { animation: mask-in 0.16s ease-out; }
+.modal { animation: modal-in 0.18s cubic-bezier(0.2, 0.8, 0.3, 1); }
+@keyframes mask-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes modal-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+
+/* —— 状态胶囊 / 标签：运行中↔已停止 不再硬切 —— */
+.pill, .run-pill, .tag, .env-run-pill {
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+/* —— 「计算中…」这类等待文案：呼吸式脉冲，明确「还在动」 —— */
+.size-pending { color: var(--text-dim); animation: pulse-fade 1.1s ease-in-out infinite; }
+@keyframes pulse-fade { 0%, 100% { opacity: 0.4; } 50% { opacity: 1; } }
+
+/* —— 骨架屏（首屏扫描 / 插件列表加载中） —— */
+.skeleton-list { display: flex; flex-direction: column; gap: 8px; }
+.skeleton-card {
+  background: var(--panel-2);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.skeleton-line, .skeleton-row {
+  background: linear-gradient(90deg, var(--panel-2) 25%, var(--border) 37%, var(--panel-2) 63%);
+  background-size: 400% 100%;
+  animation: skeleton-shimmer 1.3s ease-in-out infinite;
+  border-radius: 4px;
+}
+.skeleton-line { height: 10px; }
+.skeleton-line.w30 { width: 30%; }
+.skeleton-line.w40 { width: 40%; }
+.skeleton-line.w70 { width: 70%; }
+.skeleton-row { height: 34px; }
+@keyframes skeleton-shimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
