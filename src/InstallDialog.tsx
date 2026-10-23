@@ -324,17 +324,17 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
         </div>
 
         {/* 标签页 */}
-        <div className="tab-bar">
-          <button className={`tab-btn ${tab === "market" ? "active" : ""}`} onClick={() => switchTab("market")}>
+        <div className="tab-bar" role="tablist">
+          <button className={`tab-btn ${tab === "market" ? "active" : ""}`} onClick={() => switchTab("market")} role="tab" aria-selected={tab === "market"}>
             市场
           </button>
-          <button className={`tab-btn ${tab === "search" ? "active" : ""}`} onClick={() => switchTab("search")}>
+          <button className={`tab-btn ${tab === "search" ? "active" : ""}`} onClick={() => switchTab("search")} role="tab" aria-selected={tab === "search"}>
             npm 搜索
           </button>
-          <button className={`tab-btn ${tab === "custom" ? "active" : ""}`} onClick={() => switchTab("custom")}>
+          <button className={`tab-btn ${tab === "custom" ? "active" : ""}`} onClick={() => switchTab("custom")} role="tab" aria-selected={tab === "custom"}>
             自定义源
           </button>
-          <button className={`tab-btn ${tab === "local" ? "active" : ""}`} onClick={() => switchTab("local")}>
+          <button className={`tab-btn ${tab === "local" ? "active" : ""}`} onClick={() => switchTab("local")} role="tab" aria-selected={tab === "local"}>
             本地导入
           </button>
         </div>

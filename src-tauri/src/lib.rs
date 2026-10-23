@@ -104,6 +104,26 @@ async fn scan_envs(state: State<'_, AppState>) -> Result<Vec<DshEnv>, String> {
         .map_err(|e| format!("扫描失败：{e}"))
 }
 
+/// 流式扫描全部 DSH 环境（对齐 scan_profiles_live 的思路）：
+/// 手动环境在内存中立即可用，逐个 emit `env-found`；全局 CLI 探测较慢
+/// （spawn 子进程探版本）放最后，探测到再 emit；全部结束 emit `envs-scan-done`。
+/// 最终顺序由前端 applyStoredOrder（用户拖拽）决定，UI 以 done 后的全量为准。
+#[tauri::command]
+async fn scan_envs_live(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let manual = state.manual_envs.lock().unwrap().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        for m in &manual {
+            let _ = app.emit("env-found", m);
+        }
+        if let Some(g) = scanner::detect_global_cli() {
+            let _ = app.emit("env-found", &g);
+        }
+        let _ = app.emit("envs-scan-done", true);
+    })
+    .await
+    .map_err(|e| format!("扫描失败：{e}"))
+}
+
 /// 手动添加环境（如 pnpm dlx 版本）
 /// validate_manual_env 会执行命令探测版本（spawn 子进程）→ 阻塞线程池。
 #[tauri::command]
@@ -3230,6 +3250,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             scan_envs,
+            scan_envs_live,
             add_manual_env,
             remove_manual_env,
             get_env,
@@ -3576,13 +3597,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.23_x64-setup.exe", "0.3.23"));
-        assert!(asset_matches("dsh-manager_0.3.23_x64-setup.exe", "0.3.23"));
-        assert!(asset_matches("任意名_0.3.23_x64-setup.exe", "0.3.23"));
-        assert!(!asset_matches("DSH-Manager-0.3.23-win-x64.exe", "0.3.23"));
-        assert!(!asset_matches("DSH Manager_0.3.23_x64-setup.exe.sha256", "0.3.23"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.23"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.23"));
+        assert!(asset_matches("DSH Manager_0.3.24_x64-setup.exe", "0.3.24"));
+        assert!(asset_matches("dsh-manager_0.3.24_x64-setup.exe", "0.3.24"));
+        assert!(asset_matches("任意名_0.3.24_x64-setup.exe", "0.3.24"));
+        assert!(!asset_matches("DSH-Manager-0.3.24-win-x64.exe", "0.3.24"));
+        assert!(!asset_matches("DSH Manager_0.3.24_x64-setup.exe.sha256", "0.3.24"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.24"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.24"));
     }
 
     #[test]
@@ -3715,10 +3736,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.23_x64-setup.exe", "0.3.23"));
+        assert!(asset_matches("DSH.Manager_0.3.24_x64-setup.exe", "0.3.24"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.23_x64-setup.exe", "0.3.23"));
-        assert!(asset_matches("DSH.MANAGER_0.3.23_X64-SETUP.EXE", "0.3.23"));
+        assert!(asset_matches("dsh.manager_0.3.24_x64-setup.exe", "0.3.24"));
+        assert!(asset_matches("DSH.MANAGER_0.3.24_X64-SETUP.EXE", "0.3.24"));
     }
 
     #[test]
@@ -3726,7 +3747,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.23", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.24", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

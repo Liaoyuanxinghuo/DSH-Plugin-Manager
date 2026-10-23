@@ -68,6 +68,9 @@ const mockBrowsers = [
 function mockAll() {
   mockInvoke.mockImplementation((cmd: string) => {
     switch (cmd) {
+      case "scan_envs_live":
+        // 流式接口：不发射事件，前端 seen 为空时走 scan_envs 兜底
+        return Promise.resolve();
       case "scan_envs":
         return Promise.resolve([
           {
@@ -182,9 +185,9 @@ describe("App 主界面", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("＋扫本体")).toBeInTheDocument();
+      expect(screen.getByText("扫本体")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("＋扫本体"));
+    await user.click(screen.getByText("扫本体"));
     // 不应出现教学弹窗文案
     expect(screen.queryByText(/扫描 DSH 本体/)).not.toBeInTheDocument();
     expect(screen.queryByText(/什么时候需要用它/)).not.toBeInTheDocument();
@@ -271,7 +274,7 @@ describe("App 主界面", () => {
       expect(screen.getAllByText("web").length).toBeGreaterThan(0);
     });
     expect(screen.queryByText("newone")).toBeNull();
-    await user.click(screen.getByRole("button", { name: /刷新/ }));
+    await user.click(screen.getByText("刷新"));
     // 刷新后 list_all_profiles 再次拉取，新增 profile 出现在列表
     await waitFor(() => {
       expect(screen.getByText("newone")).toBeInTheDocument();
@@ -283,7 +286,7 @@ describe("App 主界面", () => {
   it("文件系统快捷入口显示「当前 Profile 目录」并点击调用 open_path", async () => {
     const user = userEvent.setup();
     render(<App />);
-    // 按钮文本带 📂 前缀 → 用正则匹配
+    // 按钮文本经 Icon 组件渲染，用纯文本匹配
     await waitFor(() => {
       expect(screen.getByText(/当前 Profile 目录/)).toBeInTheDocument();
     });
@@ -296,9 +299,9 @@ describe("App 主界面", () => {
   it("显示启动按钮与文件入口", async () => {
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("▶ 启动 DSH")).toBeInTheDocument();
+      expect(screen.getByText("启动 DSH")).toBeInTheDocument();
     });
-    // 文件入口依赖异步的 get_env_paths，单独等待（按钮文本含 emoji，用正则）
+    // 文件入口依赖异步的 get_env_paths，单独等待
     await waitFor(() => {
       expect(screen.getByText(/DSH_HOME/)).toBeInTheDocument();
     });
@@ -315,9 +318,9 @@ describe("App 主界面", () => {
       return mockAllDefault(cmd);
     });
     render(<App />);
-    await screen.findByText("■ 停止");
+    await screen.findByText("停止");
     // 运行中：删除按钮隐藏（mock 只有一个 profile，唯一删除按钮应不存在）
-    expect(screen.queryByText("🗑 删除")).not.toBeInTheDocument();
+    expect(screen.queryByText("删除")).not.toBeInTheDocument();
     // 进程退出 → 删除按钮恢复
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "list_running_cmd") return Promise.resolve([]);
@@ -326,7 +329,7 @@ describe("App 主界面", () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 3100));
     });
-    expect(screen.getByText("🗑 删除")).toBeInTheDocument();
+    expect(screen.getByText("删除")).toBeInTheDocument();
   });
 
   it("进程退出后，重启按钮自动变回启动按钮", async () => {
@@ -340,7 +343,7 @@ describe("App 主界面", () => {
       return mockAllDefault(cmd);
     });
     render(<App />);
-    await screen.findByText("↻ 重启 DSH");
+    await screen.findByText("重启 DSH");
     // 进程退出（后端 list_running 清理死进程返回空）→ 等一个轮询周期后按钮变回「启动」
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "list_running_cmd") return Promise.resolve([]);
@@ -349,7 +352,7 @@ describe("App 主界面", () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 3100));
     });
-    expect(screen.getByText("▶ 启动 DSH")).toBeInTheDocument();
+    expect(screen.getByText("启动 DSH")).toBeInTheDocument();
   });
   it("认领实例（放生找回）：显示「认领」标记，按钮状态对应为运行中", async () => {
     mockInvoke.mockImplementation((cmd: string) => {
@@ -375,8 +378,8 @@ describe("App 主界面", () => {
     expect(screen.queryByText(/·认领/)).not.toBeInTheDocument();
     expect(await screen.findByText(/运行中（认领）/)).toBeInTheDocument();
     // 状态对应：不显示启动按钮，显示重启与停止（可直接接管操作）
-    expect(await screen.findByText("↻ 重启 DSH")).toBeInTheDocument();
-    expect(screen.queryByText("▶ 启动 DSH")).not.toBeInTheDocument();
+    expect(await screen.findByText("重启 DSH")).toBeInTheDocument();
+    expect(screen.queryByText("启动 DSH")).not.toBeInTheDocument();
   });
 
   it("连点「启动」只调用一次 start_dsh_cmd（防重复拉起）", async () => {
@@ -389,7 +392,7 @@ describe("App 主界面", () => {
       return mockAllDefault(cmd);
     });
     render(<App />);
-    const btn = await screen.findByText("▶ 启动 DSH");
+    const btn = await screen.findByText("启动 DSH");
     await act(async () => {
       btn.click();
       btn.click();
@@ -398,7 +401,7 @@ describe("App 主界面", () => {
     expect(startCalls).toBe(1);
   });
 
-  it("点中栏「▶ 启动」同时把该 profile 切为当前选中", async () => {
+  it("点中栏「启动」同时把该 profile 切为当前选中", async () => {
     let startedProfile = "";
     mockInvoke.mockImplementation((cmd: string, args?: unknown) => {
       if (cmd === "start_dsh_cmd") {
@@ -435,7 +438,7 @@ describe("App 主界面", () => {
     });
     render(<App />);
     // 默认选中 web（第一个）；点 headless 那一行的启动按钮（中栏按列表顺序渲染）
-    const startBtns = await screen.findAllByText("▶ 启动");
+    const startBtns = await screen.findAllByText("启动");
     expect(startBtns).toHaveLength(2);
     await act(async () => {
       startBtns[1].click();
@@ -449,7 +452,7 @@ describe("App 主界面", () => {
     localStorage.removeItem("dshpm-sel-profile-dir");
   });
 
-  it("点「⬆ 导出」立即弹出弹窗（node_modules 体积后台算，不阻塞弹窗）", async () => {
+  it("点「导出」立即弹出弹窗（node_modules 体积后台算，不阻塞弹窗）", async () => {
     mockInvoke.mockImplementation((cmd: string) => {
       if (cmd === "profile_node_modules_size") {
         // 体积永远算不完：模拟 3.3 万文件 / 693MB 需要十几秒的磁盘递归
@@ -462,7 +465,7 @@ describe("App 主界面", () => {
     await waitFor(() => {
       expect(screen.getAllByText("web").length).toBeGreaterThan(0);
     });
-    await user.click(screen.getByText("⬆ 导出"));
+    await user.click(screen.getByText("导出"));
     // 关键回归：体积还没算完，弹窗也必须已经出现
     expect(await screen.findByText(/导出 Profile「web」/)).toBeInTheDocument();
     expect(screen.getByText("计算中…")).toBeInTheDocument();
@@ -504,9 +507,9 @@ describe("App 主界面", () => {
       return mockAllDefault(cmd);
     });
     render(<App />);
-    // desktop 行是「选中」按钮；中栏只剩一个「▶ 启动」（web 那行）
+    // desktop 行是「选中」按钮；中栏只剩一个「启动」（web 那行）
     const selectBtn = await screen.findByText("选中");
-    expect(screen.getAllByText("▶ 启动")).toHaveLength(1);
+    expect(screen.getAllByText("启动")).toHaveLength(1);
     // 中栏 desktop 行标题右侧有「官方桌面」标签（此刻右栏选中的是 web，故只有这一个）
     expect(screen.getByText("官方桌面").className).toContain("official");
     await act(async () => {
@@ -545,7 +548,7 @@ describe("App 主界面", () => {
       // profile 名会同时出现在中栏列表与右栏标题，用 getAllByText 避免歧义
       expect(screen.getAllByText("web").length).toBeGreaterThan(0);
     });
-    await user.click(screen.getByText("▶ 启动 DSH"));
+    await user.click(screen.getByText("启动 DSH"));
     // 启动就绪后（portOpen=true）不应自动调用 open_url_cmd
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("start_dsh_cmd", expect.anything());
@@ -580,9 +583,9 @@ describe("App 主界面", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("🌐 打开界面")).toBeInTheDocument();
+      expect(screen.getByText("打开界面")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("🌐 打开界面"));
+    await user.click(screen.getByText("打开界面"));
     expect(mockInvoke).toHaveBeenCalledWith("open_dsh_web_cmd", {
       envId: "global",
       profile: "web",
@@ -619,9 +622,9 @@ describe("App 主界面", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("🌐 打开界面")).toBeInTheDocument();
+      expect(screen.getByText("打开界面")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("🌐 打开界面"));
+    await user.click(screen.getByText("打开界面"));
     await waitFor(() => {
       expect(screen.getByText(/已在浏览器打开 DSH 界面（免 token 登录）/)).toBeInTheDocument();
     });
@@ -649,7 +652,7 @@ describe("App 主界面", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("🌐 打开界面")).toBeInTheDocument();
+      expect(screen.getByText("打开界面")).toBeInTheDocument();
     });
     await user.click(screen.getByLabelText("选择打开界面用的浏览器"));
     // 默认浏览器在首位，其后是已安装浏览器（名称只在悬停提示/无障碍标签，不显示）
@@ -688,13 +691,13 @@ describe("App 主界面", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("🌐 打开界面")).toBeInTheDocument();
+      expect(screen.getByText("打开界面")).toBeInTheDocument();
     });
     await user.click(screen.getByLabelText("选择打开界面用的浏览器"));
     await user.click(screen.getByRole("option", { name: /Mozilla Firefox/ }));
     // 选择写入全局记忆（与 DSH/Profile 无关的单一键）
     expect(localStorage.getItem("dshpm-browser")).toBe("c:\\program files\\mozilla firefox\\firefox.exe");
-    await user.click(screen.getByText("🌐 打开界面"));
+    await user.click(screen.getByText("打开界面"));
     expect(mockInvoke).toHaveBeenCalledWith("open_dsh_web_cmd", {
       envId: "global",
       profile: "web",
@@ -768,7 +771,7 @@ describe("App 主界面", () => {
     await waitFor(() => {
       expect(screen.getByTitle(/打开界面用：Mozilla Firefox/)).toBeInTheDocument();
     });
-    await user.click(screen.getByText("🌐 打开界面"));
+    await user.click(screen.getByText("打开界面"));
     expect(mockInvoke).toHaveBeenCalledWith("open_dsh_web_cmd", {
       envId: "global",
       profile: "web",
@@ -780,7 +783,7 @@ describe("App 主界面", () => {
     await waitFor(() => {
       expect(screen.getByTitle(/打开界面用：Mozilla Firefox/)).toBeInTheDocument();
     });
-    await user.click(screen.getByText("🌐 打开界面"));
+    await user.click(screen.getByText("打开界面"));
     expect(mockInvoke).toHaveBeenCalledWith("open_dsh_web_cmd", {
       envId: "global",
       profile: "headless",
@@ -817,7 +820,7 @@ describe("App 主界面", () => {
     await waitFor(() => {
       expect(screen.getByTitle(/打开界面用：Google Chrome（默认）/)).toBeInTheDocument();
     });
-    await user.click(screen.getByText("🌐 打开界面"));
+    await user.click(screen.getByText("打开界面"));
     expect(mockInvoke).toHaveBeenCalledWith("open_dsh_web_cmd", {
       envId: "global",
       profile: "web",
@@ -1002,7 +1005,7 @@ describe("App 主界面", () => {
       expect(screen.getByText(/当前 Profile 目录/)).toBeInTheDocument();
     });
     // 插件列表卡片的安装按钮（注意排除"已安装插件（N）"标题，用精确按钮文本）
-    const installBtn = screen.getByText("＋安装插件");
+    const installBtn = screen.getByText("安装插件");
     await user.click(installBtn);
     // env.name 含半角括号（如 "全局 CLI (dsh 0.1.0-rc.7)"），目标条追加全角括号版本信息
     await waitFor(() => {
@@ -1011,7 +1014,7 @@ describe("App 主界面", () => {
     expect(screen.getByText(/× web/)).toBeInTheDocument();
     expect(screen.getByText(/dsh 0.1.0-rc.7）/)).toBeInTheDocument();
     // 切到"本地导入" tab，安装按钮明确标注目标组合
-    await user.click(screen.getByText("本地导入"));
+    await user.click(screen.getByRole("tab", { name: "本地导入" }));
     expect(screen.getByText(/安装到 全局 CLI.* × web/)).toBeInTheDocument();
   });
 
@@ -1057,9 +1060,9 @@ describe("App 主界面", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("▶ 启动 DSH")).toBeInTheDocument();
+      expect(screen.getByText("启动 DSH")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("▶ 启动 DSH"));
+    await user.click(screen.getByText("启动 DSH"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("start_dsh_cmd", {
         envId: "global",
@@ -1221,10 +1224,14 @@ describe("M3 插件管理", () => {
     });
     const user = userEvent.setup();
     render(<App />);
+    // 先等 env/profile 就绪（点击时按钮才可点；防止扫描竞态把点击吞掉）
     await waitFor(() => {
-      expect(screen.getByText("⟳ 检查更新")).toBeInTheDocument();
+      expect(screen.getByText("web")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("⟳ 检查更新"));
+    await waitFor(() => {
+      expect(screen.getByText("检查更新")).toBeInTheDocument();
+    });
+    await user.click(screen.getByText("检查更新"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("check_updates_cmd", {
         envId: "global",
@@ -1239,7 +1246,7 @@ describe("M3 插件管理", () => {
 });
 
 describe("新建/删除 Profile", () => {
-  it("点击＋新建弹出表单，选择 profiles 目录后调用 create_profile_cmd 并选中新 profile", async () => {
+  it("点击新建弹出表单，选择 profiles 目录后调用 create_profile_cmd 并选中新 profile", async () => {
     const profilesDir = "C:\\Users\\test\\.dsh\\profiles";
     vi.mocked(mockOpen).mockResolvedValue(profilesDir);
     mockInvoke.mockImplementation((cmd: string) => {
@@ -1256,9 +1263,9 @@ describe("新建/删除 Profile", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("＋新建")).toBeInTheDocument();
+      expect(screen.getByText("新建")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("＋新建"));
+    await user.click(screen.getByText("新建"));
     await waitFor(() => {
       expect(screen.getByText("新建 Profile")).toBeInTheDocument();
     });
@@ -1286,9 +1293,9 @@ describe("新建/删除 Profile", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("＋新建")).toBeInTheDocument();
+      expect(screen.getByText("新建")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("＋新建"));
+    await user.click(screen.getByText("新建"));
     await user.click(screen.getByText("选择目录"));
     await waitFor(() => {
       expect(screen.getByDisplayValue(profilesDir)).toBeInTheDocument();
@@ -1306,9 +1313,9 @@ describe("新建/删除 Profile", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("＋新建")).toBeInTheDocument();
+      expect(screen.getByText("新建")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("＋新建"));
+    await user.click(screen.getByText("新建"));
     await user.click(screen.getByText("选择目录"));
     await waitFor(() => {
       expect(screen.getByText(/不是 profiles 文件夹/)).toBeInTheDocument();
@@ -1345,9 +1352,9 @@ describe("新建/删除 Profile", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("＋新建")).toBeInTheDocument();
+      expect(screen.getByText("新建")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("＋新建"));
+    await user.click(screen.getByText("新建"));
     await waitFor(() => {
       expect(screen.getByText("新建 Profile")).toBeInTheDocument();
     });
@@ -1388,9 +1395,9 @@ describe("新建/删除 Profile", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("＋新建")).toBeInTheDocument();
+      expect(screen.getByText("新建")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("＋新建"));
+    await user.click(screen.getByText("新建"));
     await waitFor(() => {
       expect(screen.getByText("新建 Profile")).toBeInTheDocument();
     });
@@ -1409,9 +1416,9 @@ describe("新建/删除 Profile", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getAllByText("🗑 删除").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("删除").length).toBeGreaterThan(0);
     });
-    await user.click(screen.getAllByText("🗑 删除")[0]);
+    await user.click(screen.getAllByText("删除")[0]);
     await waitFor(() => {
       expect(screen.getByText(/删除 profile/)).toBeInTheDocument();
     });
@@ -1466,7 +1473,7 @@ describe("新建/删除 Profile", () => {
       expect(screen.getByText("from-scan")).toBeInTheDocument();
     });
     // 删除第二项（from-scan，来源 dirB），而不是选中的 web
-    const delBtns = screen.getAllByText("🗑 删除");
+    const delBtns = screen.getAllByText("删除");
     await user.click(delBtns[1]);
     await waitFor(() => {
       expect(screen.getByText(/删除 profile「from-scan」/)).toBeInTheDocument();
@@ -1504,16 +1511,16 @@ describe("M4 健康与维护", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("⟳ 依赖检查")).toBeInTheDocument();
+      expect(screen.getByText("依赖检查")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("⟳ 依赖检查"));
+    await user.click(screen.getByText("依赖检查"));
     await waitFor(() => {
       expect(screen.getByText(/1\/2 已安装/)).toBeInTheDocument();
       expect(screen.getByText("dshmarket")).toBeInTheDocument();
       expect(screen.getByText("缺失")).toBeInTheDocument();
     });
     // 修复按钮此时可用
-    await user.click(screen.getByText("⚙ 修复依赖"));
+    await user.click(screen.getByText("修复依赖"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("fix_deps_cmd", {
         envId: "global",
@@ -1539,15 +1546,15 @@ describe("M4 健康与维护", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("🧹 扫描残留")).toBeInTheDocument();
+      expect(screen.getByText("扫描残留")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("🧹 扫描残留"));
+    await user.click(screen.getByText("扫描残留"));
     await waitFor(() => {
       expect(screen.getByText(".generations")).toBeInTheDocument();
       expect(screen.getByText("node_modules/.cache")).toBeInTheDocument();
     });
     // 清理前需确认
-    await user.click(screen.getByText("🗑 清理残留"));
+    await user.click(screen.getByText("清理残留"));
     await waitFor(() => {
       expect(screen.getByText(/清理残留缓存/)).toBeInTheDocument();
     });
@@ -1572,9 +1579,9 @@ describe("M4 健康与维护", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("📦 导出诊断包")).toBeInTheDocument();
+      expect(screen.getByText("导出诊断包")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("📦 导出诊断包"));
+    await user.click(screen.getByText("导出诊断包"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalled();
     });
@@ -1601,9 +1608,9 @@ describe("M5 设置与 DSH 下载", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("⚙ 设置")).toBeInTheDocument();
+      expect(screen.getByText("设置")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("⚙ 设置"));
+    await user.click(screen.getByText("设置"));
     // 镜像源为下拉列表：getByDisplayValue 匹配 select 时取选项文本，改用 combobox + toHaveValue
     const regSelect = screen.getByRole("combobox", { name: /npm 镜像源/ });
     await waitFor(() => {
@@ -1644,13 +1651,13 @@ describe("M5 设置与 DSH 下载", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("⬇ 下载DSH")).toBeInTheDocument();
+      expect(screen.getByText("下载DSH")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("⬇ 下载DSH"));
+    await user.click(screen.getByText("下载DSH"));
     await waitFor(() => {
       expect(screen.getByText("0.1.5-rc.3")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("⬇ 安装 dsh 0.1.5-rc.3"));
+    await user.click(screen.getByText("安装 dsh 0.1.5-rc.3"));
     await waitFor(() => {
       expect(mockInvoke).toHaveBeenCalledWith("install_dsh_version_cmd", {
         version: "0.1.5-rc.3",
@@ -1675,12 +1682,12 @@ describe("M5 设置与 DSH 下载", () => {
     });
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("⬇ 下载DSH")).toBeInTheDocument();
+      expect(screen.getByText("下载DSH")).toBeInTheDocument();
     });
     // 点击后不崩溃、能正常显示版本列表与安装按钮
-    fireEvent.click(screen.getByText("⬇ 下载DSH"));
+    fireEvent.click(screen.getByText("下载DSH"));
     await waitFor(() => {
-      expect(screen.getByText("⬇ 安装 dsh 0.1.5-rc.3")).toBeInTheDocument();
+      expect(screen.getByText("安装 dsh 0.1.5-rc.3")).toBeInTheDocument();
     });
     // 目录未从 snake_case 读到 → 显示占位符而非崩溃
     expect(screen.getByPlaceholderText("下载根目录（每版本独立子目录）")).toBeInTheDocument();
@@ -1838,7 +1845,7 @@ describe("M5 设置与 DSH 下载", () => {
       // profile 名会同时出现在中栏列表与右栏标题，用 getAllByText 避免歧义
       expect(screen.getAllByText("web").length).toBeGreaterThan(0);
     });
-    await user.click(screen.getByText("▶ 启动 DSH"));
+    await user.click(screen.getByText("启动 DSH"));
     // 未就绪阶段：不应出现「服务已就绪」
     await waitFor(() => {
       expect(screen.getByText(/正在等待服务就绪/)).toBeInTheDocument();
@@ -1874,7 +1881,7 @@ describe("M5 设置与 DSH 下载", () => {
     await waitFor(() => {
       expect(screen.getByText("web")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("▶ 启动 DSH"));
+    await user.click(screen.getByText("启动 DSH"));
     await waitFor(
       () => {
         expect(screen.getByText(/服务已就绪：.*自动登录/)).toBeInTheDocument();
@@ -1907,7 +1914,7 @@ describe("M5 设置与 DSH 下载", () => {
     await waitFor(() => {
       expect(screen.getByText("web")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("▶ 启动 DSH"));
+    await user.click(screen.getByText("启动 DSH"));
     await waitFor(
       () => {
         expect(screen.getByText(/服务已就绪：http:\/\/127\.0\.0\.1:3080\/\?token=late/)).toBeInTheDocument();
@@ -1972,7 +1979,7 @@ describe("M5 设置与 DSH 下载", () => {
     await waitFor(() => {
       expect(screen.getByText("web")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("▶ 启动 DSH"));
+    await user.click(screen.getByText("启动 DSH"));
     // 弹出残留确认框（严格匹配结果 + 手动确认）
     await waitFor(() => {
       expect(screen.getByText(/发现 1 个残留的 node 进程/)).toBeInTheDocument();
@@ -2000,7 +2007,7 @@ describe("M5 设置与 DSH 下载", () => {
     await waitFor(() => {
       expect(screen.getByText("web")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("▶ 启动 DSH"));
+    await user.click(screen.getByText("启动 DSH"));
     await waitFor(() => {
       expect(screen.getByText(/发现 1 个残留的 node 进程/)).toBeInTheDocument();
     });
@@ -2037,9 +2044,9 @@ describe("M5 设置与 DSH 下载", () => {
       return mockAllDefault(cmd);
     });
     render(<App />);
-    // 来源立即显示（不等扫描）
+    // 右栏标题立即显示（不等扫描）：Profile 名称来自上次记忆
     await waitFor(() => {
-      expect(screen.getByText(/来源:/)).toBeInTheDocument();
+      expect(document.querySelector(".panel.wide .profile-src")?.textContent).toMatch(/Profile: web/);
     });
     // 启动按钮可用，点击后以记住的来源目录启动
     const btn = await screen.findByRole("button", { name: /启动 DSH/ });
@@ -2063,23 +2070,23 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.23", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.24", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("⚙ 设置")).toBeInTheDocument();
+      expect(screen.getByText("设置")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("⚙ 设置"));
+    await user.click(screen.getByText("设置"));
     // 关于本项目：点开后显示项目地址按钮
-    await user.click(screen.getByText("ℹ 关于本项目"));
+    await user.click(screen.getByText("关于本项目"));
     await waitFor(() => {
-      expect(screen.getByText("🌐 项目地址（GitHub）")).toBeInTheDocument();
+      expect(screen.getByText("项目地址（GitHub）")).toBeInTheDocument();
     });
-    // 检查更新：mock 返回有新版本 → 显示提示
-    await user.click(screen.getByText("🔄 检查更新"));
+    // 检查更新：mock 返回有新版本 → 显示提示（关于对话框中的按钮，位于设置面板按钮之后）
+    await user.click(screen.getAllByText("检查更新")[1]);
     await waitFor(() => {
       expect(screen.getByText(/发现新版本/)).toBeInTheDocument();
     });
@@ -2090,27 +2097,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.23", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.24", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.23_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.24_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("⬇ 下载 v0.3.23"));
+    await user.click(screen.getByText("下载 v0.3.24"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.23" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.24" });
     // 打开所在文件夹
-    await user.click(screen.getByText("📂 打开所在文件夹"));
+    await user.click(screen.getByText("打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.23_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.24_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
-    await user.click(screen.getByText("🔄 关闭程序并更新"));
+    await user.click(screen.getByText("关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.23_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.24_x64-setup.exe" });
     });
   });
 });
@@ -2149,9 +2156,9 @@ describe("拖拽排序与箭头", () => {
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("⚙ 设置")).toBeInTheDocument();
+      expect(screen.getByText("设置")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("⚙ 设置"));
+    await user.click(screen.getByText("设置"));
 
     // 默认应为 dark
     expect(document.documentElement.getAttribute("data-theme")).toBe("dark");
@@ -2234,11 +2241,11 @@ describe("拖拽排序与箭头", () => {
   it("导入导出按钮箭头方向正确", async () => {
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("⬇导入")).toBeInTheDocument();
+      expect(screen.getByText("导入")).toBeInTheDocument();
     });
     await waitFor(() => {
       // 默认 mock 有两个 profile，各有一个导出按钮
-      expect(screen.getAllByText("⬆ 导出").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("导出").length).toBeGreaterThan(0);
     });
   });
 });
@@ -2252,7 +2259,7 @@ describe("整合包导入导出与备注", () => {
       expect(screen.getByText(/全局 CLI/)).toBeInTheDocument();
     });
     const user = userEvent.setup();
-    await user.click(screen.getByText("⬇导入"));
+    await user.click(screen.getByText("导入"));
     // 选项卡片文本带 emoji 前缀，用正则匹配
     expect(screen.getByText(/完整 profile zip/)).toBeInTheDocument();
     expect(screen.getByText(/整合包（.dspack）/)).toBeInTheDocument();
@@ -2261,10 +2268,10 @@ describe("整合包导入导出与备注", () => {
   it("导出弹窗提供整合包类型：填包名后出现导出整合包按钮", async () => {
     render(<App />);
     await waitFor(() => {
-      expect(screen.getAllByText("⬆ 导出").length).toBeGreaterThan(0);
+      expect(screen.getAllByText("导出").length).toBeGreaterThan(0);
     });
     const user = userEvent.setup();
-    await user.click(screen.getAllByText("⬆ 导出")[0]);
+    await user.click(screen.getAllByText("导出")[0]);
     expect(screen.getByText("完整 profile zip")).toBeInTheDocument();
     await user.click(screen.getByText("整合包（.dspack）"));
     expect(screen.getByText("选择位置并导出整合包")).toBeInTheDocument();
@@ -2276,8 +2283,9 @@ describe("整合包导入导出与备注", () => {
   it("右键 profile 打开备注弹窗，保存调用 save_profile_note_cmd", async () => {
     mockInvoke.mockClear();
     render(<App />);
+    // 等列表渲染：用 .profile-item 存在性判断（右栏详情也会显示 profile 名，getByText 会多匹配）
     await waitFor(() => {
-      expect(screen.getByText("web")).toBeInTheDocument();
+      expect(document.querySelector(".profile-item")).toBeTruthy();
     });
     const item = document.querySelector(".profile-item") as HTMLElement;
     fireEvent.contextMenu(item);
@@ -2315,7 +2323,7 @@ describe("便携 Git 检测与初始化提示", () => {
     });
     expect(screen.queryByText(/尚未初始化便携环境/)).not.toBeInTheDocument();
     expect(screen.queryByText("⚡ 初始化环境")).not.toBeInTheDocument();
-    expect(screen.getByText("⬇ 下载DSH")).toBeInTheDocument();
+    expect(screen.getByText("下载DSH")).toBeInTheDocument();
   });
 
   it("系统无 Git：启动时提示初始化便携 Git", async () => {
@@ -2327,7 +2335,7 @@ describe("便携 Git 检测与初始化提示", () => {
     // 横幅点明缺 Git 与初始化入口（横幅 + 左栏各有一个「初始化环境」按钮）
     expect(screen.getByText(/github:\/git\+ 依赖需要/)).toBeInTheDocument();
     expect(screen.getAllByText("⚡ 初始化环境").length).toBeGreaterThan(0);
-    expect(screen.queryByText("⬇ 下载DSH")).not.toBeInTheDocument();
+    expect(screen.queryByText("下载DSH")).not.toBeInTheDocument();
   });
 
   it("便携 Git 已就绪：不提示缺 Git", async () => {
@@ -2337,7 +2345,7 @@ describe("便携 Git 检测与初始化提示", () => {
       expect(screen.getByText(/全局 CLI/)).toBeInTheDocument();
     });
     expect(screen.queryByText(/尚未初始化便携环境/)).not.toBeInTheDocument();
-    expect(screen.getByText("⬇ 下载DSH")).toBeInTheDocument();
+    expect(screen.getByText("下载DSH")).toBeInTheDocument();
   });
 
   it("点「初始化环境」调用 init_portable_runtime_cmd（Node+Git 一并初始化）", async () => {
@@ -2389,14 +2397,14 @@ describe("官方桌面版 (desktop) 适配", () => {
 
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("官方桌面")).toBeInTheDocument();
+      expect(screen.getAllByText("官方桌面").length).toBeGreaterThan(0);
     });
     // 官方桌面 profile 必须隐藏删除按钮
-    expect(screen.queryByText("🗑 删除")).not.toBeInTheDocument();
+    expect(screen.queryByText("删除")).not.toBeInTheDocument();
     // 显示官方桌面客户端控制与启动按钮
     expect(screen.getByText("官方桌面客户端控制")).toBeInTheDocument();
-    expect(screen.getByText("▶ 启动官方桌面")).toBeInTheDocument();
-    expect(screen.getByText("🖥 已在官方桌面窗口运行")).toBeInTheDocument();
+    expect(screen.getByText("启动官方桌面")).toBeInTheDocument();
+    expect(screen.getByText("已在官方桌面窗口运行")).toBeInTheDocument();
   });
 
   it("官方桌面版运行中时展示运行状态与「⏹ 停止官方桌面」按钮", async () => {
@@ -2538,3 +2546,114 @@ function mockAllDefault(cmd: string) {
       return Promise.resolve(null);
   }
 }
+
+describe("首次使用引导（空状态）", () => {
+  /** 在 beforeEach 的 mockAll 之上覆盖部分命令，其余照旧 */
+  function withOverrides(overrides: Record<string, () => Promise<unknown>>) {
+    const prev = mockInvoke.getMockImplementation()!;
+    mockInvoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (overrides[cmd]) return overrides[cmd]();
+      return (prev as (c: string, a?: unknown) => Promise<unknown>)(cmd, args);
+    });
+  }
+
+  it("首跑：左栏两步指引 + 中栏第3步预告 + 右栏最后一步", async () => {
+    withOverrides({
+      check_portable_runtime_cmd: () => Promise.resolve(false),
+      check_portable_git_cmd: () => Promise.resolve("none"),
+      scan_envs: () => Promise.resolve([]),
+      list_all_profiles: () => Promise.resolve([]),
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("首次使用，分两步：")).toBeInTheDocument();
+    });
+    expect(screen.getByText("准备运行环境")).toBeInTheDocument();
+    expect(screen.getByText("⚡ 一键初始化环境")).toBeInTheDocument();
+    expect(screen.getByText("获取 DSH 环境")).toBeInTheDocument();
+    expect(screen.getByText("⬇ 下载 DSH")).toBeInTheDocument();
+    expect(screen.getByText("第 3 步 · 准备 Profile")).toBeInTheDocument();
+    expect(screen.getByText(/先从左栏的第 1 步开始/)).toBeInTheDocument();
+    expect(screen.getByText(/最后一步：选组合，启动/)).toBeInTheDocument();
+    expect(screen.getByText("① 运行环境")).toBeInTheDocument();
+  });
+
+  it("运行环境与 DSH 就绪、无 Profile：中栏第3步点亮，右栏进度同步", async () => {
+    withOverrides({
+      check_portable_runtime_cmd: () => Promise.resolve(true),
+      check_portable_git_cmd: () => Promise.resolve("system"),
+      list_all_profiles: () => Promise.resolve([]),
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("这个环境还没有 Profile")).toBeInTheDocument();
+    });
+    expect(screen.getByText("第 3 步 · 当前")).toBeInTheDocument();
+    expect(screen.getByText("✨ 一键初始化（推荐）")).toBeInTheDocument();
+    expect(screen.getByText(/在中栏准备一个 Profile/)).toBeInTheDocument();
+    expect(screen.getByText("② DSH ✓")).toBeInTheDocument();
+    expect(screen.getByText("③ Profile")).toBeInTheDocument();
+  });
+
+  it("运行环境就绪但无 DSH：第1步打勾无按钮，第2步点亮，右栏进度①✓②当前", async () => {
+    withOverrides({
+      check_portable_runtime_cmd: () => Promise.resolve(true),
+      check_portable_git_cmd: () => Promise.resolve("system"),
+      scan_envs: () => Promise.resolve([]),
+      list_all_profiles: () => Promise.resolve([]),
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("首次使用，分两步：")).toBeInTheDocument();
+    });
+    expect(screen.getByText("Node.js + pnpm 已就绪")).toBeInTheDocument();
+    expect(screen.queryByText("⚡ 一键初始化环境")).not.toBeInTheDocument();
+    expect(screen.getByText(/扫描电脑上已安装的 DSH/)).toBeInTheDocument();
+    expect(screen.getByText(/最后一步：选组合，启动/)).toBeInTheDocument();
+    expect(screen.getByText("① 运行环境 ✓")).toBeInTheDocument();
+    expect(screen.getByText("② DSH")).toBeInTheDocument();
+    expect(screen.getByText("③ Profile")).toBeInTheDocument();
+  });
+
+  it("运行环境与 DSH 均无、但已有 desktop Profile：中栏正常列出，③✓ 且④不高亮", async () => {
+    withOverrides({
+      check_portable_runtime_cmd: () => Promise.resolve(false),
+      check_portable_git_cmd: () => Promise.resolve("none"),
+      scan_envs: () => Promise.resolve([]),
+      list_all_profiles: () =>
+        Promise.resolve([
+          {
+            name: "desktop",
+            profilesDir: "C:\Users\test\.dsh\profiles",
+            path: "C:\Users\test\.dsh\profiles\desktop",
+            pluginCount: 2,
+            dataSize: 0,
+            modified: "2026-10-01 08:00",
+            hasPatch: true,
+            hasLock: false,
+            hasPackage: true,
+          },
+        ]),
+    });
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("desktop").length).toBeGreaterThan(0);
+    });
+    expect(screen.getAllByText("官方桌面").length).toBeGreaterThan(0);
+    // desktop 是官方桌面端专属 Profile，不算「Profile 已就绪」
+    expect(screen.getByText(/官方桌面客户端的 Profile/)).toBeInTheDocument();
+    expect(screen.getByText("① 运行环境")).toBeInTheDocument();
+    expect(screen.getByText("② DSH")).toBeInTheDocument();
+    expect(screen.getByText("③ Profile").className).not.toContain("done");
+    expect(screen.getByText("④ 启动").className).not.toContain("current");
+  });
+
+  it("环境与 Profile 均就绪：不再显示首跑指引", async () => {
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText(/全局 CLI/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText("首次使用，分两步：")).not.toBeInTheDocument();
+    expect(screen.queryByText("这个环境还没有 Profile")).not.toBeInTheDocument();
+  });
+});

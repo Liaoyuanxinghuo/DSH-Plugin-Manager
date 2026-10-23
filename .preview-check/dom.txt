@@ -1,0 +1,60 @@
+﻿<!DOCTYPE html>
+<html data-theme="dark"><head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root, [data-theme="dark"] {
+    --bg: #0f1419; --panel: #161d26; --border: #26303d;
+    --text: #dbe3ee; --text-dim: #8b98a9; --accent: #2fbf8f;
+  }
+  body { background: var(--bg); color: var(--text); font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; font-size: 14px; padding: 40px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; display: flex; flex-direction: column; max-width: 420px; }
+  .profile-src {
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 100%;
+  }
+  .profile-src code {
+    color: inherit;
+    background: transparent;
+    font-size: 12px;
+  }
+  .panel-title { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .panel-title.col { flex-direction: column; align-items: stretch; justify-content: flex-start; gap: 2px; }
+  .panel-title.col h2 { flex-shrink: 0; font-weight: 400; }
+  .panel-title.col h2 code { color: var(--accent); }
+  .panel-title.col .profile-src { margin-top: 0; overflow: visible; white-space: normal; font-size: 13px; color: var(--text); }
+  .panel-title.col .profile-src code { font-size: 13px; color: var(--accent); }
+  .panel-title.col .profile-src .tag { white-space: nowrap; }
+  .panel-title h2 { font-size: 13px; font-weight: 700; display: flex; align-items: center; gap: 6px; flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .panel-title code { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="panel">
+  <div class="panel-title col">
+    <h2 id="row1">DSH版本: <code id="c1">0.2.1-rc.2</code></h2>
+    <div class="profile-src" id="row2" title="当前选中的 Profile">Profile: <code id="c2">better-deepseek-harness-1-desktop</code></div>
+  </div>
+</div>
+<script>
+  const fmt = (el) => { const s = getComputedStyle(el); return s.fontSize + " / " + s.fontWeight + " / " + s.fontFamily.split(",")[0]; };
+  const out = document.createElement("div");
+  out.id = "RESULT";
+  out.textContent =
+    "h2: " + fmt(document.getElementById("row1")) + "\n" +
+    "h2 code: " + fmt(document.getElementById("c1")) + "\n" +
+    "profile-src: " + fmt(document.getElementById("row2")) + "\n" +
+    "profile code: " + fmt(document.getElementById("c2"));
+  document.body.appendChild(out);
+</script><div id="RESULT">h2: 13px / 400 / "Segoe UI"
+h2 code: 13px / 400 / monospace
+profile-src: 13px / 400 / "Segoe UI"
+profile code: 13px / 400 / monospace</div>
+
+
+</body></html>

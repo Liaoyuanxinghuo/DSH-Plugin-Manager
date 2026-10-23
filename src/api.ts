@@ -40,6 +40,7 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 
 export const api = {
   scanEnvs: () => invoke<DshEnv[]>("scan_envs"),
+  scanEnvsLive: () => invoke<void>("scan_envs_live"),
   addManualEnv: (name: string, command: string) =>
     invoke<DshEnv>("add_manual_env", { name, command }),
   removeManualEnv: (id: string) =>

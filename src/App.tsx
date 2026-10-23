@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState, type PointerEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { api, formatSize, pickDspackFile, pickFolder, pickSavePackPath, pickSaveZipPath, pickZipFile } from "./api";
 import { listen } from "@tauri-apps/api/event";
 import { applyStoredOrder, migrateStoredOrder, moveItem, readStoredOrder } from "./reorder";
 import InstallDialog from "./InstallDialog";
 import ComplementDialog from "./ComplementDialog";
+import { Icon } from "./icons";
 import type {
   BrowserInfo,
   DshEnv,
@@ -33,6 +34,26 @@ const binDir = (p: string) => {
   const i = Math.max(p.lastIndexOf("\\"), p.lastIndexOf("/"));
   return i > 0 ? p.slice(0, i) : p;
 };
+
+/** 首次使用引导的迷你步骤行（左栏）：done 打勾 / current 高亮 / pending 置灰 */
+function OnboardMiniStep(props: {
+  state: "done" | "current" | "pending";
+  n: number;
+  title: string;
+  desc: string;
+  children?: ReactNode;
+}) {
+  return (
+    <div className={`mini-step ${props.state}`}>
+      <span className="mini-badge">{props.state === "done" ? "✓" : props.n}</span>
+      <div className="mini-body">
+        <div className="mini-title">{props.title}</div>
+        <div className="mini-desc">{props.desc}</div>
+        {props.children}
+      </div>
+    </div>
+  );
+}
 
 /**
  * 列表拖拽排序（pointer 事件实现）。
@@ -229,11 +250,15 @@ export default function App() {
   // 增量扫描/重排时锚定选中项，防止异步 setState 竞态把选中踢掉
   const selectedProfileRef = useRef(selectedProfile);
   const selectedDirRef = useRef(selectedProfilesDir);
+  const selectedEnvRef = useRef(selectedEnv);
   const startingRef = useRef(false); // 启动防抖：连点「启动」不重复拉起（后端另有 per-key 互斥）
   useEffect(() => {
     selectedProfileRef.current = selectedProfile;
     selectedDirRef.current = selectedProfilesDir;
   }, [selectedProfile, selectedProfilesDir]);
+  useEffect(() => {
+    selectedEnvRef.current = selectedEnv;
+  }, [selectedEnv]);
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
   const [pluginsLoading, setPluginsLoading] = useState(false);
   const [pluginQuery, setPluginQuery] = useState("");
@@ -270,6 +295,8 @@ export default function App() {
   const [showInitBtn, setShowInitBtn] = useState(false);
   /** 流式渲染：扫到一个显示一个；此项仅表示「扫描是否结束」（空态文案用） */
   const [profilesReady, setProfilesReady] = useState(false);
+  /** 环境列表流式扫描结束标记（对齐 profilesReady：骨架屏 → 空态） */
+  const [envsReady, setEnvsReady] = useState(false);
   const [initRunning, setInitRunning] = useState(false);
   // 「打开界面」浏览器选择：全局记忆（localStorage，与 DSH/Profile 无关）；空串 = 系统默认
   const [browsers, setBrowsers] = useState<BrowserInfo[]>([]);
@@ -345,6 +372,10 @@ export default function App() {
   const [portableLogs, setPortableLogs] = useState<string[]>([]);
   const gitMissing = gitStatus === "missing" || gitStatus === "none";
   const needInit = portableReady === false || gitMissing;
+  // 运行环境真正就绪：portableReady 需明确为 true 且 Git 不缺（检测中 null 按未就绪展示）
+  const runtimeReady = portableReady === true && !gitMissing;
+  // 「可用」Profile：排除官方桌面端专属的 desktop（归官方客户端使用，不代表本工具的 Profile 已准备）
+  const usableProfileCount = profiles.filter((p) => p.name.toLowerCase() !== "desktop").length;
 
   // 检测便携运行时 + Git 来源（要求.md 二.6：与 Node 便携运行时一并检测）
   useEffect(() => {
@@ -430,17 +461,49 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // 加载环境列表
+  // 加载环境列表（对齐中栏 profile 流式：手动环境立即上屏，全局 CLI 探测完补上；
+  // 扫完按用户拖拽顺序定稿；选中项按 id 锚定，扫描/重排都不会被踢掉）
   const loadEnvs = useCallback(async () => {
+    setEnvsReady(false);
     try {
-      const list = await api.scanEnvs();
-      setEnvs(applyStoredOrder(list, (e) => e.id, readStoredOrder("dshpm-env-order")));
-      if (list.length > 0) {
-        setSelectedEnv((cur) => (cur && list.some((e) => e.id === cur) ? cur : list[0].id));
+      const seen = new Map<string, DshEnv>();
+      const sortAll = (list: DshEnv[]) =>
+        applyStoredOrder(list, (e) => e.id, readStoredOrder("dshpm-env-order"));
+      const pushOne = (e: DshEnv) => {
+        if (!e) return;
+        seen.set(e.id, e);
+        setEnvs(sortAll([...seen.values()]));
+      };
+      const un = await listen<DshEnv>("env-found", (ev) => {
+        if (ev.payload) pushOne(ev.payload);
+      }).catch(() => undefined);
+      try {
+        await api.scanEnvsLive();
+      } catch {
+        /* 流式接口失败则走全量兜底 */
+      }
+      un?.();
+      if (seen.size === 0) {
+        const all = (await api.scanEnvs().catch(() => [])) ?? [];
+        for (const e of all) pushOne(e);
+      }
+      const finalList = sortAll([...seen.values()]);
+      setEnvs(finalList);
+      setEnvsReady(true);
+      // 选中锚定：有则保住，已消失才回退到第一个
+      const prev = selectedEnvRef.current;
+      if (prev) {
+        const hit = finalList.find((e) => e.id === prev);
+        if (hit) setSelectedEnv(hit.id);
+        else if (finalList.length > 0) setSelectedEnv(finalList[0].id);
+        else setSelectedEnv("");
+      } else if (finalList.length > 0) {
+        setSelectedEnv(finalList[0].id);
       } else {
         setSelectedEnv("");
       }
     } catch (e) {
+      setEnvsReady(true);
       setError(String(e));
     }
   }, []);
@@ -475,7 +538,6 @@ export default function App() {
         setProfiles(sortAll(applyKnownSizes([...seen.values()])));
       };
 
-      const { listen } = await import("@tauri-apps/api/event");
       const un = await listen<ProfileInfo>("profile-found", (e) => {
         if (e.payload) pushOne(e.payload);
       }).catch(() => undefined);
@@ -1470,6 +1532,8 @@ export default function App() {
   const [helpTopic, setHelpTopic] = useState<"envs" | "profiles" | null>(null);
 
   const selectedEnvObj = envs.find((e) => e.id === selectedEnv) ?? null;
+  // 右栏标题的 DSH 版本：desktop profile 不依赖环境，固定显示「官方桌面版本」；否则用选中环境的版本号，未选中显示占位
+  const dshVersionLabel = isDesktopProfile ? "官方桌面版本" : selectedEnvObj?.version || "未选中";
 
   // 指定环境是否可启动（绑定 dsh 运行时）
   const envCanStart = (envId: string) => {
@@ -1506,23 +1570,23 @@ export default function App() {
         </div>
         <div className="topbar-actions">
           <button className="btn ghost" onClick={() => setShowSettings(true)} title="设置（镜像源 / DSH 下载目录）">
-            ⚙ 设置
+            <Icon name="gear" /> 设置
           </button>
           <button className="btn ghost" onClick={refreshAll} disabled={busy}>
-            ⟳ 刷新
+            <Icon name="refresh" /> 刷新
           </button>
         </div>
       </header>
 
       {error && (
         <div className="banner error">
-          <span>⚠ {error}</span>
+          <span><Icon name="warning" size={12} /> {error}</span>
           <button className="btn tiny" onClick={() => setError("")}>×</button>
         </div>
       )}
       {info && (
         <div className="banner info">
-          <span>ℹ {info}</span>
+          <span><Icon name="info" size={12} /> {info}</span>
           <button className="btn tiny" onClick={() => setInfo("")}>×</button>
         </div>
       )}
@@ -1567,7 +1631,7 @@ export default function App() {
       {showInitHint && envs.length > 0 && profiles.length === 0 && (
         <div className="banner info">
           <span>
-            ℹ 当前没有 profile，请点击中栏「初始化」按钮完成初始化（dsh 会自动创建默认 web profile）
+            <Icon name="info" size={12} /> 当前没有 profile，请点击中栏「初始化」按钮完成初始化（dsh 会自动创建默认 web profile）
           </span>
           <button className="btn tiny" onClick={() => setShowInitHint(false)} title="关闭提示">×</button>
         </div>
@@ -1594,17 +1658,72 @@ export default function App() {
                   onClick={openDshDownload}
                   title="下载并安装 DSH 多版本到指定目录（需已初始化便携环境）"
                 >
-                  ⬇ 下载DSH
+                  <Icon name="download" /> 下载DSH
                 </button>
               )}
               <button className="btn tiny" onClick={handleAddDshScan} disabled={busy} title="把电脑上已安装的 dsh（CLI / DSH Desktop 内置 / 本地项目）添加为可启动、可装插件的环境">
-                ＋扫本体
+                <Icon name="plus" /> 扫本体
               </button>
               <button className="help-btn" onClick={() => setHelpTopic("envs")} title="DSH 环境使用说明">?</button>
             </div>
           </div>
           <div className="env-list" ref={envReorder.listRef}>
-            {envs.length === 0 && <div className="empty">未检测到 DSH，请下载或扫描目录</div>}
+            {/* 首屏骨架屏：扫描期间先给结构感，别只留一行字干等（对齐中栏） */}
+            {!envsReady && envs.length === 0 && (
+              <div className="skeleton-list" aria-label="正在扫描 DSH 环境">
+                {[0, 1, 2].map((i) => (
+                  <div className="skeleton-card" key={i}>
+                    <div className="skeleton-line w40" />
+                    <div className="skeleton-line w70" />
+                    <div className="skeleton-line w30" />
+                  </div>
+                ))}
+              </div>
+            )}
+            {envsReady && envs.length === 0 && (
+              <div className="msteps" aria-label="首次使用指引">
+                <div className="onboard-lead">首次使用，分两步：</div>
+                <OnboardMiniStep
+                  state={runtimeReady ? "done" : "current"}
+                  n={1}
+                  title="准备运行环境"
+                  desc={runtimeReady ? "Node.js + pnpm 已就绪" : "Node.js + pnpm（缺 Git 自动带上），自动下载到本软件数据目录，不改动系统配置"}
+                >
+                  {!runtimeReady && (
+                    <div className="mini-btns">
+                      <button
+                        className="btn primary"
+                        onClick={handleInitPortable}
+                        disabled={initingPortable}
+                        title="下载并安装便携环境（Node.js LTS + pnpm；缺 Git 时一并装便携 Git）到 %AppData%\dsh-plugin-manager\runtime"
+                      >
+                        {initingPortable ? "初始化中…" : "⚡ 一键初始化环境"}
+                      </button>
+                    </div>
+                  )}
+                </OnboardMiniStep>
+                <OnboardMiniStep
+                  state={runtimeReady ? "current" : "pending"}
+                  n={2}
+                  title="获取 DSH 环境"
+                  desc="下载官方多版本共存，或扫描电脑上已安装的 DSH"
+                >
+                  <div className="mini-btns">
+                    <button className="btn" onClick={openDshDownload} title="下载并安装 DSH 多版本到指定目录（运行环境未就绪时会自动先初始化）">
+                      ⬇ 下载 DSH
+                    </button>
+                    <button
+                      className="btn"
+                      onClick={handleAddDshScan}
+                      disabled={busy}
+                      title="把电脑上已安装的 dsh（CLI / DSH Desktop 内置 / 本地项目）添加为可启动、可装插件的环境"
+                    >
+                      🔍 扫描已装的 DSH
+                    </button>
+                  </div>
+                </OnboardMiniStep>
+              </div>
+            )}
             {envs.map((env, i) => {
               const insts = runnings.filter((r) => r.envId === env.id);
               return (
@@ -1672,14 +1791,14 @@ export default function App() {
                 </button>
               ) : (
                 <button className="btn tiny" onClick={() => setShowCreateProfile(true)} disabled={creatingProfile || !selectedEnv} title="新建空白 profile（含默认 bundle）">
-                  ＋新建
+                  <Icon name="plus" /> 新建
                 </button>
               )}
               <button className="btn tiny" onClick={handleAddScanDir} disabled={busy} title="扫描本地 DSH_HOME 或 profiles 目录">
-                ＋扫Profile
+                <Icon name="plus" /> 扫Profile
               </button>
               <button className="btn tiny" onClick={handleImport} disabled={!selectedEnv}>
-                ⬇导入
+                <Icon name="import" /> 导入
               </button>
               <button className="help-btn" onClick={() => setHelpTopic("profiles")} title="Profiles 使用说明">?</button>
             </div>
@@ -1697,7 +1816,46 @@ export default function App() {
                 ))}
               </div>
             )}
-            {profilesReady && profiles.length === 0 && <div className="empty">该环境暂无 profile</div>}
+            {profilesReady && profiles.length === 0 && (envs.length === 0 ? (
+              <div className="empty-state">
+                <span className="stepchip dim">第 3 步 · 准备 Profile</span>
+                <h3>等左侧两步完成后，来这里配置 Profile</h3>
+                <p>Profile 是一套独立的插件集合与配置，到时候可以一键初始化、新建空白或导入整合包</p>
+                <div className="arrow-hint">👈 现在，先从左栏的第 1 步开始</div>
+              </div>
+            ) : (
+              <div className="empty-state">
+                <span className="stepchip">第 3 步 · 当前</span>
+                <h3>这个环境还没有 Profile</h3>
+                <p>Profile 是一套独立的插件集合与配置，推荐先一键初始化</p>
+                <div className="stack">
+                  <button
+                    className="btn primary"
+                    onClick={handleInitProfile}
+                    disabled={creatingProfile || !selectedEnv}
+                    title="用本地 dsh 启动内置 web profile（首次自动创建并初始化）"
+                  >
+                    ✨ 一键初始化（推荐）
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={() => setShowCreateProfile(true)}
+                    disabled={creatingProfile || !selectedEnv}
+                    title={!selectedEnv ? "先在左栏选择一个 DSH 环境" : "新建空白 profile（含默认 bundle）"}
+                  >
+                    ＋ 新建空白 Profile
+                  </button>
+                  <button
+                    className="btn"
+                    onClick={handleImport}
+                    disabled={!selectedEnv}
+                    title={!selectedEnv ? "先在左栏选择一个 DSH 环境" : "导入完整 zip 快照或 .dspack 整合包"}
+                  >
+                    📦 导入整合包 / zip
+                  </button>
+                </div>
+              </div>
+            ))}
             {profiles.map((p, i) => (
               <div
                 key={`${p.name}::${p.profilesDir}`}
@@ -1752,7 +1910,7 @@ export default function App() {
                       api.openPath(p.path).catch((x) => setError(String(x)));
                     }}
                   >
-                    📂 打开目录
+                    <Icon name="folder" /> 打开目录
                   </button>
                   {(() => {
                     const rp = runnings.find(
@@ -1774,7 +1932,7 @@ export default function App() {
                           }}
                           title={`停止 ${p.name}（PID ${rp.pid}）`}
                         >
-                          ■ 停止
+                          <Icon name="stop" /> 停止
                         </button>
                       </>
                     ) : p.name.toLowerCase() === "desktop" ? (
@@ -1810,7 +1968,7 @@ export default function App() {
                             : `启动 ${p.name}（并切换到该 profile）`
                         }
                       >
-                        ▶ 启动
+                        <Icon name="play" /> 启动
                       </button>
                     );
                   })()}
@@ -1821,7 +1979,7 @@ export default function App() {
                       handleExport(p.name);
                     }}
                   >
-                    ⬆ 导出
+                    <Icon name="export" /> 导出
                   </button>
                   {/* 运行中隐藏删除按钮；官方桌面版 profile（desktop）彻底隐藏删除按钮防止误删核心数据 */}
                   {p.name.toLowerCase() !== "desktop" &&
@@ -1836,7 +1994,7 @@ export default function App() {
                       }}
                       title={`删除 profile「${p.name}」（含 node_modules，不可恢复）`}
                     >
-                      🗑 删除
+                      <Icon name="trash" /> 删除
                     </button>
                   )}
                 </div>
@@ -1850,30 +2008,50 @@ export default function App() {
 
         {/* 右：详情与操作 */}
         <section className="panel wide">
+          {/* 标题区始终显示：DSH版本 + Profile（未选中显示「未选中」占位，不再有「来源」行） */}
+          <div className="panel-title">
+            <h2>
+              DSH版本: <code>{dshVersionLabel}</code>
+            </h2>
+            <div className="profile-src" title={isDesktopProfile ? "此 Profile 归属于 DeepSeek Harness 官方桌面客户端" : "当前选中的 Profile"}>
+              Profile: <code>{selectedProfile || "未选中"}</code>
+              {isDesktopProfile && (
+                <span
+                  className="tag official"
+                  style={{ marginLeft: 8, verticalAlign: "middle" }}
+                  title="此 Profile 归属于 DeepSeek Harness 官方桌面客户端。支持在桌面端运行中在线热管理（安装、卸载、热启用/禁用免重启）。"
+                >
+                  官方桌面
+                </span>
+              )}
+            </div>
+          </div>
           {!selectedEnv || !selectedProfile ? (
-            <div className="empty">请选择环境与 Profile 查看详情</div>
+            <div className="final-card">
+              <div className="fc-title">▶ 最后一步：选组合，启动</div>
+              <div className="fc-desc">
+                {(() => {
+                  const hasUsable = usableProfileCount > 0;
+                  if (envs.length === 0 && !hasUsable)
+                    return profiles.length === 0
+                      ? "完成左侧与中间的准备后，在左栏选一个 DSH 环境、中栏选一个 Profile，右侧就会出现「▶ 启动」按钮；启动后点「🌐 打开界面」直达 DSH Web UI。支持多版本 × 多 Profile 任意组合、多实例并行，端口自动分配。"
+                      : "检测到官方桌面客户端的 Profile（desktop），它归官方桌面端使用；要在本工具启动 DSH，还需完成左栏两步，并在中栏准备一个自己的 Profile（一键初始化 / 新建 / 导入）。";
+                  if (envs.length === 0)
+                    return "Profile 已就绪 ✓；还差左栏的运行环境与 DSH 环境，两步完成后选中环境即可「▶ 启动」。";
+                  if (!hasUsable)
+                    return "在中栏准备一个 Profile（一键初始化 / 新建空白 / 导入整合包）后，右侧就会出现「▶ 启动」按钮；启动后点「🌐 打开界面」直达 DSH Web UI。";
+                  return "在左栏与中栏各选一项，即可查看详情并「▶ 启动」；任意「环境 × Profile」组合均可搭配，支持多实例并行。";
+                })()}
+              </div>
+              <div className="prog">
+                <span className={`pchip ${runtimeReady ? "done" : "current"}`}>① 运行环境{runtimeReady ? " ✓" : ""}</span>
+                <span className={`pchip ${envs.length > 0 ? "done" : runtimeReady ? "current" : ""}`}>② DSH{envs.length > 0 ? " ✓" : ""}</span>
+                <span className={`pchip ${usableProfileCount > 0 ? "done" : envs.length > 0 ? "current" : ""}`}>③ Profile{usableProfileCount > 0 ? " ✓" : ""}</span>
+                <span className={`pchip ${runtimeReady && envs.length > 0 && usableProfileCount > 0 ? "current" : ""}`}>④ 启动</span>
+              </div>
+            </div>
           ) : (
             <>
-              <div className="panel-title">
-                <h2>
-                  Profile: <code>{selectedProfile}</code>
-                  {isDesktopProfile && (
-                    <span
-                      className="tag official"
-                      style={{ marginLeft: 8, verticalAlign: "middle" }}
-                      title="此 Profile 归属于 DeepSeek Harness 官方桌面客户端。支持在桌面端运行中在线热管理（安装、卸载、热启用/禁用免重启）。"
-                    >
-                      官方桌面
-                    </span>
-                  )}
-                </h2>
-                {selectedProfilesDir && (
-                  <div className="profile-src" title="该 profile 所在的 profiles 目录（任意 dsh × 任意来源组合）">
-                    来源: <code>{selectedProfilesDir}</code>
-                  </div>
-                )}
-              </div>
-
               {/* 启动控制：官方桌面版分流 vs 普通 Web profile 多实例 */}
               {isDesktopProfile ? (
                 <div className="control-card">
@@ -1908,7 +2086,7 @@ export default function App() {
                         disabled={busy}
                         title="启动官方桌面客户端（DeepSeek Harness.exe）"
                       >
-                        ▶ 启动官方桌面
+                        <Icon name="play" /> 启动官方桌面
                       </button>
                     )}
                     <button
@@ -1916,7 +2094,7 @@ export default function App() {
                       disabled={true}
                       title="官方桌面版为本地桌面窗口程序，无需在浏览器中打开 Web 界面"
                     >
-                      🖥 已在官方桌面窗口运行
+                      <Icon name="desktop" /> 已在官方桌面窗口运行
                     </button>
                   </div>
                   <div className="run-hint">
@@ -1971,7 +2149,7 @@ export default function App() {
                         disabled={busy}
                         title={`停止并重启 ${selectedProfile}`}
                       >
-                        ↻ 重启 DSH
+                        <Icon name="refresh" /> 重启 DSH
                       </button>
                     ) : (
                       <button
@@ -1980,7 +2158,7 @@ export default function App() {
                         disabled={busy || !selectedProfile || !selectedEnvObj?.runCommand}
                         title={selectedEnvObj && !selectedEnvObj.runCommand ? "该环境未配置 dsh 程序，无法启动" : ""}
                       >
-                        ▶ 启动 DSH
+                        <Icon name="play" /> 启动 DSH
                       </button>
                     )}
                     <button
@@ -1996,7 +2174,7 @@ export default function App() {
                       disabled={busy || (!curRun && !initRunning)}
                       title={initRunning ? "停止初始化进程" : "停止当前 DSH"}
                     >
-                      ■ 停止
+                      <Icon name="stop" /> 停止
                     </button>
                     {curRun && (
                       <>
@@ -2011,7 +2189,7 @@ export default function App() {
                               .catch((e) => setError(String(e)));
                           }}
                         >
-                          🌐 打开界面
+                          <Icon name="globe" /> 打开界面
                         </button>
                         <BrowserPick browsers={browsers} value={browserExe} onChange={setBrowserExe} />
                       </>
@@ -2042,7 +2220,7 @@ export default function App() {
                           className="btn"
                           onClick={() => api.openPath(b.path!).catch((x) => setError(String(x)))}
                         >
-                          📂 {b.label}
+                          <Icon name="folder" /> {b.label}
                         </button>
                       ))}
                     </div>
@@ -2060,7 +2238,7 @@ export default function App() {
                   <div className="fold-inner">
                 <div className="card-row actions">
                   <button className="btn tiny" onClick={handleCheckDeps} disabled={checkingDeps || (!selectedEnvObj?.runCommand && !isDesktopProfile) || !selectedProfile}>
-                    {checkingDeps ? "检查中..." : "⟳ 依赖检查"}
+                    {checkingDeps ? "检查中..." : <><Icon name="refresh" /> 依赖检查</>}
                   </button>
                   <button
                     className="btn tiny"
@@ -2068,10 +2246,10 @@ export default function App() {
                     disabled={fixingDeps || (!selectedEnvObj?.runCommand && !isDesktopProfile) || !deps?.some((d) => !d.installed)}
                     title={deps?.some((d) => !d.installed) ? "运行 pnpm install 补齐缺失依赖" : "先做依赖检查，有缺失时可用"}
                   >
-                    {fixingDeps ? "修复中..." : "⚙ 修复依赖"}
+                    {fixingDeps ? "修复中..." : <><Icon name="gear" /> 修复依赖</>}
                   </button>
                   <button className="btn tiny" onClick={handleScanJunk} disabled={scanningJunk || !selectedProfile}>
-                    {scanningJunk ? "扫描中..." : "🧹 扫描残留"}
+                    {scanningJunk ? "扫描中..." : <><Icon name="broom" /> 扫描残留</>}
                   </button>
                   <button
                     className="btn tiny"
@@ -2079,17 +2257,17 @@ export default function App() {
                     disabled={cleaningJunk || !junk || junk.length === 0}
                     title="清理扫描到的全部残留缓存（二次确认）"
                   >
-                    {cleaningJunk ? "清理中..." : "🗑 清理残留"}
+                    {cleaningJunk ? "清理中..." : <><Icon name="trash" /> 清理残留</>}
                   </button>
                   <button className="btn tiny" onClick={handleExportDiag} disabled={diagExporting}>
-                    {diagExporting ? "导出中..." : "📦 导出诊断包"}
+                    {diagExporting ? "导出中..." : <><Icon name="package" /> 导出诊断包</>}
                   </button>
                 </div>
                 {deps && (
                   <div className="dep-list">
                     <div className="dep-summary">
                       依赖：{deps.filter((d) => d.installed).length}/{deps.length} 已安装
-                      {deps.some((d) => !d.installed) && <span className="ver-err"> 有缺失，可用「⚙ 修复依赖」</span>}
+                      {deps.some((d) => !d.installed) && <span className="ver-err"> 有缺失，可用「修复依赖」</span>}
                     </div>
                     {deps.some((d) => !d.installed) && (
                       <div className="dep-missing">
@@ -2119,7 +2297,7 @@ export default function App() {
                           ))}
                         </div>
                         {!cleaningJunk && (
-                          <div className="junk-hint">点击「🗑 清理残留」将删除以上 {junk.length} 项缓存（不影响插件与配置）</div>
+                          <div className="junk-hint">点击「清理残留」将删除以上 {junk.length} 项缓存（不影响插件与配置）</div>
                         )}
                       </>
                     )}
@@ -2141,7 +2319,7 @@ export default function App() {
                       title="刷新插件列表与状态"
                       style={{ padding: "0 4px", minWidth: 22, height: 20, fontSize: 13, lineHeight: "18px" }}
                     >
-                      ⟳
+                      <Icon name="refresh" size={12} />
                     </button>
                   </span>
                   <div className="title-actions">
@@ -2159,7 +2337,7 @@ export default function App() {
                       disabled={checkingUpdates || !selectedEnvObj?.runCommand || plugins.length === 0}
                       title="并行查询 npm，检查各插件是否有新版本"
                     >
-                      {checkingUpdates ? "检查中..." : "⟳ 检查更新"}
+                      {checkingUpdates ? "检查中..." : <><Icon name="refresh" /> 检查更新</>}
                     </button>
                     <button
                       className="btn tiny"
@@ -2170,7 +2348,7 @@ export default function App() {
                       disabled={!selectedEnvObj?.runCommand && !isDesktopProfile}
                       title={selectedEnvObj && !selectedEnvObj.runCommand && !isDesktopProfile ? "该环境未配置 dsh 程序" : "从本地文件夹或 tgz 导入插件"}
                     >
-                      ＋本地导入
+                      <Icon name="plus" /> 本地导入
                     </button>
                     <button
                       className="btn tiny"
@@ -2181,7 +2359,7 @@ export default function App() {
                       disabled={!selectedEnvObj?.runCommand && !isDesktopProfile}
                       title={selectedEnvObj && !selectedEnvObj.runCommand && !isDesktopProfile ? "该环境未配置 dsh 程序" : "在线安装插件（市场/npm/自定义源）"}
                     >
-                      ＋安装插件
+                      <Icon name="plus" /> 安装插件
                     </button>
                   </div>
                 </div>
@@ -2200,7 +2378,7 @@ export default function App() {
                     <input
                       className="plugin-search"
                       type="search"
-                      placeholder="🔍 搜索插件（名称 / 版本）..."
+                      placeholder="搜索插件（名称 / 版本）..."
                       value={pluginQuery}
                       onChange={(e) => setPluginQuery(e.target.value)}
                       disabled={busy}
@@ -2306,14 +2484,14 @@ export default function App() {
                 </ul>
                 <div className="card-title">怎么添加环境？</div>
                 <ul>
-                  <li><strong>⬇ 下载DSH</strong>：从镜像下载任意版本到指定目录，自动添加为环境。</li>
-                  <li><strong>＋扫本体</strong>：选择可能包含 dsh 的目录，应用向下递归 3 层自动探测（识别 <code>dsh.cmd</code> / <code>bin.js</code> 并读取版本）。
+                  <li><strong>下载DSH</strong>：从镜像下载任意版本到指定目录，自动添加为环境。</li>
+                  <li><strong>扫本体</strong>：选择可能包含 dsh 的目录，应用向下递归 3 层自动探测（识别 <code>dsh.cmd</code> / <code>bin.js</code> 并读取版本）。
                     例如：全局 npm 目录 <code>…\AppData\Roaming\npm</code>、DSH Desktop 的 <code>…\.dsh-win\versions\…</code>、或你下载 dsh 的文件夹。</li>
                   <li>全局安装的 dsh CLI 通常已自动识别，无需手动添加。</li>
                 </ul>
                 <div className="card-title">怎么用？</div>
                 <ul>
-                  <li>选中一个环境 + 在中栏选中任意 profile → 点击「▶ 启动」＝ 用该 DSH 加载该 profile。</li>
+                  <li>选中一个环境 + 在中栏选中任意 profile → 点击「启动」＝ 用该 DSH 加载该 profile。</li>
                   <li>任意环境 × 任意 profile 可自由组合；切换环境不影响 profile 列表。</li>
                   <li>可同时运行多个实例：不同环境 × 不同 profile 各自独立进程、独立端口（从 3080 起自动分配），每行可单独停止/重启。</li>
                   <li>每行「移除」按钮：会删除磁盘上对应的 DSH 版本目录（仅限受管下载目录内、带版本标识与安装特征的目录，四重校验防误删）；全局 CLI 等非受管环境只移出列表。</li>
@@ -2325,14 +2503,14 @@ export default function App() {
                 <ul>
                   <li>每个 profile = 一套独立的插件集合与配置（<code>package.json</code> + <code>cordis.patch.yml</code>），相当于 DSH 的"配置档"。</li>
                   <li>所有 profile 统一堆放在列表中，<strong>不绑定任何 DSH 版本</strong>——切换环境不会影响 profile。</li>
-                  <li>列表自动合并：默认 <code>~/.dsh/profiles</code> + 你通过「＋扫Profile」添加的目录（如 DSH Desktop 的 <code>.dsh-packs</code> 目录），每个 profile 标注自己的来源目录。</li>
+                  <li>列表自动合并：默认 <code>~/.dsh/profiles</code> + 你通过「扫Profile」添加的目录（如 DSH Desktop 的 <code>.dsh-packs</code> 目录），每个 profile 标注自己的来源目录。</li>
                 </ul>
                 <div className="card-title">常见操作</div>
                 <ul>
-                  <li><strong>＋新建</strong>：新建空白 profile（含默认 base + web-app bundle，可直接启动）。</li>
-                  <li><strong>＋扫Profile</strong>：选择本地 DSH_HOME 或 profiles 目录，把里面的 profile 加入列表。</li>
-                  <li><strong>⬇导入 / 导出</strong>：把 profile 打包成 zip 迁移到其他电脑（可排除 node_modules 减小体积；重名自动改名）。</li>
-                  <li>每行：📂 打开目录 / ▶ 启动 / ⬆ 导出 / 🗑 删除。</li>
+                  <li><strong>新建</strong>：新建空白 profile（含默认 base + web-app bundle，可直接启动）。</li>
+                  <li><strong>扫Profile</strong>：选择本地 DSH_HOME 或 profiles 目录，把里面的 profile 加入列表。</li>
+                  <li><strong>导入 / 导出</strong>：把 profile 打包成 zip 迁移到其他电脑（可排除 node_modules 减小体积；重名自动改名）。</li>
+                  <li>每行：打开目录 / 启动 / 导出 / 删除。</li>
                   <li>选中 profile 后，右侧可安装/管理插件（市场、npm 搜索、自定义源、本地文件夹/tgz）。</li>
                 </ul>
                 <div className="card-title">与 DSH 的组合</div>
@@ -2480,7 +2658,7 @@ export default function App() {
                   将删除整个目录（含 node_modules，
                   {confirmDeleteProfile.dataSize > 0 ? formatSize(confirmDeleteProfile.dataSize) : "体积未知"}
                   ），
-              该操作<strong>不可恢复</strong>。如需保留可先用「⬇ 导出」备份。
+              该操作<strong>不可恢复</strong>。如需保留可先用「导出」备份。
             </p>
             <div className="modal-actions">
               <button className="btn" onClick={() => setConfirmDeleteProfile(null)} disabled={deletingProfile}>
@@ -3114,7 +3292,7 @@ function SettingsDialog({
               }}
             />
             <button type="button" className="btn tiny" onClick={addCustomMirror}>
-              ＋ 添加
+              <Icon name="plus" /> 添加
             </button>
           </div>
         </label>
@@ -3139,7 +3317,7 @@ function SettingsDialog({
         </div>
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
           <button className="btn tiny" onClick={() => setAboutOpen(!aboutOpen)}>
-            ℹ 关于本项目
+            <Icon name="info" size={12} /> 关于本项目
           </button>
           <button
             className="btn tiny"
@@ -3156,19 +3334,19 @@ function SettingsDialog({
               }
             }}
           >
-            {checking ? "检查中…" : "🔄 检查更新"}
+            {checking ? "检查中…" : <><Icon name="refresh" /> 检查更新</>}
           </button>
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.23</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.24</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
             </div>
             <div style={{ marginTop: 6 }}>
               <button className="btn tiny" onClick={() => api.openUrl("https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/")}>
-                🌐 项目地址（GitHub）
+                <Icon name="globe" /> 项目地址（GitHub）
               </button>
             </div>
             <div style={{ marginTop: 6 }}>
@@ -3204,7 +3382,7 @@ function SettingsDialog({
                       }
                     }}
                   >
-                    ⬇ 下载 v{updateInfo.latest}
+                    <Icon name="download" /> 下载 v{updateInfo.latest}
                   </button>
                 )}
                 {downloading && (
@@ -3221,7 +3399,7 @@ function SettingsDialog({
                     <div style={{ color: "#7fd6a2", wordBreak: "break-all" }}>✅ 已保存：{downPath}</div>
                     <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
                       <button className="btn tiny" onClick={() => api.openPath(downPath)}>
-                        📂 打开所在文件夹
+                        <Icon name="folder" /> 打开所在文件夹
                       </button>
                       <button
                         className="btn tiny"
@@ -3236,7 +3414,7 @@ function SettingsDialog({
                           }
                         }}
                       >
-                        {closingForUpdate ? "正在启动安装程序…" : "🔄 关闭程序并更新"}
+                        {closingForUpdate ? "正在启动安装程序…" : <><Icon name="refresh" /> 关闭程序并更新</>}
                       </button>
                     </div>
                   </div>
@@ -3264,7 +3442,7 @@ function SettingsDialog({
               if (p) setDownloadDir(p);
             }}
           >
-            📂 选择目录
+            <Icon name="folder" /> 选择目录
           </button>
         </label>
         {err && <div className="modal-err">{err}</div>}
@@ -3355,7 +3533,7 @@ function DshDownloadDialog({ onClose, onInstalled }: { onClose: () => void; onIn
           setErr("");
           onInstalled();
         } catch (ae) {
-          setErr(`安装成功但添加环境失败：${String(ae)}（可点击「＋扫本体」扫描该目录添加）`);
+          setErr(`安装成功但添加环境失败：${String(ae)}（可点击「扫本体」扫描该目录添加）`);
         }
       }
     } catch (e) {
@@ -3384,7 +3562,7 @@ function DshDownloadDialog({ onClose, onInstalled }: { onClose: () => void; onIn
                 placeholder="下载根目录（每版本独立子目录）"
               />
               <button className="btn tiny" onClick={async () => { const p = await pickFolder("选择下载根目录"); if (p) setDir(p); }}>
-                📂
+                <Icon name="folder" size={12} />
               </button>
             </div>
             <div className="ver-list" style={{ maxHeight: 260 }}>
@@ -3433,7 +3611,7 @@ function DshDownloadDialog({ onClose, onInstalled }: { onClose: () => void; onIn
             <div className="modal-actions">
               <button className="btn" onClick={onClose} disabled={installing}>关闭</button>
               <button className="btn primary" onClick={start} disabled={installing || !ver || !(dir ?? "").trim()}>
-                {installing ? `下载安装中...（已运行 ${elapsed}s）` : `⬇ 安装 dsh ${ver}`}
+                {installing ? `下载安装中...（已运行 ${elapsed}s）` : <><Icon name="download" /> 安装 dsh {ver}</>}
               </button>
             </div>
           </>
@@ -3574,7 +3752,7 @@ function ImportDialog({
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 620 }}>
         <div className="modal-head">
           <h3>导入 Profile（目标：{envName}）</h3>
-          <button className="btn tiny" onClick={close} disabled={installing}>✕</button>
+          <button className="btn tiny" onClick={close} disabled={installing}><Icon name="x" size={11} /></button>
         </div>
         <p className="modal-hint">
           导入到 profiles 目录：{targetDir || "（当前环境默认）"}；重名自动改名。
@@ -3604,11 +3782,11 @@ function ImportDialog({
                 setInstalling(false);
               }
             }} disabled={installing}>
-              <div className="choice-title">🗜 完整 profile zip</div>
+              <div className="choice-title"><Icon name="export" /> 完整 profile zip</div>
               <div className="choice-desc">整目录打包（含数据），原样恢复；兼容旧版备份。</div>
             </button>
             <button className="choice-card" onClick={() => setStep("pack-source")} disabled={installing}>
-              <div className="choice-title">📦 整合包（.dspack）</div>
+              <div className="choice-title"><Icon name="package" /> 整合包（.dspack）</div>
               <div className="choice-desc">DSH-PackForge 规范：配置 + 插件 + patch，导入后自动重建依赖。</div>
             </button>
           </div>
@@ -3617,7 +3795,7 @@ function ImportDialog({
         {step === "pack-source" && (
           <div className="import-choices">
             <button className="choice-card" onClick={loadMarket} disabled={loadingMarket || installing}>
-              <div className="choice-title">🌐 在线下载整合包</div>
+              <div className="choice-title"><Icon name="globe" /> 在线下载整合包</div>
               <div className="choice-desc">浏览 dsh-pack-market 整合包市场，下载并校验 SHA-256 后导入。</div>
               {loadingMarket && <div className="dim">加载市场…</div>}
             </button>
@@ -3626,7 +3804,7 @@ function ImportDialog({
               if (!path) return;
               importAndInstall(path);
             }} disabled={installing}>
-              <div className="choice-title">💾 本地导入整合包</div>
+              <div className="choice-title"><Icon name="floppy" /> 本地导入整合包</div>
               <div className="choice-desc">选择本地 .dspack 文件（他人分享 / 已下载的整合包）。</div>
             </button>
             {marketErr && <div className="error">{marketErr}</div>}
@@ -3745,7 +3923,7 @@ function NoteDialog({
       <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 480 }}>
         <div className="modal-head">
           <h3>备注「{profile}」</h3>
-          <button className="btn tiny" onClick={onClose} disabled={saving}>✕</button>
+          <button className="btn tiny" onClick={onClose} disabled={saving}><Icon name="x" size={11} /></button>
         </div>
         <p className="modal-hint">备注仅作提示，无任何约束；适配版本只用于提醒，不影响实际运行。</p>
         <label>
