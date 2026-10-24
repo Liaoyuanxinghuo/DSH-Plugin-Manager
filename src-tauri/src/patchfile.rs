@@ -17,13 +17,32 @@ struct EntrySpan {
     name: Option<String>,
 }
 
-/// 扫描顶层条目列表：识别每条 `- ` 起始的条目及其 id/name
+/// 扫描顶层条目列表：识别每条 `- ` 起始的条目及其 id/name。
+/// `- insert:` 块内的嵌套行**不是**顶层条目（market toggle 永不命中 insert 行，
+/// 否则会把 `disabled:` 写进包的插入块里破坏其语义）
 fn scan_entries(lines: &[String]) -> Vec<EntrySpan> {
     let mut entries: Vec<EntrySpan> = Vec::new();
     let mut current: Option<EntrySpan> = None;
+    let mut in_insert = false;
+    let mut insert_indent = 0usize;
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
         let indent = line.len() - t.len();
+        if t.starts_with("- insert:") || t == "- insert" {
+            if let Some(e) = current.take() {
+                entries.push(e);
+            }
+            in_insert = true;
+            insert_indent = indent;
+            continue;
+        }
+        if in_insert {
+            if t.starts_with("- ") && indent <= insert_indent {
+                in_insert = false; // 落回顶层，按普通条目继续处理
+            } else {
+                continue;
+            }
+        }
         // 新条目：以 `- ` 开头（含 `- id:` / `- name:` 等）
         if t.starts_with("- ") || t == "-" {
             if let Some(e) = current.take() {
@@ -102,9 +121,15 @@ fn find_last_match<'a>(
 }
 
 /// 在条目范围内查找 disabled 键所在行
+/// 仅匹配条目直接属性层级（indent == 条目缩进 + 2），
+/// 避免误改条目嵌套配置（如 `config: { disabled: true }`）里的同名键
 fn find_disabled_line(lines: &[String], e: &EntrySpan) -> Option<(usize, Option<bool>)> {
+    let prop_indent = e.indent + 2;
     for j in e.start..e.end {
         let t = lines[j].trim_start();
+        if lines[j].len() - t.len() != prop_indent {
+            continue;
+        }
         if let Some(rest) = t.strip_prefix("disabled:") {
             return Some((j, rest.trim().parse::<bool>().ok()));
         }
@@ -204,8 +229,11 @@ pub fn set_plugin_disabled(content: &str, plugin_id: &str, disabled: bool) -> Re
 }
 
 /// 设置 disabled 状态。
-/// 匹配顺序（官方）：条目 id == plugin_id，或条目声明的 name == package_name；
-/// 多条匹配时取**最后一条**。无匹配且 disable → 追加新条目；无匹配且 enable → 原样返回。
+/// 匹配顺序（官方）：条目 id == plugin_id，或条目声明的 name == package_name。
+/// - 停用：改写**最后一条**匹配行的 flag；无匹配 → 追加新条目。
+/// - 启用（market `enableRow` 语义）：摘掉**全部**匹配行的禁用 flag（仅摘最后一条时，
+///   更早的同 id 禁用行仍会生效）；移除后若无显式 `disabled: false` 强制行 → 末尾追加
+///   （bundle 层可能默认禁用该行，官方分层合成"后面的层赢"，必须显式覆盖）。
 pub fn set_plugin_disabled_for(
     content: &str,
     plugin_id: &str,
@@ -224,20 +252,33 @@ pub fn set_plugin_disabled_for(
         .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
         .collect();
     let entries = scan_entries(&lines);
-    let matched = find_last_match(&entries, plugin_id, package_name);
+    let pid = plugin_id;
+    // 与 find_last_match 相同的选择器：id 有命中则只认 id，否则按 name
+    let id_hit = !pid.is_empty() && entries.iter().any(|e| e.id == pid);
+    let matches: Vec<&EntrySpan> = entries
+        .iter()
+        .filter(|e| {
+            if id_hit {
+                e.id == pid
+            } else {
+                package_name
+                    .map_or(false, |pkg| !pkg.is_empty() && e.name.as_deref() == Some(pkg))
+            }
+        })
+        .collect();
 
     let mut out: Vec<String> = lines.clone();
 
-    match matched {
-        Some(e) => {
-            let start = e.start;
-            let end = e.end;
-            let indent = e.indent;
-            let dis = find_disabled_line(&out, e);
-            let indent_str = " ".repeat(indent + 2);
-            if disabled {
+    if disabled {
+        // 停用：改写最后一条匹配行的 flag；无则在该条目末尾插入 / 文件末尾追加
+        match matches.last().copied() {
+            Some(e) => {
+                let end = e.end;
+                let indent = e.indent;
+                let dis = find_disabled_line(&out, e);
+                let indent_str = " ".repeat(indent + 2);
                 match dis {
-                    Some((j, Some(true))) => Ok(join_lines(&out, eol, orig_has_tail)),
+                    Some((_, Some(true))) => Ok(join_lines(&out, eol, orig_has_tail)),
                     Some((j, _)) => {
                         out[j] = format!("{indent_str}disabled: true");
                         Ok(join_lines(&out, eol, orig_has_tail))
@@ -247,58 +288,18 @@ pub fn set_plugin_disabled_for(
                         Ok(join_lines(&out, eol, orig_has_tail))
                     }
                 }
-            } else {
-                match dis {
-                    Some((j, _)) => {
-                        out.remove(j);
-                        // 仅当条目是「纯禁用桩」（除 id 外只剩注释/空行）才整条删除。
-                        // 带 name/config 的原条目保留（只摘掉 disabled），否则会误删用户配置。
-                        let new_end = end.saturating_sub(1);
-                        let mut only_id = true;
-                        for k in (start + 1)..new_end {
-                            let t = out[k].trim_start();
-                            if t.is_empty() || t.starts_with('#') {
-                                continue;
-                            }
-                            only_id = false;
-                            break;
-                        }
-                        if only_id {
-                            let first = out[start].trim_start();
-                            let body = first.strip_prefix("-").unwrap_or(first).trim_start();
-                            // 首行也必须只是 id（不能是 name:）— 否则保留
-                            if !(body.starts_with("id:") || body.is_empty()) {
-                                only_id = false;
-                            }
-                        }
-                        if only_id {
-                            // 整条删除（含首行），避免留下孤儿行
-                            let count = new_end - start;
-                            for _ in 0..count {
-                                out.remove(start);
-                            }
-                            if start < out.len() && out[start].trim().is_empty() {
-                                out.remove(start);
-                            }
-                        }
-                        Ok(join_lines(&out, eol, orig_has_tail))
-                    }
-                    None => Ok(content.to_string()),
-                }
             }
-        }
-        None => {
-            if disabled {
+            None => {
                 // market `rowBlock` 格式：两行、简单 id 不加引号（readUserPatchState 只认这种）
-                let id_for_block = if plugin_id.is_empty() {
+                let id_for_block = if pid.is_empty() {
                     derive_service_id(package_name.unwrap_or("plugin"))
                 } else {
-                    plugin_id.to_string()
+                    pid.to_string()
                 };
                 let mut block = row_block(&id_for_block, true);
                 // 仅当 id 与包名推导不一致时补 name 行（保证后续可按 name 命中）
                 if let Some(pkg) = package_name {
-                    if plugin_id.is_empty() || derive_service_id(pkg) != plugin_id {
+                    if pid.is_empty() || derive_service_id(pkg) != pid {
                         // 插在 disabled 行之前，保持 `- id` + `name` + `disabled` 结构
                         block = format!("- id: {}\n  name: {}\n  disabled: true\n",
                             if is_plain_row_id(&id_for_block) { id_for_block.clone() } else { yaml_str(&id_for_block) },
@@ -312,22 +313,136 @@ pub fn set_plugin_disabled_for(
                     out.push(line.to_string());
                 }
                 Ok(join_lines(&out, eol, orig_has_tail))
-            } else {
-                Ok(content.to_string())
             }
         }
+    } else {
+        // 启用：market `enableRow` 语义
+        let id_for_block = if pid.is_empty() {
+            derive_service_id(package_name.unwrap_or("plugin"))
+        } else {
+            pid.to_string()
+        };
+        // 1) 摘掉全部匹配行的禁用 flag（纯桩整条删，长条目只摘 flag）
+        for e in matches.iter().rev() {
+            strip_entry_disabled(&mut out, e);
+        }
+        // 2) 移除后若无显式 `disabled: false` 强制行 → 末尾追加（覆盖 bundle 层默认禁用）
+        let joined_now = join_lines(&out, eol, orig_has_tail);
+        let (_, forced) = read_user_patch_state(&joined_now);
+        if forced.iter().any(|f| f == &id_for_block) {
+            // 已有强制行：仅做删空占位还原（market `withPlaceholderRestored`）
+            return Ok(with_placeholder_restored(&joined_now));
+        }
+        let has_content = joined_now.lines().any(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#')
+        });
+        if has_content {
+            out.push(String::new());
+        }
+        for line in row_block(&id_for_block, false).trim_end_matches('\n').split('\n') {
+            out.push(line.to_string());
+        }
+        Ok(join_lines(&out, eol, orig_has_tail))
     }
 }
 
+/// 摘掉一个条目的 disabled 行；摘除后若条目只剩 id（纯禁用桩）则整条删除。
+/// 返回是否有改动。
+fn strip_entry_disabled(out: &mut Vec<String>, e: &EntrySpan) -> bool {
+    let Some((j, _)) = find_disabled_line(out, e) else {
+        return false;
+    };
+    out.remove(j);
+    // 仅当条目是「纯禁用桩」（除 id 外只剩注释/空行）才整条删除。
+    // 带 name/config 的原条目保留（只摘掉 disabled），否则会误删用户配置。
+    let new_end = e.end.saturating_sub(1);
+    let mut only_id = true;
+    for k in (e.start + 1)..new_end {
+        let t = out.get(k).map(|l| l.trim_start()).unwrap_or("");
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        only_id = false;
+        break;
+    }
+    if only_id {
+        let first = out.get(e.start).map(|l| l.trim_start()).unwrap_or("");
+        let body = first.strip_prefix("-").unwrap_or(first).trim_start();
+        // 首行也必须只是 id（不能是 name:）— 否则保留
+        if !(body.starts_with("id:") || body.is_empty()) {
+            only_id = false;
+        }
+    }
+    if only_id {
+        // 整条删除（含首行），避免留下孤儿行
+        let count = new_end - e.start;
+        for _ in 0..count {
+            if e.start < out.len() {
+                out.remove(e.start);
+            }
+        }
+        if e.start < out.len() && out[e.start].trim().is_empty() {
+            out.remove(e.start);
+        }
+    }
+    true
+}
+
+/// market `lastRowFlag` 等价：同 id 多行时，最后一个显式 `disabled` flag 的值。
+/// enableRow 追加的 `disabled: false` 强制行因此能推翻更早的禁用行。
+/// 严格两行模式（`- id: X` + 恰好 2 空格 `disabled:`），跳过 insert 块。
+fn last_row_flag(content: &str, row_id: &str) -> Option<bool> {
+    let lines: Vec<&str> = content.split('\n').collect();
+    let mut in_insert = false;
+    let mut last: Option<bool> = None;
+    for (index, raw) in lines.iter().enumerate() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let t = line.trim_start();
+        if t == "- insert:" || t.starts_with("- insert: ") {
+            in_insert = true;
+            continue;
+        }
+        if t.starts_with("- ") {
+            in_insert = false;
+        }
+        if in_insert {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("- id:") else {
+            continue;
+        };
+        let id = rest.trim();
+        if id.is_empty() || id.contains(' ') || id.contains(':') {
+            continue;
+        }
+        let id = id.trim_matches('"').trim_matches('\'');
+        if id != row_id {
+            continue;
+        }
+        let next = lines.get(index + 1).map(|l| l.strip_suffix('\r').unwrap_or(l)).unwrap_or("");
+        let n = next.trim_start();
+        if next.starts_with("  disabled:") && !next.starts_with("   ") {
+            let val = n.strip_prefix("disabled:").unwrap_or("").trim();
+            if val == "true" {
+                last = Some(true);
+            } else if val == "false" {
+                last = Some(false);
+            }
+        }
+    }
+    last
+}
+
 /// 判断某插件是否被禁用。
-/// market 权威判定（`packagePatchFlags`）：行 id 出现在 `readUserPatchState` 的
-/// disables 列表里即为禁用（`rows.some(...)`，任一行禁用就算）。
-/// 退回条目解析兜底（兼容 name 匹配的历史写法）。
+/// market 语义：同 id 多行时**最后一个显式 flag 胜出**（enableRow 追加的强制行
+/// 会被计入）；无任何 flag 行 → 未禁用。退回条目解析兜底（兼容 name 匹配的历史写法）。
 pub fn is_plugin_disabled(content: &str, plugin_id: &str, package_name: Option<&str>) -> bool {
-    let (disables, _) = read_user_patch_state(content);
     let pid = plugin_id.trim();
-    if !pid.is_empty() && disables.iter().any(|d| d == pid) {
-        return true;
+    if !pid.is_empty() {
+        if let Some(v) = last_row_flag(content, pid) {
+            return v;
+        }
     }
     // 兜底：历史条目（带 name/config 或引号 id）按条目匹配
     let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
@@ -338,7 +453,8 @@ pub fn is_plugin_disabled(content: &str, plugin_id: &str, package_name: Option<&
     }
 }
 
-/// 列出已禁用插件的 id 列表（market `readUserPatchState` 权威 + 条目兜底）
+/// 列出已禁用插件的 id 列表（market `readUserPatchState` 权威 + 条目兜底；
+/// 同 id 的最后 flag 为 false（强制启用）的不算禁用）
 pub fn list_disabled_ids(content: &str) -> Vec<String> {
     let (mut disables, _) = read_user_patch_state(content);
     let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
@@ -353,6 +469,8 @@ pub fn list_disabled_ids(content: &str) -> Vec<String> {
             }
         }
     }
+    // 强制启用（最后 flag 为 false）的 id 不算禁用
+    disables.retain(|id| last_row_flag(content, id) != Some(false));
     disables
 }
 
@@ -655,7 +773,10 @@ mod tests {
     #[test]
     fn test_enable_existing() {
         let out = set_plugin_disabled(SAMPLE, "include", false).unwrap();
-        assert!(!out.contains("- id: include"), "空条目应被删除");
+        // 纯禁用桩整条删除，但按 market enableRow 语义追加显式强制启用行
+        assert!(!out.contains("- id: include\n  disabled: true"), "旧禁用桩应被删除");
+        assert_eq!(out.matches("- id: include").count(), 1, "只应剩强制启用行: {out}");
+        assert!(out.contains("- id: include\n  disabled: false"), "应追加强制启用行: {out}");
         assert!(out.contains("# 我的补丁注释"));
         // 其他条目保留
         assert!(out.contains("llm-pi-ai"));
@@ -672,9 +793,11 @@ mod tests {
     }
 
     #[test]
-    fn test_enable_non_existing_noop() {
+    fn test_enable_non_existing_appends_force() {
+        // market enableRow：无匹配行也追加强制启用行（bundle 层可能默认禁用）
         let out = set_plugin_disabled(SAMPLE, "nope", false).unwrap();
-        assert_eq!(out, SAMPLE);
+        assert!(out.contains("- id: nope\n  disabled: false"), "{out}");
+        assert!(out.contains("- id: include\n  disabled: true"), "其余内容不变");
     }
 
     #[test]
@@ -798,8 +921,12 @@ mod tests {
         assert!(out.contains("disabled: true"));
         // 再启用
         let on = set_plugin_disabled_for(&out, "mcp-connector", Some("dsh-mcp-connector"), false).unwrap();
-        assert!(!on.contains("disabled:"), "启用后不应残留 disabled: {on}");
-        assert!(on.contains("x: 1"));
+        // 原 config 条目的 disabled 被摘除；强制启用行为显式追加（market enableRow）
+        assert!(on.contains("x: 1"), "config 必须保留: {on}");
+        assert!(on.contains("name: 'dsh-mcp-connector'"), "name 必须保留");
+        assert!(!on.contains("  disabled: true"), "不应残留禁用: {on}");
+        assert!(on.contains("- id: mcp-connector\n  disabled: false"), "应追加强制启用行: {on}");
+        assert!(!is_plugin_disabled(&on, "mcp-connector", Some("dsh-mcp-connector")));
     }
 
     #[test]
@@ -957,4 +1084,73 @@ mod tests {
         assert!(foreign.is_empty());
         assert!(carriers.is_empty());
     }
+
+    #[test]
+    fn disabled_toggle_ignores_nested_config_disabled() {
+        let content = "# 注释
+- id: some-plugin
+  name: \"@scope/pkg\"
+  config:
+    disabled: true
+    other: 1
+";
+        // 禁用：应在条目直接层级（缩进+2）插入 disabled: true，而不是改写 config 下嵌套的同名键
+        let out = set_plugin_disabled(content, "some-plugin", true).unwrap();
+        assert!(out.contains("
+  disabled: true"));
+        assert!(out.contains("    disabled: true"), "嵌套配置键必须原样保留");
+        // 启用：只摘掉直接层级的 disabled，嵌套键仍保留
+        let out2 = set_plugin_disabled(&out, "some-plugin", false).unwrap();
+        assert!(!out2.contains("
+  disabled: true"));
+        assert!(out2.contains("    disabled: true"), "启用时嵌套配置键也不得被删");
+    }
+
+    #[test]
+    fn enable_appends_force_row_and_last_flag_wins() {
+        let content = "- id: a\n  disabled: true\n";
+        let out = set_plugin_disabled(content, "a", false).unwrap();
+        // 强制启用行被追加，状态判定为已启用（market enableRow 语义）
+        assert!(out.contains("- id: a\n  disabled: false"), "{out}");
+        assert!(!is_plugin_disabled(&out, "a", None));
+        // 再禁用 → 写在强制行上，状态为禁用
+        let out2 = set_plugin_disabled(&out, "a", true).unwrap();
+        assert!(is_plugin_disabled(&out2, "a", None));
+    }
+
+    #[test]
+    fn enable_removes_all_flags_for_id_then_forces() {
+        // 同 id 两行：仅摘最后一行时更早的禁用行仍生效，必须全部摘掉
+        let content = "- id: a\n  disabled: true\n\n- id: a\n  name: 'p'\n  disabled: true\n";
+        let out = set_plugin_disabled(content, "a", false).unwrap();
+        assert!(!out.contains("disabled: true"), "{out}");
+        assert!(!is_plugin_disabled(&out, "a", None));
+        assert!(out.contains("name: 'p'"), "name 行不得变孤儿: {out}");
+    }
+
+    #[test]
+    fn enable_without_row_appends_force_row() {
+        let content = "- id: other\n  disabled: true\n";
+        let out = set_plugin_disabled(content, "x", false).unwrap();
+        assert!(out.contains("- id: x\n  disabled: false"), "{out}");
+        assert!(out.contains("- id: other\n  disabled: true"));
+        assert!(!is_plugin_disabled(&out, "x", None));
+        assert!(is_plugin_disabled(&out, "other", None));
+    }
+
+    #[test]
+    fn toggle_never_touches_insert_blocks() {
+        let insert_block = "- insert:\n    - id: inner\n      name: 'x'\n";
+        let content = format!("{insert_block}- id: outer\n  disabled: true\n");
+        // 禁用 insert 内的行：不在 insert 块里动刀，而是文件末尾追加覆盖行（market 语义）
+        let out = set_plugin_disabled(&content, "inner", true).unwrap();
+        assert!(out.contains(insert_block), "insert 块必须原样保留: {out}");
+        assert!(out.contains("- id: inner\n  disabled: true"));
+        // 启用：追加强制行，insert 块同样原样保留
+        let out2 = set_plugin_disabled(&out, "inner", false).unwrap();
+        assert!(out2.contains(insert_block), "insert 块必须原样保留: {out2}");
+        assert!(out2.contains("- id: inner\n  disabled: false"));
+        assert!(!is_plugin_disabled(&out2, "inner", None));
+    }
 }
+

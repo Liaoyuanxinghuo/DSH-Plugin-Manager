@@ -101,7 +101,8 @@ pub fn probe() -> Toolchain {
         for e in rd.flatten() {
             let p = e.path().join("node.exe");
             if p.is_file() {
-                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                // 比较的是 node.exe 文件大小（目录的 metadata().len() 在 Windows 上恒为 0）
+                let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
                 if len > best_len {
                     best_len = len;
                     found = Some(p);

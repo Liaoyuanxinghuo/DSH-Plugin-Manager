@@ -56,3 +56,9 @@ export function moveItem<T>(list: T[], from: number, to: number): T[] {
   arr.splice(to, 0, x);
   return arr;
 }
+
+/** 导入置顶：把新导入项的 id 放到存储顺序最前面（空 id 与重复项忽略），其余保持原相对顺序 */
+export function prependOrder(stored: string[], newIds: string[]): string[] {
+  const fresh = newIds.filter((id) => id && !stored.includes(id));
+  return [...fresh, ...stored];
+}

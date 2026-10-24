@@ -547,11 +547,14 @@ fn extract_and_parse(pack_path: &Path, tmp: &Path) -> Result<PackManifest, Strin
             .by_index(i)
             .map_err(|e| format!("读取包条目失败: {e}"))?;
         let name = entry.name().to_string();
-        let clean = Path::new(&name);
-        if clean.is_absolute() || name.split('/').any(|seg| seg == "..") {
+        // 防路径穿越：enclosed_name 逐段校验（覆盖 ../、反斜杠、绝对/根路径、盘符）
+        let safe = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("包包含非法路径: {name}"))?;
+        let out_path = tmp.join(&safe);
+        if !out_path.starts_with(&tmp) {
             return Err(format!("包包含非法路径: {name}"));
         }
-        let out_path = tmp.join(&name);
         if entry.is_dir() {
             fs::create_dir_all(&out_path)
                 .map_err(|e| format!("创建目录失败 {}: {e}", out_path.display()))?;
@@ -622,8 +625,14 @@ fn copy_tree(src: &Path, dst: &Path, prefix: &str) -> Result<usize, String> {
     Ok(count)
 }
 
-/// 覆盖写入目录树，已存在文件先备份到 backup_dir
-fn copy_tree_with_backup(src: &Path, dst: &Path, backup: &Path) -> Result<usize, String> {
+/// 覆盖写入目录树，已存在文件先备份到 backup_dir；
+/// 覆盖前不存在的文件 rel 路径记入 created_new（供导入失败时整树回滚）
+fn copy_tree_with_backup(
+    src: &Path,
+    dst: &Path,
+    backup: &Path,
+    created_new: &mut Vec<String>,
+) -> Result<usize, String> {
     let mut count = 0usize;
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     collect_files(src, "", &mut files)?;
@@ -637,6 +646,8 @@ fn copy_tree_with_backup(src: &Path, dst: &Path, backup: &Path) -> Result<usize,
             }
             fs::copy(&target, &bak)
                 .map_err(|e| format!("备份文件失败 {}: {e}", target.display()))?;
+        } else {
+            created_new.push(rel.clone());
         }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
@@ -646,6 +657,36 @@ fn copy_tree_with_backup(src: &Path, dst: &Path, backup: &Path) -> Result<usize,
         count += 1;
     }
     Ok(count)
+}
+
+/// 导入失败时：把备份目录里的原文件逐个复制回 dst_root 对应位置（只恢复被覆盖的文件）
+fn restore_from_backup(backup: &Path, dst_root: &Path) -> Result<usize, String> {
+    let mut restored = 0usize;
+    let mut stack = vec![backup.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let rd = fs::read_dir(&dir)
+            .map_err(|e| format!("读取备份目录失败 {}: {e}", dir.display()))?;
+        for e in rd {
+            let e = e.map_err(|e| format!("读取备份目录失败 {}: {e}", dir.display()))?;
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                let rel = p
+                    .strip_prefix(backup)
+                    .map_err(|e| format!("备份相对路径解析失败: {e}"))?;
+                let target = dst_root.join(rel);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| format!("创建目录失败 {}: {e}", parent.display()))?;
+                }
+                fs::copy(&p, &target)
+                    .map_err(|e| format!("恢复文件失败 {}: {e}", target.display()))?;
+                restored += 1;
+            }
+        }
+    }
+    Ok(restored)
 }
 
 /// 重建 profile package.json（manifest 权威）
@@ -760,6 +801,8 @@ pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportRe
     let mut renamed = false;
     let mut home_written = 0usize;
     let mut created_dirs: Vec<PathBuf> = Vec::new();
+    // 本次覆盖前不存在、由导入新写入的 home 文件（失败时删除，还原导入前状态）
+    let mut created_home_files: Vec<String> = Vec::new();
     let mut rollback_err: Option<String> = None;
 
     // 回滚闭包：删除本次新建的 profile 目录（home 覆盖已备份到 backup_dir）
@@ -809,7 +852,12 @@ pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportRe
             // home/ → $DSH_HOME（覆盖前备份）
             let home_src = work.join("home");
             if home_src.is_dir() {
-                home_written = copy_tree_with_backup(&home_src, home_dir, &backup_dir)?;
+                home_written = copy_tree_with_backup(
+                    &home_src,
+                    home_dir,
+                    &backup_dir,
+                    &mut created_home_files,
+                )?;
             }
             final_names.push(final_name);
             Ok(())
@@ -875,7 +923,12 @@ pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportRe
                         fs::copy(&abs, &target)
                             .map_err(|e| format!("复制文件失败 {}: {e}", abs.display()))?;
                     }
-                    home_written = copy_tree_with_backup(&staging, home_dir, &backup_dir)?;
+                    home_written = copy_tree_with_backup(
+                        &staging,
+                        home_dir,
+                        &backup_dir,
+                        &mut created_home_files,
+                    )?;
                 }
             }
             Ok(())
@@ -885,8 +938,26 @@ pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportRe
     if let Err(e) = result {
         rollback(&created_dirs);
         let _ = fs::remove_dir_all(&work);
-        let _ = fs::remove_dir_all(&backup_dir);
-        return Err(format!("导入失败（已回滚）：{e}"));
+        // 回滚 home：先删本次新建的文件，再把备份的被覆盖原文件逐个恢复；
+        // 恢复失败时保留备份目录，错误信息中给出路径供用户手动找回
+        for rel in &created_home_files {
+            let _ = fs::remove_file(home_dir.join(rel));
+        }
+        let restore_note = if backup_dir.exists() {
+            match restore_from_backup(&backup_dir, home_dir) {
+                Ok(n) => {
+                    let _ = fs::remove_dir_all(&backup_dir);
+                    format!("已从备份恢复 {n} 个原文件")
+                }
+                Err(re) => format!(
+                    "部分原文件恢复失败（{re}），原始备份已保留在 {}",
+                    backup_dir.display()
+                ),
+            }
+        } else {
+            "无已存在文件被覆盖".to_string()
+        };
+        return Err(format!("导入失败（已回滚；{restore_note}）：{e}"));
     }
 
     let target_path = final_names
@@ -1318,4 +1389,84 @@ mod tests {
         }
         let _ = nf;
     }
+    #[test]
+    fn test_copy_tree_with_backup_tracks_created_and_overwritten() {
+        let work = tmpdir("bak-track");
+        let src = work.join("src");
+        let dst = work.join("dst");
+        let backup = work.join("bak");
+        // dst 预置一个将被覆盖的文件
+        fs::create_dir_all(dst.join("cfg")).unwrap();
+        fs::write(dst.join("cfg").join("a.yaml"), "old").unwrap();
+        // src：覆盖 a.yaml + 新增 b.txt
+        fs::create_dir_all(src.join("cfg")).unwrap();
+        fs::write(src.join("cfg").join("a.yaml"), "new").unwrap();
+        fs::write(src.join("b.txt"), "brand-new").unwrap();
+
+        let mut created: Vec<String> = Vec::new();
+        let n = copy_tree_with_backup(&src, &dst, &backup, &mut created).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(created, vec!["b.txt".to_string()]);
+        // 被覆盖文件的原件应已进入备份目录
+        assert_eq!(
+            fs::read_to_string(backup.join("cfg").join("a.yaml")).unwrap(),
+            "old"
+        );
+        assert_eq!(fs::read_to_string(dst.join("cfg").join("a.yaml")).unwrap(), "new");
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn test_restore_from_backup_roundtrip() {
+        let work = tmpdir("bak-restore");
+        let src = work.join("src");
+        let dst = work.join("dst");
+        let backup = work.join("bak");
+        fs::create_dir_all(dst.join("cfg").join("deep")).unwrap();
+        fs::write(dst.join("cfg").join("a.yaml"), "old").unwrap();
+        fs::write(dst.join("cfg").join("deep").join("z.txt"), "old-z").unwrap();
+        fs::create_dir_all(src.join("cfg").join("deep")).unwrap();
+        fs::write(src.join("cfg").join("a.yaml"), "new").unwrap();
+        fs::write(src.join("cfg").join("deep").join("z.txt"), "new-z").unwrap();
+        fs::write(src.join("added.txt"), "added").unwrap();
+
+        let mut created: Vec<String> = Vec::new();
+        copy_tree_with_backup(&src, &dst, &backup, &mut created).unwrap();
+        // 模拟导入失败回滚：删除新建文件 + 从备份恢复被覆盖文件
+        for rel in &created {
+            fs::remove_file(dst.join(rel)).unwrap();
+        }
+        let n = restore_from_backup(&backup, &dst).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(fs::read_to_string(dst.join("cfg").join("a.yaml")).unwrap(), "old");
+        assert_eq!(
+            fs::read_to_string(dst.join("cfg").join("deep").join("z.txt")).unwrap(),
+            "old-z"
+        );
+        // 新建文件已被删除，不在恢复范围内
+        assert!(!dst.join("added.txt").exists());
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn test_import_pack_rejects_path_traversal() {
+        let work = tmpdir("slip");
+        fs::create_dir_all(&work).unwrap();
+        let zip = work.join("evil.dspack");
+        let f = fs::File::create(&zip).unwrap();
+        let mut zw = ZipWriter::new(f);
+        let opts = SimpleFileOptions::default();
+        zw.start_file("dspack.json", opts).unwrap();
+        zw.write_all(br#"{"format":"dspack","version":3,"name":"evil","packType":"profile"}"#).unwrap();
+        zw.start_file(r"..\evil.txt", opts).unwrap();
+        zw.write_all(b"pwned").unwrap();
+        zw.finish().unwrap();
+        let profiles = work.join("profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        let r = import_pack(&zip, &profiles);
+        assert!(r.is_err());
+        assert!(!profiles.join("evil.txt").exists(), "不得逃逸出解压目录");
+        let _ = fs::remove_dir_all(&work);
+    }
+
 }

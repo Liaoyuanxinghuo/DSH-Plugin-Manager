@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent, type ReactNode } from "react";
 import { api, formatSize, pickDspackFile, pickFolder, pickSavePackPath, pickSaveZipPath, pickZipFile } from "./api";
 import { listen } from "@tauri-apps/api/event";
-import { applyStoredOrder, migrateStoredOrder, moveItem, readStoredOrder } from "./reorder";
+import { applyStoredOrder, migrateStoredOrder, moveItem, prependOrder, readStoredOrder } from "./reorder";
 import InstallDialog from "./InstallDialog";
 import ComplementDialog from "./ComplementDialog";
 import { Icon } from "./icons";
@@ -271,6 +271,16 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>("");
   const [info, setInfo] = useState<string>("");
+  // Toast 轻提示（顶部居中、自动消失）：插件启停这类轻量操作反馈；错误仍走顶部 banner
+  const [toasts, setToasts] = useState<{ id: number; text: string; kind: "info" | "success" | "error" }[]>([]);
+  const toastSeq = useRef(0);
+  const pushToast = useCallback((text: string, kind: "info" | "success" | "error" = "success") => {
+    const id = ++toastSeq.current;
+    setToasts((prev) => [...prev.slice(-3), { id, text, kind }]); // 最多同时 4 条
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3000);
+  }, []);
   // 导出/导入状态
   const [exportTarget, setExportTarget] = useState<{ profile: string; profilesDir: string; nmSize: number | null } | null>(null);
   // 长任务（导出 zip / 打包整合包 / 克隆 profile）状态：只驱动进度提示，
@@ -608,6 +618,19 @@ export default function App() {
     [profiles, selectedProfilesDir],
   );
 
+  // profiles 的最新值引用：体积回填/流式扫描会频繁重建数组，
+  // 下方 effect 只依赖「选中项是否已进列表」的布尔量，避免每次回填都重拉插件列表
+  const profilesRef = useRef<ProfileInfo[]>(profiles);
+  useEffect(() => {
+    profilesRef.current = profiles;
+  }, [profiles]);
+  const selectedInList =
+    !!selectedProfile &&
+    profiles.some(
+      (x) =>
+        x.name === selectedProfile && (!selectedProfilesDir || x.profilesDir === selectedProfilesDir),
+    );
+
   // 加载插件列表（来源目录直接按当前 profile 推导，避免选中瞬间 state 未同步的竞态）
   useEffect(() => {
     if (!selectedEnv || !selectedProfile) {
@@ -616,9 +639,10 @@ export default function App() {
       setUpdates(null);
       return;
     }
+    const list = profilesRef.current;
     const p =
-      profiles.find((x) => x.name === selectedProfile && x.profilesDir === selectedProfilesDir) ??
-      profiles.find((x) => x.name === selectedProfile);
+      list.find((x) => x.name === selectedProfile && x.profilesDir === selectedProfilesDir) ??
+      list.find((x) => x.name === selectedProfile);
     if (!p) {
       // 记住的 profile 不在当前合并列表中（来源目录未扫到）：静默跳过，不报错
       setPlugins([]);
@@ -626,25 +650,37 @@ export default function App() {
       setUpdates(null);
       return;
     }
+    let alive = true; // 竞态守卫：快速切换 profile 时丢弃旧响应
     setPluginsLoading(true);
     api
       .listPlugins(selectedEnv, selectedProfile, p.profilesDir)
-      .then(setPlugins)
-      .catch((e) => setError(String(e)))
-      .finally(() => setPluginsLoading(false));
+      .then((r) => {
+        if (alive) setPlugins(r);
+      })
+      .catch((e) => {
+        if (alive) setError(String(e));
+      })
+      .finally(() => {
+        if (alive) setPluginsLoading(false);
+      });
     setUpdates(null);
-  }, [selectedEnv, selectedProfile, selectedProfilesDir, profiles]);
+    return () => {
+      alive = false;
+    };
+  }, [selectedEnv, selectedProfile, selectedProfilesDir, selectedInList]);
 
   // 加载路径（随环境 × profile 变化：文件入口对准当前选中的 profile 目录）
   useEffect(() => {
     if (!selectedEnv) return;
-    const pdir = profileDirOf(selectedProfile);
+    const item = profilesRef.current.find(
+      (x) => x.name === selectedProfile && x.profilesDir === selectedProfilesDir,
+    );
+    const pdir = item?.profilesDir ?? selectedProfilesDir;
     api
       .getEnvPaths(selectedEnv, selectedProfile, pdir)
       .then(setPaths)
       .catch(() => {});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedEnv, selectedProfile, selectedProfilesDir, profiles]);
+  }, [selectedEnv, selectedProfile, selectedProfilesDir, selectedInList]);
 
   // profile 体积异步回填：后端在列表出完之后才在后台线程统计（一个带 node_modules 的
   // profile 有数万文件，实测 16~21 秒），算好一条补一条 —— 列表本身不再被体积拖住。
@@ -831,7 +867,7 @@ export default function App() {
     }, 1000);
   };
 
-  const handleStart = async (envIdArg?: string, profileArg?: string) => {
+  const handleStart = async (envIdArg?: string, profileArg?: string, pdirHint?: string) => {
     if (startingRef.current) return; // 防抖：启动进行中忽略重复点击（后端另有 per-key 互斥）
     startingRef.current = true;
     const eid = envIdArg ?? selectedEnv;
@@ -844,8 +880,10 @@ export default function App() {
     setBusy(true);
     setError("");
     setInfo("");
+    // 行内启动自带该列表项自己的来源目录（同名多来源 profile 精确到此目录）；
     // 扫描未完成时列表可能为空 → 回退到记住的来源目录（localStorage），不挡启动
     const pdir =
+      pdirHint ??
       profiles.find((x) => x.name === pname)?.profilesDir ??
       (pname === selectedProfile ? selectedProfilesDir : "");
     if (!pdir) {
@@ -909,13 +947,13 @@ export default function App() {
     setError("");
     setInfo(`正在重启 ${pname}...`);
     try {
-      // 停止用运行中实例自己的目录，启动用列表项解析出的目录
+      // 停止用运行中实例自己的目录，启动也用同一目录（同名多来源时不串目录）
       await api.stopDsh(eid, pname, curRun.profilesDir || profileDirOf(pname));
       // 等旧进程完全退出后再启动（taskkill 异步生效）
       await new Promise((r) => setTimeout(r, 600));
       const list = await api.listRunning().catch(() => []);
       setRunnings(list);
-      await startAndPoll(eid, pname, profileDirOf(pname));
+      await startAndPoll(eid, pname, curRun.profilesDir || profileDirOf(pname));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -931,6 +969,9 @@ export default function App() {
     try {
       const dir =
         pdirArg ??
+        runnings.find(
+          (r) => r.envId === eid && r.profile === pname && r.profilesDir === selectedProfilesDir,
+        )?.profilesDir ??
         runnings.find((r) => r.envId === eid && r.profile === pname)?.profilesDir ??
         profileDirOf(pname);
       await api.stopDsh(eid, pname, dir);
@@ -1052,7 +1093,7 @@ export default function App() {
       // 刷新列表
       const list = await api.listPlugins(selectedEnv, selectedProfile, profileDirOf(selectedProfile)).catch(() => null);
       if (list) setPlugins(list);
-      setInfo(enabled ? `已启用 ${p.name}` : `已停用 ${p.name}`);
+      pushToast(enabled ? `已启用 ${p.name}` : `已停用 ${p.name}`);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -1114,9 +1155,11 @@ export default function App() {
   //
   // 旧实现在弹窗前 `await profileNodeModulesSize(...)`：那是一次全量磁盘递归，
   // 实测 3.3 万文件 / 693MB 要 16~21 秒，用户点了导出要干等十几秒才见到弹窗。
-  const handleExport = async (profile: string) => {
+  const handleExport = async (profile: string, pdirHint?: string) => {
     if (!selectedEnv) return;
-    const pdir = profiles.find((x) => x.name === profile)?.profilesDir ?? "";
+    // 行内导出自带该列表项自己的来源目录（同名多来源 profile 精确到此目录）
+    const pdir =
+      pdirHint ?? profiles.find((x) => x.name === profile)?.profilesDir ?? "";
     setExportTarget({ profile, profilesDir: pdir, nmSize: null });
     try {
       const nmSize = await api.profileNodeModulesSize(selectedEnv, profile, pdir);
@@ -1160,8 +1203,16 @@ export default function App() {
     setShowImportDialog(true);
   };
 
-  // 导入完成后刷新 profile 列表（与「刷新」同一套重扫逻辑）
-  const refreshAfterImport = async (finalNames: string[]) => {
+  // 导入完成后刷新 profile 列表（与「刷新」同一套重扫逻辑）；
+  // 新导入的 profile 持久化置顶（后续仍可拖动调整，非固定）
+  const refreshAfterImport = async (finalNames: string[], profilesDir?: string) => {
+    if (finalNames.length > 0 && profilesDir) {
+      const newIds = finalNames.map((n) => `${n}::${profilesDir}`);
+      localStorage.setItem(
+        "dshpm-prof-order",
+        JSON.stringify(prependOrder(readStoredOrder("dshpm-prof-order"), newIds)),
+      );
+    }
     await loadProfiles();
     if (finalNames.length > 0) {
       setSelectedProfile(finalNames[0]);
@@ -1563,6 +1614,14 @@ export default function App() {
 
   return (
     <div className="app">
+      {/* 顶部居中 Toast：轻量操作反馈，自动消失（错误仍走顶部 banner） */}
+      <div className="toast-wrap" aria-live="polite">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast ${t.kind}`}>
+            {t.text}
+          </div>
+        ))}
+      </div>
       <header className="topbar">
         <div className="brand">
           <span className="logo">◈</span>
@@ -1913,8 +1972,12 @@ export default function App() {
                     <Icon name="folder" /> 打开目录
                   </button>
                   {(() => {
+                    // 运行状态按「环境 × profile × 来源目录」精确匹配，同名不同来源互不干扰
                     const rp = runnings.find(
-                      (r) => r.envId === selectedEnv && r.profile === p.name,
+                      (r) =>
+                        r.envId === selectedEnv &&
+                        r.profile === p.name &&
+                        r.profilesDir === p.profilesDir,
                     );
                     return rp ? (
                       <>
@@ -1928,7 +1991,7 @@ export default function App() {
                           className="btn tiny danger"
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleStop(selectedEnv, p.name);
+                            handleStop(selectedEnv, p.name, p.profilesDir);
                           }}
                           title={`停止 ${p.name}（PID ${rp.pid}）`}
                         >
@@ -1957,7 +2020,7 @@ export default function App() {
                           // 右侧详情/运行状态/按钮跟着切过来（不必再点一次整行）
                           setSelectedProfile(p.name);
                           setSelectedProfilesDir(p.profilesDir);
-                          handleStart(selectedEnv, p.name);
+                          handleStart(selectedEnv, p.name, p.profilesDir);
                         }}
                         disabled={busy || !envCanStart(selectedEnv)}
                         title={
@@ -1976,7 +2039,7 @@ export default function App() {
                     className="btn tiny"
                     onClick={(e) => {
                       e.stopPropagation();
-                      handleExport(p.name);
+                      handleExport(p.name, p.profilesDir);
                     }}
                   >
                     <Icon name="export" /> 导出
@@ -2154,7 +2217,7 @@ export default function App() {
                     ) : (
                       <button
                         className="btn primary"
-                        onClick={() => handleStart()}
+                        onClick={() => handleStart(selectedEnv, selectedProfile, selectedProfilesDir)}
                         disabled={busy || !selectedProfile || !selectedEnvObj?.runCommand}
                         title={selectedEnvObj && !selectedEnvObj.runCommand ? "该环境未配置 dsh 程序，无法启动" : ""}
                       >
@@ -3339,7 +3402,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.24</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.25</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -3636,7 +3699,7 @@ function ImportDialog({
   envName: string;
   profilesDir: string;
   onClose: () => void;
-  onImported: (finalNames: string[]) => void;
+  onImported: (finalNames: string[], profilesDir?: string) => void;
   setGlobalError: (m: string) => void;
   setGlobalInfo: (m: string) => void;
 }) {
@@ -3700,7 +3763,7 @@ function ImportDialog({
     setGlobalInfo(
       `整合包导入成功：${result.finalNames.join("、")}${result.renamed ? "（重名已自动改名）" : ""}${result.homeWritten ? `，写入全局文件 ${result.homeWritten} 个` : ""}${result.dshHint ? ` · 已写入备注适配版本 DSH ${result.dshHint}` : ""}`,
     );
-    onImported(result.finalNames);
+    onImported(result.finalNames, targetDir);
     close();
   };
 
@@ -3774,7 +3837,7 @@ function ImportDialog({
                     ? `导入成功：原 "${r.profileName}" 与现有重名，已改名为 "${r.finalName}"（${r.pluginCount} 个插件）`
                     : `导入成功：${r.finalName}（${r.pluginCount} 个插件）`,
                 );
-                onImported([r.finalName]);
+                onImported([r.finalName], targetDir);
                 setInstalling(false);
                 close();
               } catch (e) {

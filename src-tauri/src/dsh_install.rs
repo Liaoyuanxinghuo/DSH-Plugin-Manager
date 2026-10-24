@@ -296,29 +296,46 @@ fn dir_size(path: &Path) -> u64 {
 /// 确保 profile/.npmrc 含指定 registry（供 pnpm 插件安装走镜像）
 pub fn ensure_profile_npmrc(profile_dir: &Path, registry: &str) -> Result<(), String> {
     let npmrc = profile_dir.join(".npmrc");
-    let existing = std::fs::read_to_string(&npmrc).unwrap_or_default();
-    let mut lines: Vec<String> = existing.lines().map(|l| l.to_string()).collect();
+    let raw = std::fs::read(&npmrc).unwrap_or_default();
     let reg = registry.trim();
-    if reg.is_empty() {
-        // 空 = 不使用镜像源：移除 .npmrc 中所有 registry 行
-        lines.retain(|l| {
-            !(l.trim_start().starts_with("registry=") || l.trim_start().starts_with("registry ="))
-        });
-    } else {
-        let reg_line = format!("registry={}", crate::settings::resolve_registry(reg));
-        let mut found = false;
-        for l in &mut lines {
-            if l.trim_start().starts_with("registry=") || l.trim_start().starts_with("registry =") {
-                *l = reg_line.clone();
-                found = true;
-            }
+    let reg_line = format!("registry={}", crate::settings::resolve_registry(reg));
+    // 字节级按行处理（兼容 GBK 等非 UTF-8 编码的 .npmrc，不丢用户原有的 authToken/proxy 等配置）：
+    // 只改写/删除/追加 registry 行，其余行原样保留
+    fn strip_leading_ws(line: &[u8]) -> &[u8] {
+        let mut i = 0;
+        while i < line.len() && matches!(line[i], b' ' | b'\t' | b'\r') {
+            i += 1;
         }
-        if !found {
-            lines.push(reg_line);
-        }
+        &line[i..]
     }
-    let content = lines.join("\n") + "\n";
-    std::fs::write(&npmrc, content).map_err(|e| format!("写入 .npmrc 失败: {e}"))
+    let mut out: Vec<u8> = Vec::with_capacity(raw.len() + reg_line.len() + 2);
+    let mut found = false;
+    let mut idx = 0usize;
+    while idx < raw.len() {
+        let end = raw[idx..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| idx + p)
+            .unwrap_or(raw.len());
+        let line = &raw[idx..end];
+        let t = strip_leading_ws(line);
+        if t.starts_with(b"registry=") || t.starts_with(b"registry =") {
+            found = true;
+            if !reg.is_empty() {
+                out.extend_from_slice(reg_line.as_bytes());
+                out.push(b'\n');
+            }
+        } else {
+            out.extend_from_slice(line);
+            out.push(b'\n');
+        }
+        idx = end + 1;
+    }
+    if !reg.is_empty() && !found {
+        out.extend_from_slice(reg_line.as_bytes());
+        out.push(b'\n');
+    }
+    std::fs::write(&npmrc, &out).map_err(|e| format!("写入 .npmrc 失败: {e}"))
 }
 
 #[cfg(test)]
@@ -417,4 +434,31 @@ mod tests {
             println!("  {} tags={:?}", v.version, v.tags);
         }
     }
+
+    #[test]
+    fn ensure_profile_npmrc_preserves_non_utf8_bytes() {
+        let tmp = std::env::temp_dir().join(format!("dshpm-npmrc-gbk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let mut raw = b"registry=https://old.example
+proxy=http://127.0.0.1:7890
+_authToken=secret
+".to_vec();
+        raw.extend_from_slice(&[0xC4, 0xFA, 0xBA, 0xC3]); // GBK“您好”——非 UTF-8 字节
+        raw.extend_from_slice(b"
+keep=1
+");
+        std::fs::write(tmp.join(".npmrc"), &raw).unwrap();
+        ensure_profile_npmrc(&tmp, "https://registry.npmmirror.com").unwrap();
+        let out = std::fs::read(tmp.join(".npmrc")).unwrap();
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("registry=https://registry.npmmirror.com"));
+        assert!(!s.contains("old.example"));
+        assert!(s.contains("proxy=http://127.0.0.1:7890"), "proxy 行必须保留");
+        assert!(s.contains("_authToken=secret"), "authToken 行必须保留");
+        assert!(s.contains("keep=1"));
+        assert!(out.windows(4).any(|w| w == [0xC4, 0xFA, 0xBA, 0xC3]), "非 UTF-8 字节必须原样保留");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
 }

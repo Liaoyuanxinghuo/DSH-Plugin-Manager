@@ -2070,7 +2070,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.24", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.25", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -2097,27 +2097,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.24", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.25", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.24_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.25_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("下载 v0.3.24"));
+    await user.click(screen.getByText("下载 v0.3.25"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.24" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.25" });
     // 打开所在文件夹
     await user.click(screen.getByText("打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.24_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.25_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.24_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.25_x64-setup.exe" });
     });
   });
 });
@@ -2655,5 +2655,59 @@ describe("首次使用引导（空状态）", () => {
     });
     expect(screen.queryByText("首次使用，分两步：")).not.toBeInTheDocument();
     expect(screen.queryByText("这个环境还没有 Profile")).not.toBeInTheDocument();
+  });
+});
+
+
+describe("同名多来源 Profile 与体积回填竞态", () => {
+  function mockTwoSameNameProfiles() {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "list_all_profiles") {
+        return Promise.resolve([
+          { name: "web", profilesDir: "C:\\src-a", path: "C:\\src-a\\web", pluginCount: 0, dataSize: 0, modified: "", hasPatch: false, hasLock: false, hasPackage: true },
+          { name: "web", profilesDir: "C:\\src-b", path: "C:\\src-b\\web", pluginCount: 0, dataSize: 0, modified: "", hasPatch: false, hasLock: false, hasPackage: true },
+        ]);
+      }
+      if (cmd === "start_dsh_cmd") {
+        return Promise.resolve({ success: true, pid: 1, message: "ok", port: 3080, url: "http://localhost:3080" });
+      }
+      if (cmd === "dsh_status") {
+        return Promise.resolve({ running: true, process: null, portOpen: true, webReady: true, url: "http://127.0.0.1:3080/?token=t" });
+      }
+      return mockAllDefault(cmd);
+    });
+  }
+
+  it("行内启动把该行自己的来源目录传给 start_dsh_cmd（同名不同来源不串目录）", async () => {
+    mockTwoSameNameProfiles();
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getAllByText("启动").length).toBeGreaterThanOrEqual(2);
+    });
+    await user.click(screen.getAllByText("启动")[1]);
+    await waitFor(() => {
+      const call = mockInvoke.mock.calls.find(([c]) => c === "start_dsh_cmd");
+      expect(call).toBeTruthy();
+      expect((call![1] as Record<string, unknown>).profilesDirStr).toBe("C:\\src-b");
+    });
+  });
+
+  it("profile 体积回填事件不会重复拉取插件列表", async () => {
+    mockTwoSameNameProfiles();
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(screen.getAllByText("web")[0]);
+    await waitFor(() => {
+      expect(mockInvoke.mock.calls.filter(([c]) => c === "list_plugins").length).toBeGreaterThan(0);
+    });
+    const before = mockInvoke.mock.calls.filter(([c]) => c === "list_plugins").length;
+    act(() => {
+      eventBus.emit("profile-size", { name: "web", profilesDir: "C:\\src-a", dataSize: 123 });
+      eventBus.emit("profile-size", { name: "web", profilesDir: "C:\\src-b", dataSize: 456 });
+    });
+    await new Promise((r) => setTimeout(r, 80));
+    const after = mockInvoke.mock.calls.filter(([c]) => c === "list_plugins").length;
+    expect(after).toBe(before);
   });
 });

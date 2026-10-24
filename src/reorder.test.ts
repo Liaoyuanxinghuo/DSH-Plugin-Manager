@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { readStoredOrder, applyStoredOrder, moveItem } from "./reorder";
+import { readStoredOrder, applyStoredOrder, moveItem, prependOrder } from "./reorder";
 
 beforeEach(() => {
   localStorage.clear();
@@ -18,6 +18,19 @@ describe("readStoredOrder", () => {
   it("过滤非字符串项", () => {
     localStorage.setItem("k", JSON.stringify(["a", 2, null]));
     expect(readStoredOrder("k")).toEqual(["a"]);
+  });
+});
+
+describe("prependOrder", () => {
+  it("新导入项置顶，其余保持原相对顺序", () => {
+    expect(prependOrder(["a::x", "b::y"], ["c::z"])).toEqual(["c::z", "a::x", "b::y"]);
+  });
+  it("多个导入项按传入顺序置顶", () => {
+    expect(prependOrder(["a::x"], ["c::z", "d::w"])).toEqual(["c::z", "d::w", "a::x"]);
+  });
+  it("已存在的 id 不重复前置，空 id 忽略", () => {
+    expect(prependOrder(["a::x", "b::y"], ["a::x", ""])).toEqual(["a::x", "b::y"]);
+    expect(prependOrder([], [""])).toEqual([]);
   });
 });
 

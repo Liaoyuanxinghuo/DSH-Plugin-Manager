@@ -715,7 +715,7 @@ dependencies = [
 
 [[package]]
 name = "dsh-manager"
-version = "0.3.24"
+version = "0.3.25"
 dependencies = [
  "dirs 6.0.0",
  "hmac",

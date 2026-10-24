@@ -3597,13 +3597,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.24_x64-setup.exe", "0.3.24"));
-        assert!(asset_matches("dsh-manager_0.3.24_x64-setup.exe", "0.3.24"));
-        assert!(asset_matches("任意名_0.3.24_x64-setup.exe", "0.3.24"));
-        assert!(!asset_matches("DSH-Manager-0.3.24-win-x64.exe", "0.3.24"));
-        assert!(!asset_matches("DSH Manager_0.3.24_x64-setup.exe.sha256", "0.3.24"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.24"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.24"));
+        assert!(asset_matches("DSH Manager_0.3.25_x64-setup.exe", "0.3.25"));
+        assert!(asset_matches("dsh-manager_0.3.25_x64-setup.exe", "0.3.25"));
+        assert!(asset_matches("任意名_0.3.25_x64-setup.exe", "0.3.25"));
+        assert!(!asset_matches("DSH-Manager-0.3.25-win-x64.exe", "0.3.25"));
+        assert!(!asset_matches("DSH Manager_0.3.25_x64-setup.exe.sha256", "0.3.25"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.25"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.25"));
     }
 
     #[test]
@@ -3736,10 +3736,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.24_x64-setup.exe", "0.3.24"));
+        assert!(asset_matches("DSH.Manager_0.3.25_x64-setup.exe", "0.3.25"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.24_x64-setup.exe", "0.3.24"));
-        assert!(asset_matches("DSH.MANAGER_0.3.24_X64-SETUP.EXE", "0.3.24"));
+        assert!(asset_matches("dsh.manager_0.3.25_x64-setup.exe", "0.3.25"));
+        assert!(asset_matches("DSH.MANAGER_0.3.25_X64-SETUP.EXE", "0.3.25"));
     }
 
     #[test]
@@ -3747,7 +3747,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.24", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.25", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

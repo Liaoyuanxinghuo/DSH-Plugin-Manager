@@ -172,12 +172,14 @@ pub fn import_profile(zip_path: &Path, target_profiles_dir: &Path) -> Result<Imp
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| format!("读取 zip 条目失败: {e}"))?;
         let name = entry.name().to_string();
-        // 安全校验：拒绝绝对路径与 .. 穿越
-        let clean = Path::new(&name);
-        if clean.is_absolute() || name.split('/').any(|seg| seg == "..") {
+        // 防路径穿越：enclosed_name 逐段校验（覆盖 ../、反斜杠、绝对/根路径、盘符）
+        let safe = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("zip 包含非法路径: {name}"))?;
+        let out_path = tmp.join(&safe);
+        if !out_path.starts_with(&tmp) {
             return Err(format!("zip 包含非法路径: {name}"));
         }
-        let out_path = tmp.join(&name);
         if entry.is_dir() {
             fs::create_dir_all(&out_path)
                 .map_err(|e| format!("创建目录失败 {}: {e}", out_path.display()))?;
@@ -193,12 +195,26 @@ pub fn import_profile(zip_path: &Path, target_profiles_dir: &Path) -> Result<Imp
         }
     }
 
-    // 校验合法性
-    let pkg = tmp.join("package.json");
-    if !pkg.exists() {
-        let _ = fs::remove_dir_all(&tmp);
-        return Err("zip 内缺少 package.json，不是有效的 profile 备份".to_string());
+    // 校验合法性：package.json 在解压根，或唯一的顶层文件夹内（兼容「整个文件夹打成 zip」）
+    let mut pkg_root = tmp.clone();
+    if !pkg_root.join("package.json").is_file() {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = fs::read_dir(&tmp) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() && p.join("package.json").is_file() {
+                    candidates.push(p);
+                }
+            }
+        }
+        if candidates.len() == 1 {
+            pkg_root = candidates.remove(0);
+        } else {
+            let _ = fs::remove_dir_all(&tmp);
+            return Err("zip 内缺少 package.json，不是有效的 profile 备份".to_string());
+        }
     }
+    let pkg = pkg_root.join("package.json");
     let pkg_raw = fs::read_to_string(&pkg).map_err(|e| format!("读取 package.json 失败: {e}"))?;
     if pkg_raw.trim().is_empty() {
         let _ = fs::remove_dir_all(&tmp);
@@ -234,7 +250,13 @@ pub fn import_profile(zip_path: &Path, target_profiles_dir: &Path) -> Result<Imp
     let renamed = final_name != base_name;
 
     let dest = target_profiles_dir.join(&final_name);
-    fs::rename(&tmp, &dest).map_err(|e| format!("移动目录失败: {e}"))?;
+    if pkg_root == tmp {
+        fs::rename(&tmp, &dest).map_err(|e| format!("移动目录失败: {e}"))?;
+    } else {
+        // 顶层文件夹 zip：只把该文件夹移为 dest，再清理临时目录余下内容
+        fs::rename(&pkg_root, &dest).map_err(|e| format!("移动目录失败: {e}"))?;
+        let _ = fs::remove_dir_all(&tmp);
+    }
 
     Ok(ImportResult {
         profile_name: base_name,
@@ -942,8 +964,26 @@ mod tests {
     /// 系统级功能测试：真实 Junction/目录符号链接的悬空桥清理
     #[test]
     fn test_remove_dangling_host_bridge() {
-        let work = std::env::temp_dir().join(format!("dshpm-bridge-{}", std::process::id()));
+        // 进程 id 会被 Windows 复用：叠加毫秒时间戳，避免撞上历史失败运行残留的目录
+        let work = std::env::temp_dir().join(format!(
+            "dshpm-bridge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
         let _ = fs::remove_dir_all(&work);
+        // 无符号链接权限（非管理员且未开开发者模式）→ 跳过本系统级测试，不误报失败
+        let probe_target = work.join("probe-target");
+        fs::create_dir_all(&probe_target).unwrap();
+        let probe = work.join("probe-link");
+        if std::os::windows::fs::symlink_dir(&probe_target, &probe).is_err() {
+            let _ = fs::remove_dir_all(&work);
+            eprintln!("跳过：当前环境无目录符号链接权限（需管理员或开发者模式）");
+            return;
+        }
+        let _ = fs::remove_file(&probe);
         let profile = work.join("profiles").join("p1");
         let host = work.join("host");
         let pkg = profile.join("node_modules").join("my-plugin");
@@ -1046,4 +1086,49 @@ mod tests {
         assert_eq!(v2["dsh"]["profile"]["bundles"].as_array().unwrap().len(), 2);
         let _ = fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn test_import_zip_rejects_path_traversal() {
+        let work = std::env::temp_dir().join(format!("dshpm-slip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        let zip = work.join("evil.zip");
+        let f = fs::File::create(&zip).unwrap();
+        let mut zw = ZipWriter::new(f);
+        let opts = SimpleFileOptions::default();
+        zw.start_file(r"..\evil.txt", opts).unwrap();
+        zw.write_all(b"pwned").unwrap();
+        zw.finish().unwrap();
+        let target = work.join("profiles");
+        fs::create_dir_all(&target).unwrap();
+        let r = import_profile(&zip, &target);
+        assert!(r.is_err());
+        assert!(!target.join("evil.txt").exists(), "不得逃逸出解压目录");
+        let _ = fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn test_import_zip_top_level_folder() {
+        let work = std::env::temp_dir().join(format!("dshpm-folderzip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&work);
+        fs::create_dir_all(&work).unwrap();
+        let zip = work.join("folder.zip");
+        let f = fs::File::create(&zip).unwrap();
+        let mut zw = ZipWriter::new(f);
+        let opts = SimpleFileOptions::default();
+        zw.start_file("my-profile/package.json", opts).unwrap();
+        zw.write_all(br#"{"name":"my-profile","dependencies":{"@a/b":"1"}}"#).unwrap();
+        zw.start_file("my-profile/data/k.txt", opts).unwrap();
+        zw.write_all(b"keep").unwrap();
+        zw.finish().unwrap();
+        let target = work.join("profiles");
+        fs::create_dir_all(&target).unwrap();
+        let r = import_profile(&zip, &target).unwrap();
+        assert_eq!(r.final_name, "my-profile");
+        assert!(target.join("my-profile").join("package.json").is_file());
+        assert!(target.join("my-profile").join("data").join("k.txt").is_file());
+        assert!(!target.join(".import-tmp").exists(), "临时目录不应残留");
+        let _ = fs::remove_dir_all(&work);
+    }
+
 }
