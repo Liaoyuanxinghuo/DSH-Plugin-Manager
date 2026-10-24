@@ -1922,7 +1922,6 @@ async fn check_update_cmd() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let current = env!("CARGO_PKG_VERSION").to_string();
         let repo_url = format!("https://github.com/{PROJECT_REPO}");
-        let mirror = settings::load_settings().github_mirror;
 
         let mut latest = String::new();
         let mut err_hint = String::new();
@@ -2019,7 +2018,6 @@ fn asset_matches(name: &str, version: &str) -> bool {
 /// 从 GitHub API 的 release assets 里模糊匹配安装包（统一 ghnet 镜像轮询）
 fn find_setup_asset(version: &str) -> Result<(String, String), String> {
     let needle = format!("_{version}_x64-setup");
-    let mirror = settings::load_settings().github_mirror;
     let urls = [
         format!("https://api.github.com/repos/{PROJECT_REPO}/releases/latest"),
         format!("https://api.github.com/repos/{PROJECT_REPO}/releases/tags/V{version}"),
@@ -2057,30 +2055,9 @@ fn find_setup_asset(version: &str) -> Result<(String, String), String> {
     }
 }
 
-/// 同一资产的多下载通道（大陆无 VPN）：用户镜像 + 常见代理 + 直连，逐个短超时尝试。
-fn expand_download_urls(direct_url: &str, mirror: &str) -> Vec<String> {
-    let mut proxies: Vec<String> = vec![];
-    let m = mirror.trim().trim_end_matches('/').to_string();
-    if !m.is_empty() {
-        proxies.push(m);
-    }
-    for p in [
-        "https://ghfast.top",
-        "https://gh-proxy.com",
-        "https://ghproxy.net",
-        "https://ghp.ci",
-    ] {
-        if !proxies.iter().any(|x| x == p) {
-            proxies.push(p.to_string());
-        }
-    }
-    let mut out: Vec<String> = proxies
-        .iter()
-        .map(|p| format!("{p}/{direct_url}"))
-        .collect();
-    out.push(direct_url.to_string());
-    out
-}
+// 注：旧的自建下载通道展开（expand_download_urls，仅含用户主镜像 + 硬编码代理，
+// 用户自定义镜像列表不参与）已删除——所有下载统一走 ghnet::candidate_urls /
+// ghnet::send_get（主镜像 + 自定义列表 + 内置镜像 + 直连），自定义镜像全链路生效。
 
 /// 下载新版本安装包（走 GitHub 镜像，大陆无 VPN 可用）：
 /// release 资产命名固定：DSH Manager_{version}_x64-setup.exe
@@ -2096,7 +2073,6 @@ async fn download_update_cmd(version: String, app: tauri::AppHandle) -> Result<S
     if version.is_empty() || !version.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         return Err("无效的版本号".to_string());
     }
-    let mirror = settings::load_settings().github_mirror;
     // 优先按 release 资产列表模糊匹配（资产名包含 _{v}_x64-setup 即可）；
     // 拿不到资产列表时回退固定命名构造 URL
     // 优先 API 资产真实 URL；失败则按 tag 大小写 / 文件名点号或空格多候选回退
@@ -3762,17 +3738,6 @@ mod tests {
         );
         assert_eq!(status, 0);
         assert!(msg.contains("超时"), "{msg}");
-    }
-
-    #[test]
-    fn expand_download_urls_covers_mirror_and_direct() {
-        let urls = expand_download_urls(
-            "https://github.com/a/b/releases/download/V1/A_1_x64-setup.exe",
-            "https://ghfast.top",
-        );
-        assert!(urls.iter().any(|u| u.starts_with("https://ghfast.top/")));
-        assert!(urls.iter().any(|u| u.contains("gh-proxy.com")));
-        assert_eq!(urls.last().unwrap(), "https://github.com/a/b/releases/download/V1/A_1_x64-setup.exe");
     }
 
     #[test]

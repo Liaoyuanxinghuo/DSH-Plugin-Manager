@@ -463,7 +463,6 @@ const MARKET_INDEX_URL: &str =
 
 /// 拉取整合包市场索引（统一 ghnet 镜像轮询）
 pub fn read_market_index() -> Result<Vec<MarketPackEntry>, String> {
-    let mirror = crate::settings::load_settings().github_mirror;
     let (_used, body) = crate::ghnet::fetch_text(MARKET_INDEX_URL)
         .map_err(|e| format!("拉取整合包市场失败: {e}"))?;
     let idx: MarketIndex =
@@ -511,7 +510,6 @@ pub fn download_pack(
     cache_dir: &Path,
 ) -> Result<String, String> {
     fs::create_dir_all(cache_dir).map_err(|e| format!("创建缓存目录失败: {e}"))?;
-    let mirror = crate::settings::load_settings().github_mirror;
     let (_used, bytes) = crate::ghnet::fetch_bytes(url)
         .map_err(|e| format!("下载整合包失败: {e}"))?;
     let file_name = url

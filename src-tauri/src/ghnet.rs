@@ -19,10 +19,17 @@ pub const BUILTIN_GH_MIRRORS: &[&str] = &[
 /// 单通道超时（秒）
 pub const PER_MIRROR_TIMEOUT_SECS: u64 = 10;
 
-/// 生成候选 URL：用户设置镜像链（主镜像 + 自定义列表）→ 内置镜像 → 直连
+/// 生成候选 URL：用户设置镜像链（主镜像 + 自定义列表）→ 内置镜像 → 直连。
+/// `github_mirror_list()` 含用户自定义镜像——所有 GitHub 链路（检查更新 / 下载安装包 /
+/// 市场索引与整合包 / MinGit / DSH 下载）统一走此函数，自定义镜像全部生效。
 pub fn candidate_urls(direct_url: &str) -> Vec<String> {
-    let mut mirrors: Vec<String> = crate::settings::github_mirror_list();
-    for m in BUILTIN_GH_MIRRORS {
+    build_candidates(&crate::settings::github_mirror_list(), BUILTIN_GH_MIRRORS, direct_url)
+}
+
+/// candidate_urls 的纯函数核心（单测锁定镜像优先级：用户镜像在前、内置补齐、直连垫底）
+fn build_candidates(user_mirrors: &[String], builtin: &[&str], direct_url: &str) -> Vec<String> {
+    let mut mirrors: Vec<String> = user_mirrors.to_vec();
+    for m in builtin {
         let s = m.to_string();
         if !mirrors.iter().any(|x| x == &s) {
             mirrors.push(s);
@@ -165,5 +172,28 @@ mod tests {
         let len = resp.content_length().unwrap_or(0);
         println!("asset via {du}: content-length={len}");
         assert!(len > 100_000, "安装包应有百 KB 以上");
+    }
+
+    #[test]
+    fn build_candidates_custom_mirrors_take_priority() {
+        // 用户主镜像 + 自定义列表在前，内置补齐去重，直连垫底
+        let urls = build_candidates(
+            &["https://my.mirror.a".into(), "https://my.mirror.b".into()],
+            &["https://gh-proxy.com", "https://ghfast.top"],
+            "https://github.com/o/r/releases/download/v1/x.exe",
+        );
+        assert_eq!(urls[0], "https://my.mirror.a/https://github.com/o/r/releases/download/v1/x.exe");
+        assert_eq!(urls[1], "https://my.mirror.b/https://github.com/o/r/releases/download/v1/x.exe");
+        assert!(urls.iter().take(2).all(|u| u.contains("my.mirror")), "自定义镜像必须参与且优先");
+        // 内置镜像去重补齐（与用户镜像重复的不重复出现）
+        assert_eq!(urls.iter().filter(|u| u.contains("gh-proxy.com")).count(), 1);
+        // 直连始终最后
+        assert_eq!(urls.last().unwrap(), "https://github.com/o/r/releases/download/v1/x.exe");
+    }
+
+    #[test]
+    fn build_candidates_empty_user_mirrors_fall_to_builtin() {
+        let urls = build_candidates(&[], &["https://ghfast.top"], "https://github.com/a");
+        assert_eq!(urls, vec!["https://ghfast.top/https://github.com/a".to_string(), "https://github.com/a".to_string()]);
     }
 }
