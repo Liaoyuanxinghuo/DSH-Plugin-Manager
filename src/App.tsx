@@ -327,6 +327,10 @@ export default function App() {
   // 新建 / 删除 profile
   const [showCreateProfile, setShowCreateProfile] = useState(false);
   const [confirmDeleteProfile, setConfirmDeleteProfile] = useState<ProfileInfo | null>(null);
+  // 重命名 profile（右键菜单 / 行内 ✏ 按钮打开）
+  const [renameTarget, setRenameTarget] = useState<{ name: string; profilesDir: string } | null>(null);
+  // 右键行菜单（重命名 / 备注）
+  const [rowMenu, setRowMenu] = useState<{ name: string; profilesDir: string } | null>(null);
   // 官方桌面版（DeepSeek Harness.exe）运行状态探测
   const [officialDesktopStatus, setOfficialDesktopStatus] = useState<OfficialDesktopStatus | null>(null);
   const isDesktopProfile = selectedProfile.toLowerCase() === "desktop";
@@ -1219,6 +1223,47 @@ export default function App() {
     }
   };
 
+  // 重命名：打开前预检（desktop 禁改 / 运行中提示），执行后迁移排序与选中并刷新
+  const openRename = (p: ProfileInfo) => {
+    if (p.name.toLowerCase() === "desktop") {
+      setError("「desktop」是官方桌面客户端专属 Profile，不能重命名");
+      return;
+    }
+    if (runnings.some((r) => r.profile === p.name && r.profilesDir === p.profilesDir)) {
+      setError(`「${p.name}」正在运行，请先停止该实例后再重命名`);
+      return;
+    }
+    setRenameTarget({ name: p.name, profilesDir: p.profilesDir });
+  };
+
+  // 右键行菜单：点击页面任意处关闭（菜单容器自身 stopPropagation）
+  useEffect(() => {
+    if (!rowMenu) return;
+    const close = () => setRowMenu(null);
+    window.addEventListener("click", close);
+    return () => window.removeEventListener("click", close);
+  }, [rowMenu]);
+
+  const doRename = async (newName: string) => {
+    if (!selectedEnv || !renameTarget) return;
+    const { name: oldName, profilesDir } = renameTarget;
+    await api.renameProfile(selectedEnv, oldName, newName, profilesDir);
+    // 列表排序 key 迁移（name::dir → newName::dir，保持原位置不丢）
+    const oldId = `${oldName}::${profilesDir}`;
+    const newId = `${newName}::${profilesDir}`;
+    localStorage.setItem(
+      "dshpm-prof-order",
+      JSON.stringify(readStoredOrder("dshpm-prof-order").map((id) => (id === oldId ? newId : id))),
+    );
+    // 选中记忆跟着改（同名不同来源只动本目录的）
+    if (selectedProfile === oldName && selectedProfilesDir === profilesDir) {
+      setSelectedProfile(newName);
+    }
+    setRenameTarget(null);
+    pushToast(`已重命名：${oldName} → ${newName}`);
+    await loadProfiles();
+  };
+
   // 导出整合包：.dspack v3（DSH-PackForge 规范）
   const doExportPack = async (
     packName: string,
@@ -1926,10 +1971,50 @@ export default function App() {
                 }}
                 onContextMenu={(e) => {
                   e.preventDefault();
-                  setNoteTarget({ profile: p.name, profilesDir: p.profilesDir });
+                  setRowMenu(
+                    rowMenu?.name === p.name && rowMenu?.profilesDir === p.profilesDir
+                      ? null
+                      : { name: p.name, profilesDir: p.profilesDir },
+                  );
                 }}
-                title="右键可添加备注"
+                title="右键：重命名 / 备注"
               >
+                {/* 重命名入口：行右上角 hover 浮现的铅笔（desktop 归官方桌面客户端，禁改） */}
+                {p.name.toLowerCase() !== "desktop" && (
+                  <button
+                    className="row-edit-btn"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openRename(p);
+                    }}
+                    title={`重命名 profile「${p.name}」`}
+                  >
+                    <Icon name="edit" />
+                  </button>
+                )}
+                {/* 右键行菜单（重命名 / 备注）：点击页面其他处自动关闭 */}
+                {rowMenu?.name === p.name && rowMenu?.profilesDir === p.profilesDir && (
+                  <div className="row-menu" onClick={(e) => e.stopPropagation()}>
+                    <button
+                      className="row-menu-item"
+                      onClick={() => {
+                        setRowMenu(null);
+                        openRename(p);
+                      }}
+                    >
+                      <Icon name="edit" /> 重命名
+                    </button>
+                    <button
+                      className="row-menu-item"
+                      onClick={() => {
+                        setRowMenu(null);
+                        setNoteTarget({ profile: p.name, profilesDir: p.profilesDir });
+                      }}
+                    >
+                      📝 备注 / 适配版本
+                    </button>
+                  </div>
+                )}
                 <div className="profile-name">
                   <span className="drag-handle" title="拖动排序">☰</span>
                   {p.name}
@@ -2886,6 +2971,19 @@ export default function App() {
       )}
 
       {/* 备注对话框（右键 profile） */}
+      {/* 重命名对话框（右键菜单 / 行内 ✏ 打开） */}
+      {renameTarget && (
+        <RenameDialog
+          name={renameTarget.name}
+          profilesDir={renameTarget.profilesDir}
+          existingNames={profiles
+            .filter((x) => x.profilesDir === renameTarget.profilesDir)
+            .map((x) => x.name)}
+          onClose={() => setRenameTarget(null)}
+          onConfirm={doRename}
+        />
+      )}
+
       {noteTarget && (
         <NoteDialog
           profile={noteTarget.profile}
@@ -3402,7 +3500,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.25</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.26</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -3949,6 +4047,90 @@ function ImportDialog({
 }
 
 // ==================== 备注对话框（右键 profile，仅提示无约束） ====================
+// ==================== 重命名 Profile 对话框 ====================
+function RenameDialog({
+  name,
+  profilesDir,
+  existingNames,
+  onClose,
+  onConfirm,
+}: {
+  name: string;
+  profilesDir: string;
+  /** 同一 profiles 目录下的现有名称（重名校验用） */
+  existingNames: string[];
+  onClose: () => void;
+  onConfirm: (newName: string) => Promise<void>;
+}) {
+  const [value, setValue] = useState(name);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const trimmed = value.trim();
+  const invalid =
+    /[<>:"/\\|?*]/.test(trimmed) ||
+    trimmed !== value ||
+    trimmed.endsWith(".") ||
+    trimmed.split(".").some((seg) => seg === "");
+  const duplicate = existingNames.some(
+    (n) => n.toLowerCase() === trimmed.toLowerCase() && n.toLowerCase() !== name.toLowerCase(),
+  );
+  const reserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])\.?$/i.test(trimmed);
+  const same = trimmed.toLowerCase() === name.toLowerCase();
+  const canSubmit = trimmed.length > 0 && !invalid && !duplicate && !reserved && !same && !busy;
+  const submit = async () => {
+    if (!canSubmit) return;
+    setBusy(true);
+    setErr("");
+    try {
+      await onConfirm(trimmed);
+    } catch (e) {
+      setErr(String(e));
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="modal-mask" onClick={busy ? undefined : onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 420 }}>
+        <div className="modal-head">
+          <h3>重命名 Profile</h3>
+        </div>
+        <div className="modal-hint">
+          将「{name}」重命名（目录与 package.json 同步更新，备注与排序自动迁移）。
+          <br />
+          来源目录：<code>{profilesDir}</code>
+        </div>
+        <label>
+          新名称
+          <input
+            autoFocus
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit();
+            }}
+            placeholder="如：dev / test / 0.1.7-rc.2"
+          />
+        </label>
+        {invalid && (
+          <div className="ver-err">名称含 Windows 不允许的字符（&lt; &gt; : " / \ | ? *）、首尾空格或结尾点</div>
+        )}
+        {duplicate && <div className="ver-err">该目录下已存在同名 Profile</div>}
+        {reserved && <div className="ver-err">Windows 保留设备名（CON/NUL/COM1…）不能用作 Profile 名</div>}
+        {same && !invalid && <div className="ver-err">新名称与当前名称相同</div>}
+        {err && <div className="ver-err">{err}</div>}
+        <div className="modal-actions">
+          <button className="btn" onClick={onClose} disabled={busy}>
+            取消
+          </button>
+          <button className="btn primary" onClick={submit} disabled={!canSubmit}>
+            {busy ? "重命名中…" : "确认重命名"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function NoteDialog({
   profile,
   profilesDir,

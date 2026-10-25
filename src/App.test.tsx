@@ -2070,7 +2070,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.25", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.26", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -2097,27 +2097,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.25", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.26", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.25_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.26_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("下载 v0.3.25"));
+    await user.click(screen.getByText("下载 v0.3.26"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.25" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.26" });
     // 打开所在文件夹
     await user.click(screen.getByText("打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.25_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.26_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.25_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.26_x64-setup.exe" });
     });
   });
 });
@@ -2280,7 +2280,7 @@ describe("整合包导入导出与备注", () => {
     expect(nameInput.value).toBeTruthy();
   });
 
-  it("右键 profile 打开备注弹窗，保存调用 save_profile_note_cmd", async () => {
+  it("右键 profile 出行菜单，点「备注」打开弹窗，保存调用 save_profile_note_cmd", async () => {
     mockInvoke.mockClear();
     render(<App />);
     // 等列表渲染：用 .profile-item 存在性判断（右栏详情也会显示 profile 名，getByText 会多匹配）
@@ -2289,8 +2289,10 @@ describe("整合包导入导出与备注", () => {
     });
     const item = document.querySelector(".profile-item") as HTMLElement;
     fireEvent.contextMenu(item);
-    expect(screen.getByText(/备注「web」/)).toBeInTheDocument();
+    // 右键先出行菜单（重命名 / 备注），再点「备注」进弹窗
     const user = userEvent.setup();
+    await user.click(screen.getByText("📝 备注 / 适配版本"));
+    expect(screen.getByText(/备注「web」/)).toBeInTheDocument();
     await user.type(screen.getByPlaceholderText(/此 profile 用于/), "测试备注");
     await user.selectOptions(screen.getByRole("combobox"), "0.1.0-rc.7");
     await user.click(screen.getByText("保存备注"));
@@ -2709,5 +2711,56 @@ describe("同名多来源 Profile 与体积回填竞态", () => {
     await new Promise((r) => setTimeout(r, 80));
     const after = mockInvoke.mock.calls.filter(([c]) => c === "list_plugins").length;
     expect(after).toBe(before);
+  });
+});
+
+
+describe("重命名 Profile", () => {
+  it("行内 ✏ → 弹窗 → 确认：调用 rename_profile_cmd 并迁移排序 key 与选中", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "rename_profile_cmd") {
+        return Promise.resolve("C:\\Users\\test\\.dsh\\profiles\\web2");
+      }
+      return mockAllDefault(cmd);
+    });
+    localStorage.setItem(
+      "dshpm-prof-order",
+      JSON.stringify(["web::C:\\Users\\test\\.dsh\\profiles", "headless::C:\\Users\\test\\.dsh\\profiles"]),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("web")).toBeInTheDocument();
+    });
+    await user.click(screen.getByTitle("重命名 profile「web」"));
+    const input = screen.getByDisplayValue("web");
+    await user.clear(input);
+    await user.type(input, "web2");
+    await user.click(screen.getByText("确认重命名"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("rename_profile_cmd", {
+        envId: "global",
+        oldName: "web",
+        newName: "web2",
+        profilesDirStr: "C:\\Users\\test\\.dsh\\profiles",
+      });
+    });
+    // 排序 key 迁移（原位置不变），toast 提示
+    await waitFor(() => {
+      const order = JSON.parse(localStorage.getItem("dshpm-prof-order")!);
+      expect(order).toContain("web2::C:\\Users\\test\\.dsh\\profiles");
+      expect(order).not.toContain("web::C:\\Users\\test\\.dsh\\profiles");
+      expect(order).toContain("headless::C:\\Users\\test\\.dsh\\profiles");
+    });
+    expect(await screen.findByText(/已重命名：web → web2/)).toBeInTheDocument();
+  });
+
+  it("desktop 行不显示重命名按钮（官方桌面专属）", async () => {
+    render(<App />);
+    await waitFor(() => {
+      expect(screen.getByText("web")).toBeInTheDocument();
+    });
+    expect(screen.queryByTitle("重命名 profile「web」")).toBeInTheDocument();
+    expect(screen.queryByTitle(/重命名 profile「desktop」/)).not.toBeInTheDocument();
   });
 });

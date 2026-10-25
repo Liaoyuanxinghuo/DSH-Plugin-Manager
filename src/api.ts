@@ -141,6 +141,9 @@ export const api = {
     invoke<CreateProfileResult>("create_profile_cmd", { envId, name, profilesDirStr: profilesDir }),
   deleteProfile: (envId: string, name: string, profilesDir: string) =>
     invoke<void>("delete_profile_cmd", { envId, name, profilesDirStr: profilesDir }),
+  /** 重命名 profile（目录 rename + package.json 同步 + 备注迁移；运行中后端拒绝） */
+  renameProfile: (envId: string, oldName: string, newName: string, profilesDir: string) =>
+    invoke<string>("rename_profile_cmd", { envId, oldName, newName, profilesDirStr: profilesDir }),
   // M4 依赖健康 / 残留清理 / 诊断
   checkDeps: (envId: string, profile: string, profilesDir: string) =>
     invoke<DepIssue[]>("check_deps_cmd", { envId, profile, profilesDirStr: profilesDir }),

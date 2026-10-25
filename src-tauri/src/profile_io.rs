@@ -282,6 +282,93 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
+/// Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）不可作目录名
+fn is_windows_reserved_name(name: &str) -> bool {
+    let u = name.trim_end_matches('.').to_ascii_uppercase();
+    if matches!(u.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    for pre in ["COM", "LPT"] {
+        if let Some(rest) = u.strip_prefix(pre) {
+            if rest.len() == 1 && rest.chars().all(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// 重命名 profile：目录 rename + package.json 的 name 同步 + 右键备注 key 迁移。
+/// 校验：desktop 禁改；新名非空/无非法字符/非 Windows 保留名；目标不冲突。
+/// 运行中检查由命令层完成（需要 running 表）。
+pub fn rename_profile(profiles_dir: &Path, old: &str, new: &str) -> Result<String, String> {
+    if old.trim().eq_ignore_ascii_case("desktop") {
+        return Err("「desktop」是官方桌面客户端专属 Profile，不能重命名".to_string());
+    }
+    let src = profiles_dir.join(old);
+    if !src.is_dir() {
+        return Err(format!("Profile「{old}」不存在：{}", src.display()));
+    }
+    let new_trim = new.trim();
+    if new_trim.is_empty() {
+        return Err("新名称不能为空".to_string());
+    }
+    if sanitize_name(new_trim) != new_trim {
+        return Err("新名称含 Windows 不允许的字符（< > : \" / \\ | ? *）、首尾空格或结尾点".to_string());
+    }
+    if is_windows_reserved_name(new_trim) {
+        return Err(format!("「{new_trim}」是 Windows 保留设备名，不能用作 Profile 名"));
+    }
+    if new_trim.eq_ignore_ascii_case(old) {
+        return Ok(src.to_string_lossy().to_string()); // 大小写差异外的同名：幂等成功
+    }
+    let dst = profiles_dir.join(new_trim);
+    if dst.exists() {
+        return Err(format!("目标名称「{new_trim}」已存在，请换一个"));
+    }
+    fs::rename(&src, &dst).map_err(|e| format!("重命名目录失败: {e}"))?;
+
+    // package.json 的 name 同步为目录名（serde_json 可能重排键序，对 npm/dsh 无影响）
+    let pj = dst.join("package.json");
+    if let Ok(raw) = fs::read_to_string(&pj) {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            let need = v
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n != new_trim)
+                .unwrap_or(true);
+            if need {
+                if let serde_json::Value::Object(ref mut map) = v {
+                    map.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(new_trim.to_string()),
+                    );
+                }
+                if let Ok(out) = serde_json::to_string_pretty(&v) {
+                    let _ = fs::write(&pj, out + "\n");
+                }
+            }
+        }
+    }
+
+    // 右键备注 key 迁移（name::profilesDir → 新名::profilesDir；空 note 写入即删除旧 key）
+    let pd = profiles_dir.to_string_lossy().to_string();
+    let old_key = crate::packforge::note_key(old, &pd);
+    let new_key = crate::packforge::note_key(new_trim, &pd);
+    let notes = crate::packforge::load_notes();
+    if let Some(n) = notes.get(&old_key).cloned() {
+        let _ = crate::packforge::save_note(&new_key, &n);
+        let _ = crate::packforge::save_note(
+            &old_key,
+            &crate::packforge::ProfileNote {
+                note: String::new(),
+                hint_version: String::new(),
+            },
+        );
+    }
+    Ok(dst.to_string_lossy().to_string())
+}
+
 /// 导出诊断包：DSH_HOME 配置 + 会话/存储摘要 + 各 profile 元数据（不含 node_modules）
 pub fn export_diag(home_dir: &Path, target_zip: &Path) -> Result<ExportResult, String> {
     if let Some(dir) = target_zip.parent() {
@@ -1131,4 +1218,57 @@ mod tests {
         let _ = fs::remove_dir_all(&work);
     }
 
+
+    #[test]
+    fn test_rename_profile_success_and_conflicts() {
+        let work = std::env::temp_dir().join(format!(
+            "dshpm-rename-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        let _ = fs::remove_dir_all(&work);
+        let profiles = work.join("profiles");
+        let p = profiles.join("old");
+        fs::create_dir_all(&p).unwrap();
+        fs::write(
+            p.join("package.json"),
+            r#"{"name":"old","dependencies":{"@a/b":"^1.0.0"}}"#,
+        )
+        .unwrap();
+
+        // 成功：目录改名 + package.json name 同步
+        let r = rename_profile(&profiles, "old", "new-name").unwrap();
+        assert!(r.contains("new-name"));
+        assert!(profiles.join("new-name").is_dir());
+        assert!(!profiles.join("old").exists());
+        let pj: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(profiles.join("new-name").join("package.json")).unwrap())
+                .unwrap();
+        assert_eq!(pj["name"].as_str(), Some("new-name"));
+        assert_eq!(pj["dependencies"]["@a/b"].as_str(), Some("^1.0.0"), "其余字段保留");
+
+        // 同名幂等成功
+        assert!(rename_profile(&profiles, "new-name", "new-name").is_ok());
+
+        // desktop 拒绝
+        fs::create_dir_all(profiles.join("desktop")).unwrap();
+        let e = rename_profile(&profiles, "desktop", "x").unwrap_err();
+        assert!(e.contains("官方桌面"));
+
+        // 重名冲突拒绝
+        fs::create_dir_all(profiles.join("taken")).unwrap();
+        assert!(rename_profile(&profiles, "new-name", "taken").is_err());
+
+        // 非法字符 / 保留名 / 空名 / 不存在
+        assert!(rename_profile(&profiles, "new-name", "a<b").is_err());
+        assert!(rename_profile(&profiles, "new-name", "CON").is_err());
+        assert!(rename_profile(&profiles, "new-name", "  ").is_err());
+        assert!(rename_profile(&profiles, "nope", "x").is_err());
+
+        let _ = fs::remove_dir_all(&work);
+    }
 }
+

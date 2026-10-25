@@ -7,7 +7,7 @@ import React from "react";
 export type IconName =
   | "gear" | "refresh" | "folder" | "trash" | "x" | "play" | "stop"
   | "info" | "warning" | "globe" | "broom" | "floppy" | "export"
-  | "import" | "package" | "download" | "upload" | "desktop" | "plus";
+  | "import" | "package" | "download" | "upload" | "desktop" | "plus" | "edit";
 
 const PATHS: Record<IconName, string> = {
   gear:
@@ -45,6 +45,8 @@ const PATHS: Record<IconName, string> = {
     "M24,200H232a8,8,0,0,0,0-16h-8V64a16,16,0,0,0-16-16H48A16,16,0,0,0,32,64V184H24a8,8,0,0,0,0,16ZM48,64H208V184H48ZM144,208H112a8,8,0,0,0,0,16h32a8,8,0,0,0,0-16Z",
   plus:
     "M224,128a8,8,0,0,1-8,8H136v80a8,8,0,0,1-16,0V136H40a8,8,0,0,1,0-16h80V40a8,8,0,0,1,16,0v80h80A8,8,0,0,1,224,128Z",
+  edit:
+    "M227.31,73.37,182.63,28.68a16,16,0,0,0-22.63,0L36.69,152A15.86,15.86,0,0,0,32,163.31V208a16,16,0,0,0,16,16H92.69A15.86,15.86,0,0,0,104,219.31L227.31,96a16,16,0,0,0,0-22.63ZM92.69,208H48V163.31l88-88L180.69,120ZM192,108.68,147.31,64l24-24L216,84.68Z",
 };
 
 export function Icon({

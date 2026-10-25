@@ -1776,6 +1776,39 @@ async fn delete_profile_cmd(
 
 // ==================== 命令：M5 设置 / DSH 多版本下载 ====================
 
+/// 重命名 profile（目录 rename + package.json 同步 + 备注迁移；运行中拒绝）
+#[tauri::command]
+async fn rename_profile_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    old_name: String,
+    new_name: String,
+    profiles_dir_str: String,
+) -> Result<String, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
+    if !profiles_dir.is_dir() {
+        return Err(format!("profiles 目录不存在: {}", profiles_dir.display()));
+    }
+    // 运行中的实例锚定旧目录名（进程参数/日志/token），改名会失联 → 拒绝
+    let running = state
+        .running
+        .lock()
+        .unwrap()
+        .values()
+        .any(|p| p.profile == old_name && p.profiles_dir == profiles_dir);
+    if running {
+        return Err(format!(
+            "「{old_name}」正在运行，请先停止该实例后再重命名"
+        ));
+    }
+    let pd = profiles_dir.clone();
+    let (o, n) = (old_name.clone(), new_name.clone());
+    tauri::async_runtime::spawn_blocking(move || profile_io::rename_profile(&pd, &o, &n))
+        .await
+        .map_err(|e| format!("重命名任务失败：{e}"))?
+}
+
 /// 读取设置
 #[tauri::command]
 async fn get_settings_cmd() -> settings::Settings {
@@ -3240,6 +3273,7 @@ pub fn run() {
             list_profiles,
             create_profile_cmd,
             delete_profile_cmd,
+            rename_profile_cmd,
             open_devtools_cmd,
             list_plugins,
             set_plugin_enabled_cmd,
@@ -3573,13 +3607,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.25_x64-setup.exe", "0.3.25"));
-        assert!(asset_matches("dsh-manager_0.3.25_x64-setup.exe", "0.3.25"));
-        assert!(asset_matches("任意名_0.3.25_x64-setup.exe", "0.3.25"));
-        assert!(!asset_matches("DSH-Manager-0.3.25-win-x64.exe", "0.3.25"));
-        assert!(!asset_matches("DSH Manager_0.3.25_x64-setup.exe.sha256", "0.3.25"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.25"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.25"));
+        assert!(asset_matches("DSH Manager_0.3.26_x64-setup.exe", "0.3.26"));
+        assert!(asset_matches("dsh-manager_0.3.26_x64-setup.exe", "0.3.26"));
+        assert!(asset_matches("任意名_0.3.26_x64-setup.exe", "0.3.26"));
+        assert!(!asset_matches("DSH-Manager-0.3.26-win-x64.exe", "0.3.26"));
+        assert!(!asset_matches("DSH Manager_0.3.26_x64-setup.exe.sha256", "0.3.26"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.26"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.26"));
     }
 
     #[test]
@@ -3712,10 +3746,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.25_x64-setup.exe", "0.3.25"));
+        assert!(asset_matches("DSH.Manager_0.3.26_x64-setup.exe", "0.3.26"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.25_x64-setup.exe", "0.3.25"));
-        assert!(asset_matches("DSH.MANAGER_0.3.25_X64-SETUP.EXE", "0.3.25"));
+        assert!(asset_matches("dsh.manager_0.3.26_x64-setup.exe", "0.3.26"));
+        assert!(asset_matches("DSH.MANAGER_0.3.26_X64-SETUP.EXE", "0.3.26"));
     }
 
     #[test]
@@ -3723,7 +3757,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.25", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.26", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

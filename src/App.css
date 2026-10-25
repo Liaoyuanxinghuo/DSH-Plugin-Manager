@@ -228,6 +228,14 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 [data-theme="light"] .tag.bundle { background: var(--accent-soft); color: var(--accent-text); border: 1px solid var(--ok-border); }
 [data-theme="deepseek"] .tag.bundle { background: var(--accent-soft); color: var(--accent-text); border: 1px solid var(--info-border); }
 .tag.off { background: var(--danger-soft); color: var(--danger); }
+/* 右键行菜单（重命名 / 备注）：浮层定位于行内右上，点页面其他处关闭 */
+.row-menu { position: absolute; right: 8px; top: 30px; z-index: 50; display: flex; flex-direction: column; min-width: 160px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 4px; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.4); }
+.row-menu-item { background: transparent; border: none; color: var(--text); text-align: left; padding: 7px 10px; font-size: 13px; border-radius: 6px; cursor: pointer; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.row-menu-item:hover { background: var(--btn-hover); }
+/* 行右上角 hover 浮现的重命名铅笔：平时隐形不占空间，移入该行才淡入 */
+.row-edit-btn { position: absolute; top: 7px; right: 8px; z-index: 5; width: 22px; height: 22px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text-dim); cursor: pointer; opacity: 0; pointer-events: none; transition: opacity 0.12s; }
+.profile-item:hover .row-edit-btn, .row-edit-btn:focus-visible { opacity: 1; pointer-events: auto; }
+.row-edit-btn:hover { border-color: var(--accent); color: var(--accent); background: var(--btn-hover); }
 [data-theme="light"] .tag.off,
 [data-theme="deepseek"] .tag.off { background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger-border); }
 .tag.note { background: var(--info-soft); color: var(--info); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
