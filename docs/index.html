@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DSH Manager · 车同轨，书同文</title>
+<meta name="description" content="DSH Manager —— 面向 DeepSeek Harness 的桌面管理工具。多版本共存、插件管理、Profile 与整合包（.dspack）、多实例并行，全程图形化，开箱即用。" />
+<meta property="og:title" content="DSH Manager · 车同轨，书同文" />
+<meta property="og:description" content="DSH 的多版本、插件、Profile 与整合包，从此归于一统。无需本地环境，无需命令行。" />
+<meta property="og:type" content="website" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0e13'/%3E%3Cpath d='M32 12 L52 32 L32 52 L12 32 Z' fill='none' stroke='%232fbf8f' stroke-width='5'/%3E%3Ccircle cx='32' cy='32' r='6' fill='%232fbf8f'/%3E%3C/svg%3E" />
+<style>
+  :root {
+    --bg: #0a0e13;
+    --bg-2: #0d1219;
+    --panel: #101720;
+    --panel-2: #141c27;
+    --line: rgba(160, 180, 200, 0.12);
+    --line-strong: rgba(160, 180, 200, 0.22);
+    --text: #e8edf4;
+    --text-2: #a8b4c4;
+    --text-3: #6b7889;
+    --jade: #2fbf8f;
+    --jade-2: #2fd3c5;
+    --jade-soft: rgba(47, 191, 143, 0.12);
+    --serif: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
+    --sans: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    --mono: "Cascadia Code", Consolas, "SF Mono", monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.75;
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: rgba(47, 191, 143, 0.28); }
+  a { color: inherit; text-decoration: none; }
+
+  /* ===== 氛围层：辉光 + 细网格 + 颗粒 ===== */
+  .atmosphere { position: fixed; inset: 0; pointer-events: none; z-index: 0; }
+  .glow-a { position: absolute; top: -260px; right: -180px; width: 780px; height: 780px;
+    background: radial-gradient(circle, rgba(47, 191, 143, 0.13), transparent 62%); }
+  .glow-b { position: absolute; top: 42%; left: -320px; width: 720px; height: 720px;
+    background: radial-gradient(circle, rgba(45, 120, 200, 0.08), transparent 65%); }
+  .glow-c { position: absolute; bottom: -300px; right: 8%; width: 680px; height: 680px;
+    background: radial-gradient(circle, rgba(47, 211, 197, 0.07), transparent 65%); }
+  .grid-lines { position: absolute; inset: 0; opacity: 0.5;
+    background-image:
+      linear-gradient(rgba(150, 175, 200, 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(150, 175, 200, 0.045) 1px, transparent 1px);
+    background-size: 88px 88px;
+    mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, #000 20%, transparent 78%);
+    -webkit-mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, #000 20%, transparent 78%);
+  }
+  .grain { position: absolute; inset: 0; opacity: 0.05; mix-blend-mode: overlay;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E"); }
+
+  .shell { position: relative; z-index: 1; }
+  .wrap { width: min(1120px, calc(100% - 48px)); margin: 0 auto; }
+
+  /* ===== 导航 ===== */
+  .nav {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+    background: rgba(10, 14, 19, 0.72);
+    border-bottom: 1px solid var(--line);
+  }
+  .nav-inner { display: flex; align-items: center; justify-content: space-between; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; letter-spacing: 0.02em; }
+  .brand svg { flex-shrink: 0; }
+  .brand .lat { color: var(--text-3); font-family: var(--serif); font-style: italic; font-weight: 400; font-size: 13px; letter-spacing: 0.14em; margin-left: 2px; }
+  .nav-links { display: flex; align-items: center; gap: 30px; font-size: 13.5px; color: var(--text-2); }
+  .nav-links a { transition: color 0.2s; position: relative; }
+  .nav-links a:hover { color: var(--text); }
+  .nav-links a::after { content: ""; position: absolute; left: 0; bottom: -6px; height: 1px; width: 0; background: var(--jade); transition: width 0.25s; }
+  .nav-links a:hover::after { width: 100%; }
+  .nav-gh { display: inline-flex; align-items: center; gap: 7px; padding: 8px 16px; font-size: 13px;
+    border: 1px solid var(--line-strong); border-radius: 999px; color: var(--text-2);
+    transition: all 0.25s; }
+  .nav-gh:hover { border-color: var(--jade); color: var(--text); box-shadow: 0 0 24px rgba(47, 191, 143, 0.18); }
+
+  /* ===== Hero ===== */
+  .hero { padding: 110px 0 40px; position: relative; }
+  .hero-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 56px; align-items: center; }
+  .eyebrow { display: inline-flex; align-items: center; gap: 12px; font-family: var(--mono);
+    font-size: 11px; letter-spacing: 0.32em; color: var(--jade); text-transform: uppercase; }
+  .eyebrow::before { content: ""; width: 34px; height: 1px; background: linear-gradient(90deg, var(--jade), transparent); }
+  h1.hero-title {
+    margin: 20px 0 18px;
+    font-size: clamp(34px, 5.4vw, 58px);
+    line-height: 1.18;
+    letter-spacing: -0.01em;
+    font-weight: 700;
+  }
+  /* 短语锁行：整个标题一行放不下时只在逗号后换行，绝不从词中断开 */
+  h1.hero-title .nb { white-space: nowrap; }
+  h1.hero-title em { font-style: normal; color: transparent;
+    background: linear-gradient(120deg, var(--jade) 20%, var(--jade-2) 80%);
+    -webkit-background-clip: text; background-clip: text; }
+  .hero-lede { max-width: 26em; color: var(--text-2); font-size: clamp(15.5px, 1.5vw, 18px); line-height: 1.8; }
+  .hero-lede strong { color: var(--text); font-weight: 650; }
+  .hero-sub { max-width: 30em; color: var(--text-3); font-size: 13.5px; margin-top: 10px; }
+  .cta-row { display: flex; gap: 14px; margin-top: 34px; flex-wrap: wrap; }
+  .btn { display: inline-flex; align-items: center; gap: 9px; padding: 13px 28px; border-radius: 10px;
+    font-size: 15px; font-weight: 600; cursor: pointer; border: none; transition: all 0.28s cubic-bezier(0.22, 0.61, 0.36, 1); }
+  .btn-primary { background: linear-gradient(135deg, var(--jade), #24a87c); color: #04130d;
+    box-shadow: 0 10px 34px rgba(47, 191, 143, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.25); }
+  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 16px 44px rgba(47, 191, 143, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.25); }
+  .btn-ghost { background: transparent; color: var(--text); border: 1px solid var(--line-strong); }
+  .btn-ghost:hover { border-color: var(--jade); background: var(--jade-soft); transform: translateY(-2px); }
+  .hero-meta { display: flex; gap: 22px; margin-top: 26px; flex-wrap: wrap;
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.06em; color: var(--text-3); }
+  .hero-meta span { display: inline-flex; align-items: center; gap: 7px; }
+  .hero-meta i { width: 4px; height: 4px; border-radius: 50%; background: var(--jade); font-style: normal; }
+
+  /* ===== 三栏界面 Mock ===== */
+  .hero-visual { position: relative; }
+  .app-mock {
+    position: relative; border-radius: 16px; padding: 1px;
+    background: linear-gradient(155deg, rgba(47, 191, 143, 0.4), rgba(160, 180, 200, 0.12) 38%, rgba(160, 180, 200, 0.06));
+    box-shadow: 0 40px 90px rgba(0, 0, 0, 0.55), 0 0 80px rgba(47, 191, 143, 0.1);
+    transform: perspective(1400px) rotateY(-4deg) rotateX(2deg);
+    transition: transform 0.5s ease;
+  }
+  .app-mock:hover { transform: perspective(1400px) rotateY(-1deg) rotateX(0.5deg) translateY(-4px); }
+  .mock-inner { background: #0c1117; border-radius: 15px; overflow: hidden; }
+  .mock-bar { display: flex; align-items: center; gap: 8px; padding: 11px 14px;
+    background: rgba(20, 28, 39, 0.9); border-bottom: 1px solid var(--line); }
+  .mock-bar .dot { width: 9px; height: 9px; border-radius: 50%; }
+  .mock-bar .t { margin-left: 8px; font-size: 11px; color: var(--text-3); font-family: var(--mono); letter-spacing: 0.08em; }
+  .mock-cols { display: grid; grid-template-columns: 108px 118px 1fr; gap: 1px; background: var(--line); min-height: 300px; }
+  .mock-col { background: #0c1117; padding: 12px 10px; }
+  .mock-h { font-size: 10px; color: var(--text-3); letter-spacing: 0.12em; text-transform: uppercase;
+    font-family: var(--mono); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+  .mock-pill { font-size: 8.5px; padding: 1px 7px; border-radius: 99px; background: var(--jade-soft); color: var(--jade); letter-spacing: 0.04em; }
+  .mock-item { padding: 7px 9px; border-radius: 7px; background: var(--panel); border: 1px solid transparent;
+    margin-bottom: 6px; font-size: 10.5px; color: var(--text-2); display: flex; align-items: center; gap: 6px;
+    transition: all 0.3s; }
+  .mock-item.on { border-color: rgba(47, 191, 143, 0.5); background: var(--jade-soft); color: var(--text); }
+  .mock-item .d { width: 5px; height: 5px; border-radius: 50%; background: var(--text-3); flex-shrink: 0; }
+  .mock-item.on .d { background: var(--jade); box-shadow: 0 0 8px var(--jade); }
+  .mock-item .dim { font-size: 8.5px; color: var(--text-3); margin-left: auto; }
+  .mock-tag { display: inline-block; font-size: 7.5px; padding: 0.5px 5px; border-radius: 4px;
+    background: rgba(59, 130, 246, 0.18); color: #7ab0ff; margin-left: 4px; }
+  .mock-run { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 9px 11px; border-radius: 8px; background: var(--panel); border: 1px solid rgba(47, 191, 143, 0.25); margin-bottom: 10px; }
+  .mock-run .st { font-size: 10px; color: var(--jade); display: flex; align-items: center; gap: 6px; }
+  .mock-run .st i { width: 6px; height: 6px; border-radius: 50%; background: var(--jade); animation: pulse 2s infinite; }
+  .mock-btns { display: flex; gap: 5px; margin-bottom: 12px; }
+  .mock-btn { flex: 1; text-align: center; font-size: 9px; padding: 5px 0; border-radius: 6px;
+    background: var(--panel-2); color: var(--text-2); border: 1px solid var(--line); }
+  .mock-btn.p { background: var(--jade); color: #04130d; border-color: var(--jade); font-weight: 600; }
+  .mock-plug { display: flex; align-items: center; gap: 7px; padding: 6.5px 9px; border-radius: 7px;
+    background: var(--panel); margin-bottom: 5px; font-size: 10px; color: var(--text-2); }
+  .mock-plug .sw { margin-left: auto; width: 22px; height: 12px; border-radius: 99px; background: var(--jade); position: relative; flex-shrink: 0; }
+  .mock-plug .sw::after { content: ""; position: absolute; top: 2px; right: 2px; width: 8px; height: 8px; border-radius: 50%; background: #fff; }
+  .mock-plug .sw.off { background: var(--surface-muted, #2a3646); }
+  .mock-plug .sw.off::after { right: auto; left: 2px; opacity: 0.6; }
+  .mock-plug .ver { font-family: var(--mono); font-size: 8px; color: var(--text-3); }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(47, 191, 143, 0.5); } 50% { box-shadow: 0 0 0 5px rgba(47, 191, 143, 0); } }
+
+  /* ===== 通用 Section ===== */
+  section { padding: 104px 0; position: relative; }
+  .sec-head { max-width: 640px; margin-bottom: 58px; }
+  .sec-head h2 { font-size: clamp(28px, 3.6vw, 42px); line-height: 1.25; letter-spacing: -0.01em; margin: 16px 0 14px; font-weight: 700; }
+  .sec-head p { color: var(--text-2); font-size: 15.5px; }
+  .sec-head .lat-line { font-family: var(--serif); font-style: italic; color: var(--text-3); letter-spacing: 0.16em; font-size: 13px; }
+
+  /* ===== 痛点 ===== */
+  .pain-list { border-top: 1px solid var(--line); }
+  .pain-row { display: grid; grid-template-columns: 88px minmax(0, 1fr) minmax(0, 1.15fr); gap: 28px;
+    padding: 30px 8px; border-bottom: 1px solid var(--line); align-items: baseline; transition: background 0.3s; }
+  .pain-row:hover { background: linear-gradient(90deg, var(--jade-soft), transparent 70%); }
+  .pain-no { font-family: var(--serif); font-size: 30px; color: var(--text-3); font-style: italic; transition: color 0.3s; }
+  .pain-row:hover .pain-no { color: var(--jade); }
+  .pain-q { font-size: 17px; font-weight: 600; }
+  .pain-a { color: var(--text-2); font-size: 14.5px; }
+  .pain-a b { color: var(--jade); font-weight: 600; }
+
+  /* ===== 功能卡片 ===== */
+  .feat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+  .feat-card { position: relative; padding: 30px 26px 28px; border-radius: 14px;
+    background: linear-gradient(170deg, var(--panel), rgba(16, 23, 32, 0.4));
+    border: 1px solid var(--line); overflow: hidden; transition: all 0.35s cubic-bezier(0.22, 0.61, 0.36, 1); }
+  .feat-card::before { content: ""; position: absolute; top: 0; left: 24px; right: 24px; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(47, 191, 143, 0.55), transparent);
+    opacity: 0; transition: opacity 0.35s; }
+  .feat-card:hover { transform: translateY(-5px); border-color: rgba(47, 191, 143, 0.35);
+    box-shadow: 0 24px 52px rgba(0, 0, 0, 0.4), 0 0 42px rgba(47, 191, 143, 0.08); }
+  .feat-card:hover::before { opacity: 1; }
+  .feat-icon { width: 44px; height: 44px; border-radius: 11px; display: flex; align-items: center; justify-content: center;
+    background: var(--jade-soft); border: 1px solid rgba(47, 191, 143, 0.25); margin-bottom: 18px; color: var(--jade); }
+  .feat-card h3 { font-size: 17px; margin-bottom: 9px; font-weight: 650; letter-spacing: 0.01em; }
+  .feat-card p { color: var(--text-2); font-size: 13.5px; line-height: 1.85; }
+  .feat-card .idx { position: absolute; top: 20px; right: 22px; font-family: var(--serif); font-style: italic;
+    font-size: 15px; color: var(--text-3); opacity: 0.6; }
+
+  /* ===== 整合包专题 ===== */
+  .pack-band { position: relative; border-radius: 20px; padding: 64px 58px; overflow: hidden;
+    background: linear-gradient(135deg, rgba(47, 191, 143, 0.1), rgba(20, 28, 39, 0.6) 46%, rgba(45, 120, 200, 0.09));
+    border: 1px solid rgba(47, 191, 143, 0.22); }
+  .pack-band::before { content: ".dspack"; position: absolute; right: -30px; bottom: -52px;
+    font-family: var(--serif); font-style: italic; font-size: 170px; color: rgba(47, 191, 143, 0.06);
+    letter-spacing: -0.03em; user-select: none; pointer-events: none; }
+  .pack-band h2 { font-size: clamp(26px, 3.2vw, 38px); line-height: 1.3; max-width: 17em; margin-bottom: 16px; }
+  .pack-band h2 em { font-style: normal; color: var(--jade); }
+  .pack-band > p { color: var(--text-2); max-width: 36em; font-size: 15px; }
+  .pack-chips { display: flex; gap: 12px; margin-top: 32px; flex-wrap: wrap; }
+  .chip { display: inline-flex; align-items: center; gap: 9px; padding: 11px 20px; border-radius: 99px;
+    background: rgba(10, 14, 19, 0.55); border: 1px solid var(--line-strong); font-size: 13.5px; color: var(--text); }
+  .chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--jade); font-style: normal; flex-shrink: 0; }
+  .chip small { color: var(--text-3); font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.05em; }
+
+  /* ===== 步骤 ===== */
+  .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; counter-reset: st; }
+  .step { position: relative; padding: 28px 22px 26px; border-radius: 13px;
+    border: 1px solid var(--line); background: rgba(16, 23, 32, 0.5); }
+  .step::after { content: ""; position: absolute; top: 50%; right: -15px; width: 16px; height: 1px; background: var(--line-strong); }
+  .step:last-child::after { display: none; }
+  .step .no { font-family: var(--mono); font-size: 11px; letter-spacing: 0.22em; color: var(--jade); margin-bottom: 14px; }
+  .step h4 { font-size: 15.5px; margin-bottom: 8px; font-weight: 650; }
+  .step p { color: var(--text-2); font-size: 12.5px; line-height: 1.8; }
+
+  /* ===== 下载 ===== */
+  .dl-zone { text-align: center; padding: 110px 0 120px; }
+  .dl-zone .sec-head { margin: 0 auto 48px; text-align: center; }
+  .dl-zone .sec-head .eyebrow { justify-content: center; }
+  .dl-zone .sec-head .eyebrow::before { display: none; }
+  .dl-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 380px)); gap: 20px; justify-content: center; }
+  .dl-card { padding: 34px 30px; border-radius: 16px; text-align: left; position: relative; overflow: hidden;
+    background: linear-gradient(175deg, var(--panel-2), var(--panel)); border: 1px solid var(--line-strong);
+    transition: all 0.35s; }
+  .dl-card:hover { transform: translateY(-5px); border-color: rgba(47, 191, 143, 0.5);
+    box-shadow: 0 28px 64px rgba(0, 0, 0, 0.5), 0 0 48px rgba(47, 191, 143, 0.12); }
+  .dl-card .kind { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.24em; color: var(--jade); text-transform: uppercase; }
+  .dl-card h3 { font-size: 21px; margin: 12px 0 8px; font-weight: 700; }
+  .dl-card p { color: var(--text-2); font-size: 13px; min-height: 3.2em; }
+  .dl-card .btn { margin-top: 20px; width: 100%; justify-content: center; }
+  .dl-note { margin-top: 30px; color: var(--text-3); font-size: 12.5px; }
+  .dl-note a { color: var(--text-2); border-bottom: 1px solid var(--line-strong); transition: all 0.2s; }
+  .dl-note a:hover { color: var(--jade); border-color: var(--jade); }
+  .ver-badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 16px; border-radius: 99px;
+    background: var(--jade-soft); border: 1px solid rgba(47, 191, 143, 0.3); color: var(--jade);
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; margin-bottom: 22px; }
+
+  /* ===== Footer ===== */
+  footer { border-top: 1px solid var(--line); padding: 40px 0 52px; }
+  .foot-inner { display: flex; align-items: center; justify-content: space-between; gap: 24px; flex-wrap: wrap; }
+  .foot-brand { display: flex; align-items: center; gap: 10px; color: var(--text-3); font-size: 13px; }
+  .foot-links { display: flex; gap: 26px; font-size: 13px; color: var(--text-3); }
+  .foot-links a:hover { color: var(--jade); }
+  .foot-lic { font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; color: var(--text-3); }
+
+  /* ===== 入场动画 ===== */
+  .rise { opacity: 0; transform: translateY(26px); transition: opacity 0.85s cubic-bezier(0.22, 0.61, 0.36, 1), transform 0.85s cubic-bezier(0.22, 0.61, 0.36, 1); transition-delay: var(--d, 0s); }
+  .rise.in { opacity: 1; transform: none; }
+  .hero .rise { animation: hero-in 0.9s cubic-bezier(0.22, 0.61, 0.36, 1) both; animation-delay: var(--d, 0s); }
+  @keyframes hero-in { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: none; } }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+    .rise { opacity: 1; transform: none; }
+  }
+
+  /* ===== 响应式 ===== */
+  @media (max-width: 980px) {
+    .hero-grid { grid-template-columns: 1fr; gap: 60px; }
+    .hero { padding-top: 76px; }
+    .feat-grid { grid-template-columns: repeat(2, 1fr); }
+    .steps { grid-template-columns: repeat(2, 1fr); }
+    .step::after { display: none; }
+    .pain-row { grid-template-columns: 56px 1fr; }
+    .pain-a { grid-column: 2; }
+    .pack-band { padding: 44px 30px; }
+  }
+  @media (max-width: 640px) {
+    .wrap { width: calc(100% - 36px); }
+    .nav-links { display: none; }
+    .feat-grid, .steps, .dl-cards { grid-template-columns: 1fr; }
+    .hero-meta { gap: 12px; }
+    .pack-band::before { font-size: 92px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="atmosphere" aria-hidden="true">
+  <div class="glow-a"></div><div class="glow-b"></div><div class="glow-c"></div>
+  <div class="grid-lines"></div><div class="grain"></div>
+</div>
+
+<div class="shell">
+
+  <!-- 导航 -->
+  <nav class="nav">
+    <div class="wrap nav-inner">
+      <a class="brand" href="#top">
+        <svg width="26" height="26" viewBox="0 0 64 64" aria-hidden="true">
+          <path d="M32 8 L56 32 L32 56 L8 32 Z" fill="none" stroke="#2fbf8f" stroke-width="5"/>
+          <circle cx="32" cy="32" r="6" fill="#2fbf8f"/>
+        </svg>
+        DSH Manager <span class="lat">車同軌・書同文</span>
+      </a>
+      <div class="nav-links">
+        <a href="#why">解决什么</a>
+        <a href="#features">功能</a>
+        <a href="#pack">整合包</a>
+        <a href="#start">上手</a>
+        <a href="#download">下载</a>
+      </div>
+      <a class="nav-gh" href="https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager" target="_blank" rel="noopener">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
+        源码
+      </a>
+    </div>
+  </nav>
+
+  <!-- Hero -->
+  <header class="hero" id="top">
+    <div class="wrap">
+      <div class="hero-grid">
+        <div>
+          <div class="eyebrow" style="--d:.05s">DSH MANAGER · 桌面管理工具</div>
+          <h1 class="hero-title" style="--d:.18s">
+            <span class="nb">车同轨，</span><span class="nb"><em>书同文</em>。</span>
+          </h1>
+          <p class="hero-lede" style="--d:.3s">
+            DSH 的多版本、插件、Profile 与整合包，<strong>从此归于一统</strong>。
+          </p>
+          <p class="hero-sub" style="--d:.42s">
+            无需本地环境，无需命令行——下载、安装、启动、分享，点几下就完。
+          </p>
+          <div class="cta-row" style="--d:.46s">
+            <a class="btn btn-primary" href="https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/releases/latest" target="_blank" rel="noopener">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 3v12m0 0l-5-5m5 5l5-5M4 21h16"/></svg>
+              下载最新版
+            </a>
+            <a class="btn btn-ghost" href="#features">看看能做什么</a>
+          </div>
+          <div class="hero-meta" style="--d:.6s">
+            <span><i></i>Windows 10 / 11</span>
+            <span><i></i>便携单文件</span>
+            <span><i></i>开箱即用</span>
+          </div>
+        </div>
+
+        <!-- 三栏界面 Mock -->
+        <div class="hero-visual" style="--d:.4s">
+          <div class="app-mock">
+            <div class="mock-inner">
+              <div class="mock-bar">
+                <span class="dot" style="background:#e5534b"></span>
+                <span class="dot" style="background:#d29922"></span>
+                <span class="dot" style="background:#2fbf8f"></span>
+                <span class="t">◈ DSH Manager</span>
+              </div>
+              <div class="mock-cols">
+                <div class="mock-col">
+                  <div class="mock-h">DSH 环境 <span class="mock-pill">3</span></div>
+                  <div class="mock-item on"><span class="d"></span>0.2.1-rc.2<span class="dim">手动</span></div>
+                  <div class="mock-item"><span class="d"></span>0.2.0<span class="dim">全局</span></div>
+                  <div class="mock-item"><span class="d"></span>0.1.9<span class="dim">扫描</span></div>
+                </div>
+                <div class="mock-col">
+                  <div class="mock-h">Profiles <span class="mock-pill">4</span></div>
+                  <div class="mock-item on"><span class="d"></span>my-pack<span class="dim">36</span></div>
+                  <div class="mock-item"><span class="d"></span>web<span class="dim">12</span></div>
+                  <div class="mock-item"><span class="d"></span>desktop<span class="mock-tag">官方</span></div>
+                  <div class="mock-item"><span class="d"></span>dev-team<span class="dim">21</span></div>
+                </div>
+                <div class="mock-col">
+                  <div class="mock-run">
+                    <span class="st"><i></i>运行中 · 端口 3082</span>
+                    <span class="mock-pill">● :3082</span>
+                  </div>
+                  <div class="mock-btns">
+                    <div class="mock-btn p">▶ 启动</div>
+                    <div class="mock-btn">🌐 打开界面</div>
+                    <div class="mock-btn">■ 停止</div>
+                  </div>
+                  <div class="mock-h">已安装插件 <span class="mock-pill">36</span></div>
+                  <div class="mock-plug">@michengai/dsh-codex-ui<span class="ver">1.1.47</span><span class="sw"></span></div>
+                  <div class="mock-plug">dsh-cost-meter<span class="ver">1.9.30</span><span class="sw"></span></div>
+                  <div class="mock-plug">@deepseek-ai/dsh-sdk<span class="ver">0.2.1</span><span class="sw off"></span></div>
+                  <div class="mock-plug">dsh-context<span class="ver">0.74.0</span><span class="sw"></span></div>
+                  <div class="mock-plug">dsh-pet<span class="ver">0.3.8</span><span class="sw"></span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- 解决什么 -->
+  <section id="why">
+    <div class="wrap">
+      <div class="sec-head rise">
+        <div class="eyebrow">WHY · 解决什么问题</div>
+        <h2>折腾 DSH 的那些坑，<br />一个个填掉。</h2>
+        <p class="lat-line">a manager for the whole ecosystem</p>
+      </div>
+      <div class="pain-list">
+        <div class="pain-row rise">
+          <div class="pain-no">01</div>
+          <div class="pain-q">装了个插件，DSH 就起不来了？</div>
+          <div class="pain-a">图形化<strong>关停、降级</strong>问题插件，让 DSH 正常启动——不用翻配置文件。</div>
+        </div>
+        <div class="pain-row rise" style="--d:.06s">
+          <div class="pain-no">02</div>
+          <div class="pain-q">升级 DSH，所有插件全失效？</div>
+          <div class="pain-a">多个 DSH 版本<strong>共存互不影响</strong>，复制已有 Profile 从容适配新版。</div>
+        </div>
+        <div class="pain-row rise" style="--d:.12s">
+          <div class="pain-no">03</div>
+          <div class="pain-q">不想一个一个装插件试？</div>
+          <div class="pain-a">内置<strong>整合包市场</strong>，像装 Minecraft 整合包一样，一键导入整套配置。</div>
+        </div>
+        <div class="pain-row rise" style="--d:.18s">
+          <div class="pain-no">04</div>
+          <div class="pain-q">不想开命令行，还想多开几个？</div>
+          <div class="pain-a">任意「版本 × Profile」<strong>多实例并行</strong>，端口自动分配，图形化启停重启。</div>
+        </div>
+        <div class="pain-row rise" style="--d:.24s">
+          <div class="pain-no">05</div>
+          <div class="pain-q">网络不好，下载总失败？</div>
+          <div class="pain-a"><strong>镜像轮询 + 便携运行时</strong>，不依赖你系统的 Node / Git，大陆无 VPN 开箱即用。</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 功能 -->
+  <section id="features">
+    <div class="wrap">
+      <div class="sec-head rise">
+        <div class="eyebrow">CAPABILITIES · 核心能力</div>
+        <h2>一个界面，管住整个 DSH。</h2>
+        <p>从本体版本到插件开关，从 Profile 到整合包分享，全部图形化完成。</p>
+      </div>
+      <div class="feat-grid">
+        <div class="feat-card rise">
+          <div class="idx">i</div>
+          <div class="feat-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></div>
+          <h3>多版本环境</h3>
+          <p>下载 / 扫描多个 DSH 本体，新旧版本共存。任意「环境 × Profile」自由组合，切换版本不丢插件。</p>
+        </div>
+        <div class="feat-card rise" style="--d:.07s">
+          <div class="idx">ii</div>
+          <div class="feat-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l8 4.5v9L12 20l-8-4.5v-9L12 2z"/><path d="M12 11l8-4.5M12 11v9M12 11L4 6.5"/></svg></div>
+          <h3>插件管理</h3>
+          <p>内置市场 + NPM / GitHub / 本地安装，拉杆启停、一键更新、版本豁免、依赖修复，装坏可回退。</p>
+        </div>
+        <div class="feat-card rise" style="--d:.14s">
+          <div class="idx">iii</div>
+          <div class="feat-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg></div>
+          <h3>Profile 管理</h3>
+          <p>新建 / 删除 / 重命名 / 导入导出，右键备注与适配版本，拖拽排序，同名多来源精确区分。</p>
+        </div>
+        <div class="feat-card rise" style="--d:.05s">
+          <div class="idx">iv</div>
+          <div class="feat-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z"/><path d="M3 8l9 5 9-5M12 13v8"/></svg></div>
+          <h3>整合包 .dspack</h3>
+          <p>遵循 DSH-PackForge 开放规范，导出 / 导入 / 在线市场，SHA-256 校验，自动重建依赖。</p>
+        </div>
+        <div class="feat-card rise" style="--d:.12s">
+          <div class="idx">v</div>
+          <div class="feat-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 12h14M12 5v14"/><circle cx="12" cy="12" r="9"/></svg></div>
+          <h3>多实例并行</h3>
+          <p>独立进程、端口从 3080 自动分配，互不冲突。「打开界面」直达带 token 的 Web UI。</p>
+        </div>
+        <div class="feat-card rise" style="--d:.19s">
+          <div class="idx">vi</div>
+          <div class="feat-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a9 9 0 0 1 9 9c0 6-9 11-9 11S3 17 3 11a9 9 0 0 1 9-9z"/><circle cx="12" cy="11" r="3"/></svg></div>
+          <h3>开箱即用</h3>
+          <p>便携 Node / pnpm / Git 自动就绪，全程无黑框、不改系统 PATH，镜像轮询应对弱网环境。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 整合包专题 -->
+  <section id="pack">
+    <div class="wrap">
+      <div class="pack-band rise">
+        <div class="eyebrow">MODPACK · 整合包生态</div>
+        <h2>像分发 Minecraft 整合包一样，<em>分发你的 AI 工作流</em>。</h2>
+        <p>
+          一个 .dspack 就是一套完整的配置快照：插件组合、依赖、补丁、适配版本。
+          不含 node_modules 与凭据，体积小、可安全分享，导入即用。
+        </p>
+        <div class="pack-chips">
+          <span class="chip"><i></i>导出 <small>EXPORT</small></span>
+          <span class="chip"><i></i>导入 + 自动重建依赖 <small>INSTALL</small></span>
+          <span class="chip"><i></i>在线市场 <small>MARKET</small></span>
+          <span class="chip"><i></i>SHA-256 校验 <small>VERIFIED</small></span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 上手 -->
+  <section id="start">
+    <div class="wrap">
+      <div class="sec-head rise">
+        <div class="eyebrow">QUICK START · 四步跑起来</div>
+        <h2>从下载到 Web 界面，<br />比装个播放器还快。</h2>
+      </div>
+      <div class="steps">
+        <div class="step rise">
+          <div class="no">STEP 01</div>
+          <h4>下载安装</h4>
+          <p>便携单文件解压即用，或用安装包装好。运行环境会自动准备。</p>
+        </div>
+        <div class="step rise" style="--d:.07s">
+          <div class="no">STEP 02</div>
+          <h4>获取 DSH 环境</h4>
+          <p>一键下载官方多版本，或扫描电脑上已装的 DSH 本体。</p>
+        </div>
+        <div class="step rise" style="--d:.14s">
+          <div class="no">STEP 03</div>
+          <h4>初始化 Profile</h4>
+          <p>一键初始化开箱即用，也可导入整合包 / 新建空白配置。</p>
+        </div>
+        <div class="step rise" style="--d:.21s">
+          <div class="no">STEP 04</div>
+          <h4>选组合，启动</h4>
+          <p>任选「环境 × Profile」启动，点「打开界面」直达 DSH Web UI。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 下载 -->
+  <section class="dl-zone" id="download">
+    <div class="wrap">
+      <div class="sec-head rise">
+        <div class="eyebrow">DOWNLOAD · 获取 DSH Manager</div>
+        <div class="ver-badge">◈ 当前版本 v0.3.26 · MIT-ish 开源（CC BY-NC-SA 4.0）</div>
+        <h2>开始归于一统。</h2>
+        <p>Windows 10 / 11（需 WebView2 运行时，系统一般自带）</p>
+      </div>
+      <div class="dl-cards">
+        <div class="dl-card rise">
+          <div class="kind">Installer · NSIS</div>
+          <h3>安装版</h3>
+          <p>标准 Windows 安装包，装好后有开始菜单入口，适合固定使用。</p>
+          <a class="btn btn-primary" href="https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/releases/latest" target="_blank" rel="noopener">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 3v12m0 0l-5-5m5 5l5-5M4 21h16"/></svg>
+            下载安装包
+          </a>
+        </div>
+        <div class="dl-card rise" style="--d:.1s">
+          <div class="kind">Portable · Single EXE</div>
+          <h3>便携版</h3>
+          <p>绿色单文件，免安装免依赖，复制到哪就能在哪跑，数据集中存放。</p>
+          <a class="btn btn-primary" href="https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/releases/latest" target="_blank" rel="noopener">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 3v12m0 0l-5-5m5 5l5-5M4 21h16"/></svg>
+            下载便携版
+          </a>
+        </div>
+      </div>
+      <p class="dl-note">
+        两个按钮均跳转至 <a href="https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/releases/latest" target="_blank" rel="noopener">最新 Release 页</a>，
+        页面内含全部产物与校验信息 · 历史版本见
+        <a href="https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/releases" target="_blank" rel="noopener">Releases 归档</a>
+      </p>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer>
+    <div class="wrap foot-inner">
+      <div class="foot-brand">
+        <svg width="18" height="18" viewBox="0 0 64 64" aria-hidden="true">
+          <path d="M32 8 L56 32 L32 56 L8 32 Z" fill="none" stroke="#6b7889" stroke-width="5"/>
+          <circle cx="32" cy="32" r="6" fill="#6b7889"/>
+        </svg>
+        DSH Manager · 车同轨，书同文
+      </div>
+      <div class="foot-links">
+        <a href="https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager#常见问题faq" target="_blank" rel="noopener">FAQ</a>
+        <a href="https://linux.do/" target="_blank" rel="noopener">致谢 Linux.do</a>
+      </div>
+      <div class="foot-lic">CC BY-NC-SA 4.0</div>
+    </div>
+  </footer>
+
+</div>
+
+<script>
+  // 滚动入场（性能友好：一次性 observer）
+  (function () {
+    var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    var items = document.querySelectorAll(".rise");
+    if (reduce || !("IntersectionObserver" in window)) {
+      items.forEach(function (el) { el.classList.add("in"); });
+      return;
+    }
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.12, rootMargin: "0px 0px -6% 0px" });
+    items.forEach(function (el) { io.observe(el); });
+  })();
+</script>
+
+</body>
+</html>
