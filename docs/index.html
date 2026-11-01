@@ -29,7 +29,8 @@
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html { scroll-behavior: smooth; }
+  /* 横向溢出兜底：clip 不产生滚动容器，比 hidden 更彻底（老浏览器回退 hidden） */
+  html { scroll-behavior: smooth; overflow-x: hidden; overflow-x: clip; }
   body {
     background: var(--bg);
     color: var(--text);
@@ -37,6 +38,8 @@
     font-size: 15px;
     line-height: 1.75;
     overflow-x: hidden;
+    overflow-x: clip;
+    overflow-wrap: anywhere;
     -webkit-font-smoothing: antialiased;
   }
   ::selection { background: rgba(47, 191, 143, 0.28); }
@@ -134,7 +137,7 @@
     background: rgba(20, 28, 39, 0.9); border-bottom: 1px solid var(--line); }
   .mock-bar .dot { width: 9px; height: 9px; border-radius: 50%; }
   .mock-bar .t { margin-left: 8px; font-size: 11px; color: var(--text-3); font-family: var(--mono); letter-spacing: 0.08em; }
-  .mock-cols { display: grid; grid-template-columns: 108px 118px 1fr; gap: 1px; background: var(--line); min-height: 300px; }
+  .mock-cols { display: grid; grid-template-columns: 108px 118px minmax(0, 1fr); gap: 1px; background: var(--line); min-height: 300px; }
   .mock-col { background: #0c1117; padding: 12px 10px; }
   .mock-h { font-size: 10px; color: var(--text-3); letter-spacing: 0.12em; text-transform: uppercase;
     font-family: var(--mono); margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
@@ -270,7 +273,10 @@
 
   /* ===== 响应式 ===== */
   @media (max-width: 980px) {
-    .hero-grid { grid-template-columns: 1fr; gap: 60px; }
+    .hero-grid { grid-template-columns: minmax(0, 1fr); gap: 60px; }
+    /* 窄屏取消 3D 倾角：透视投影会超出屏幕宽度制造横向溢出 */
+    .app-mock { transform: none; }
+    .app-mock:hover { transform: translateY(-4px); }
     .hero { padding-top: 76px; }
     .feat-grid { grid-template-columns: repeat(2, 1fr); }
     .steps { grid-template-columns: repeat(2, 1fr); }
@@ -282,9 +288,16 @@
   @media (max-width: 640px) {
     .wrap { width: calc(100% - 36px); }
     .nav-links { display: none; }
-    .feat-grid, .steps, .dl-cards { grid-template-columns: 1fr; }
+    .brand .lat { display: none; }
+    .brand, .nav-gh { white-space: nowrap; }
+    .feat-grid, .steps, .dl-cards { grid-template-columns: minmax(0, 1fr); }
     .hero-meta { gap: 12px; }
     .pack-band::before { font-size: 92px; }
+    /* 三栏 mock 在窄屏压成两栏，隐藏「运行」栏避免竖排挤压 */
+    .mock-cols { grid-template-columns: 104px minmax(0, 1fr); }
+    .mock-col:nth-child(3) { display: none; }
+    .mock-item { font-size: 9.5px; }
+    .mock-item .dim, .mock-item .mock-tag { display: none; }
   }
 </style>
 </head>
@@ -543,7 +556,6 @@
     <div class="wrap">
       <div class="sec-head rise">
         <div class="eyebrow">DOWNLOAD · 获取 DSH Manager</div>
-        <div class="ver-badge">◈ 当前版本 v0.3.26 · MIT-ish 开源（CC BY-NC-SA 4.0）</div>
         <h2>开始归于一统。</h2>
         <p>Windows 10 / 11（需 WebView2 运行时，系统一般自带）</p>
       </div>
