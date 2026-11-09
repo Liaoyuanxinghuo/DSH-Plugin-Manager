@@ -2693,12 +2693,17 @@ async fn import_pack_cmd(
     env_id: String,
     pack_path: String,
     profiles_dir_str: String,
+    dsh_hint: Option<String>,
 ) -> Result<packforge::PackImportResult, String> {
     let env = get_env_inner(&state, &env_id)?;
     let profiles_dir = profiles_dir_arg(&profiles_dir_str, &env);
     // 解压放阻塞线程池
     tauri::async_runtime::spawn_blocking(move || {
-        packforge::import_pack(std::path::Path::new(&pack_path), &profiles_dir)
+        packforge::import_pack(
+            std::path::Path::new(&pack_path),
+            &profiles_dir,
+            dsh_hint.as_deref().unwrap_or(""),
+        )
     })
     .await
     .map_err(|e| format!("导入任务失败：{e}"))?

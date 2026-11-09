@@ -1059,7 +1059,11 @@ fn unique_name(base: &str, profiles_dir: &Path) -> (String, bool) {
 }
 
 /// 导入整合包到目标 profiles 目录；home 级内容写 profiles_dir 的父目录（DSH_HOME 语义）
-pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportResult, String> {
+pub fn import_pack(
+    pack_path: &Path,
+    profiles_dir: &Path,
+    dsh_hint_fallback: &str,
+) -> Result<PackImportResult, String> {
     let work = profiles_dir.join(".import-tmp");
     if work.exists() {
         fs::remove_dir_all(&work).map_err(|e| format!("清理临时目录失败: {e}"))?;
@@ -1247,6 +1251,10 @@ pub fn import_pack(pack_path: &Path, profiles_dir: &Path) -> Result<PackImportRe
     let mut dsh_hint = extract_dsh_hint(manifest.dsh_version.as_deref().unwrap_or(""), &desc);
     if dsh_hint.is_empty() {
         dsh_hint = extract_dsh_hint("", &name_desc);
+    }
+    // 兜底：包内 manifest 没写适配版本时，采信调用方传入的外部依据（市场索引 / Release 说明提取）
+    if dsh_hint.is_empty() {
+        dsh_hint = dsh_hint_fallback.trim().to_string();
     }
     if !dsh_hint.is_empty() {
         let pd = profiles_dir.to_string_lossy().to_string();
@@ -1692,7 +1700,7 @@ mod tests {
 
         let dst = work.join("dst").join("profiles");
         fs::create_dir_all(&dst).unwrap();
-        let r = import_pack(&pack, &dst).unwrap();
+        let r = import_pack(&pack, &dst, "").unwrap();
         assert_eq!(r.pack_type, "profile");
         assert_eq!(r.final_names, vec!["web".to_string()]);
         assert!(!r.renamed);
@@ -1705,11 +1713,27 @@ mod tests {
         assert_eq!(pkg["dependencies"]["dsh-pet"], "0.2.0");
         assert_eq!(pkg["dsh"]["profile"]["bundles"][0], "@deepseek-ai/dsh-base");
 
-        // 重名 → 改名导入
-        let r2 = import_pack(&pack, &dst).unwrap();
+        // 重名 → 改名导入；manifest 有 dshVersion 时优先于外部兜底
+        let r2 = import_pack(&pack, &dst, "0.9.9-fallback").unwrap();
         assert!(r2.renamed);
         assert!(r2.final_names[0].contains("import"));
         assert!(dst.join(&r2.final_names[0]).join("package.json").exists());
+        assert_eq!(r2.dsh_hint, "0.1.7-rc.2", "manifest 有 dshVersion 时应优先");
+
+        // manifest 未写 dshVersion → 采信外部兜底（市场索引 / Release 说明提取）
+        let pack2 = work.join("web2-1.0.0.dspack");
+        export_pack(
+            &src_profiles.join("web"),
+            &src_profiles,
+            &pack2,
+            "web2",
+            "1.0.0",
+            "Web",
+            "",
+        )
+        .unwrap();
+        let r3 = import_pack(&pack2, &dst, "0.9.9-fallback").unwrap();
+        assert_eq!(r3.dsh_hint, "0.9.9-fallback", "manifest 无 dshVersion 时应采信外部兜底");
 
         let _ = fs::remove_dir_all(&work);
     }
@@ -1721,7 +1745,7 @@ mod tests {
         fs::create_dir_all(&dst).unwrap();
         let bad = work.join("bad.dspack");
         fs::write(&bad, "not a zip").unwrap();
-        let r = import_pack(&bad, &dst);
+        let r = import_pack(&bad, &dst, "");
         assert!(r.is_err());
         let _ = fs::remove_dir_all(&work);
     }
@@ -1849,7 +1873,7 @@ mod tests {
         zw.finish().unwrap();
         let profiles = work.join("profiles");
         fs::create_dir_all(&profiles).unwrap();
-        let r = import_pack(&zip, &profiles);
+        let r = import_pack(&zip, &profiles, "");
         assert!(r.is_err());
         assert!(!profiles.join("evil.txt").exists(), "不得逃逸出解压目录");
         let _ = fs::remove_dir_all(&work);

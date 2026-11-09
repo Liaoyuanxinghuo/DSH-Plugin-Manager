@@ -190,8 +190,8 @@ export const api = {
     invoke<PackVersionInfo[]>("list_pack_versions_cmd", { owner, repo }),
   downloadPack: (url: string, sha256: string, size: number) =>
     invoke<string>("download_pack_cmd", { url, sha256, size }),
-  importPack: (envId: string, packPath: string, profilesDir: string) =>
-    invoke<PackImportResult>("import_pack_cmd", { envId, packPath, profilesDirStr: profilesDir }),
+  importPack: (envId: string, packPath: string, profilesDir: string, dshHint?: string) =>
+    invoke<PackImportResult>("import_pack_cmd", { envId, packPath, profilesDirStr: profilesDir, dshHint }),
   // 插件补全
   complementManifest: (envId: string, profile: string, profilesDir: string) =>
     invoke<ProfileManifest>("complement_manifest_cmd", { envId, profile, profilesDirStr: profilesDir }),

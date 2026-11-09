@@ -425,13 +425,17 @@ export default function App() {
     }
   }, [portableReady, gitMissing, portableBannerOpen]);
 
-  // 加载 profile 备注（仅提示，无任何约束）
-  useEffect(() => {
-    api
+  // 加载 profile 备注（仅提示，无任何约束）；导入整合包写入了「适配版本」后需手动刷新
+  const loadNotes = useCallback(async () => {
+    await api
       .getProfileNotes()
       .then((m) => setNotes(m ?? {}))
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    loadNotes();
+  }, [loadNotes]);
 
   // 记住上次选择（环境 / profile / 端口）
   useEffect(() => {
@@ -1232,6 +1236,7 @@ export default function App() {
       );
     }
     await loadProfiles();
+    await loadNotes();
     if (finalNames.length > 0) {
       setSelectedProfile(finalNames[0]);
     }
@@ -3888,8 +3893,9 @@ function ImportDialog({
     close();
   };
 
-  // 导入整合包 + 逐个重建依赖（日志展示）
-  const importAndInstall = async (packPath: string) => {
+  // 导入整合包 + 逐个重建依赖（日志展示）；dshHint = 外部已知适配版本（市场索引/Release 提取），
+  // 仅当包内 manifest 没写 dshVersion 时作兜底写入备注
+  const importAndInstall = async (packPath: string, dshHint?: string) => {
     if (installing) return;
     setInstalling(true);
     setLogs([]);
@@ -3897,7 +3903,7 @@ function ImportDialog({
     setGlobalError("");
     setStep("busy");
     try {
-      const r = await api.importPack(envId, packPath, targetDir);
+      const r = await api.importPack(envId, packPath, targetDir, dshHint);
       setLogs((prev) => [...prev, { line: `已落盘：${r.finalNames.join("、")}，开始重建依赖…`, kind: "stdout" }]);
       for (const name of r.finalNames) {
         setLogs((prev) => [...prev, { line: `── 重建 ${name} 依赖（dsh plugin install）`, kind: "stdout" }]);
@@ -4064,7 +4070,7 @@ function ImportDialog({
                       onClick={async () => {
                         try {
                           const local = await api.downloadPack(mp.downloadUrl, mp.sha256, mp.size);
-                          await importAndInstall(local);
+                          await importAndInstall(local, mp.dshVersion);
                         } catch (e) {
                           setGlobalError(String(e));
                         }
@@ -4105,7 +4111,7 @@ function ImportDialog({
                                 onClick={async () => {
                                   try {
                                     const local = await api.downloadPack(v.downloadUrl, v.sha256, v.size);
-                                    await importAndInstall(local);
+                                    await importAndInstall(local, v.dshHint);
                                   } catch (e) {
                                     setGlobalError(String(e));
                                   }
