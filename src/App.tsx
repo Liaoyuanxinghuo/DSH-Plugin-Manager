@@ -3371,7 +3371,12 @@ function SettingsDialog({
   return (
     <div className="modal-mask" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3>设置</h3>
+        <div className="modal-head">
+          <h3>设置</h3>
+          <button className="btn tiny" onClick={onClose} disabled={busy}><Icon name="x" size={11} /></button>
+        </div>
+        <div className="settings-card">
+          <div className="settings-card-title">外观</div>
         <label>
           界面外观主题
           <div className="theme-segmented">
@@ -3407,6 +3412,124 @@ function SettingsDialog({
             </button>
           </div>
         </label>
+        </div>
+        <div className="settings-card">
+          <div className="settings-card-title">关于 / 更新</div>
+        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <button className="btn tiny" onClick={() => setAboutOpen(!aboutOpen)}>
+            <Icon name="info" size={12} /> 关于本项目
+          </button>
+          <button
+            className="btn tiny"
+            disabled={checking}
+            onClick={async () => {
+              setChecking(true);
+              setUpdateInfo(null);
+              try {
+                setUpdateInfo(await api.checkUpdate());
+              } catch (e) {
+                setUpdateInfo({ current: "", latest: "", hasUpdate: false, url: "", error: String(e) });
+              } finally {
+                setChecking(false);
+              }
+            }}
+          >
+            {checking ? "检查中…" : <><Icon name="refresh" /> 检查更新</>}
+          </button>
+        </div>
+        {aboutOpen && (
+          <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.26</span></div>
+            <div style={{ color: "var(--text-dim)" }}>
+              图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
+              支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
+            </div>
+            <div style={{ marginTop: 6 }}>
+              <button className="btn tiny" onClick={() => api.openUrl("https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/")}>
+                <Icon name="globe" /> 项目地址（GitHub）
+              </button>
+            </div>
+            <div style={{ marginTop: 6 }}>
+              QQ 交流群：<b>1044723843</b>
+            </div>
+          </div>
+        )}
+        {updateInfo && (
+          <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 0, fontSize: 12, lineHeight: 1.8 }}>
+            {updateInfo.error ? (
+              <div style={{ color: "#ffb3ad" }}>{updateInfo.error}</div>
+            ) : updateInfo.hasUpdate ? (
+              <div>
+                <div style={{ color: "#ffd479" }}>
+                  发现新版本：当前 v{updateInfo.current} → v{updateInfo.latest}
+                </div>
+                {!downloading && !downPath && (
+                  <button
+                    className="btn tiny"
+                    style={{ marginTop: 6 }}
+                    disabled={downloading}
+                    onClick={async () => {
+                      setDownloading(true);
+                      setDownPercent(0);
+                      setDownPath("");
+                      setDownErr("");
+                      try {
+                        const path = await api.downloadUpdate(updateInfo.latest);
+                        setDownPath(path);
+                      } catch (e) {
+                        setDownErr(String(e));
+                        setDownloading(false);
+                      }
+                    }}
+                  >
+                    <Icon name="download" /> 下载 v{updateInfo.latest}
+                  </button>
+                )}
+                {downloading && (
+                  <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
+                    <div style={{ flex: 1, height: 6, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
+                      <div style={{ width: `${downPercent}%`, height: "100%", background: "#5b8cff", transition: "width .15s" }} />
+                    </div>
+                    <span style={{ color: "var(--text-dim)", width: 44, textAlign: "right" }}>{downPercent}%</span>
+                  </div>
+                )}
+                {downErr && <div style={{ color: "#ffb3ad", marginTop: 6 }}>{downErr}</div>}
+                {downPath && (
+                  <div style={{ marginTop: 6 }}>
+                    <div style={{ color: "#7fd6a2", wordBreak: "break-all" }}>✅ 已保存：{downPath}</div>
+                    <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                      <button className="btn tiny" onClick={() => api.openPath(downPath)}>
+                        <Icon name="folder" /> 打开所在文件夹
+                      </button>
+                      <button
+                        className="btn tiny"
+                        disabled={closingForUpdate}
+                        onClick={async () => {
+                          setClosingForUpdate(true);
+                          try {
+                            await api.launchInstallerAndExit(downPath);
+                          } catch (e) {
+                            setDownErr(String(e));
+                            setClosingForUpdate(false);
+                          }
+                        }}
+                      >
+                        {closingForUpdate ? "正在启动安装程序…" : <><Icon name="refresh" /> 关闭程序并更新</>}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ color: "var(--text)" }}>
+                ✅ 已是最新版本（v{updateInfo.current || "?"}）{updateInfo.latest ? `（最新 v${updateInfo.latest}）` : ""}
+              </div>
+            )}
+          </div>
+        )}
+        </div>
+        <div className="settings-card">
+          <div className="settings-card-title">网络镜像</div>
         <p className="modal-hint">
           npm 镜像源用于：插件市场/搜索、包信息查询、DSH 下载、写各 profile 的 .npmrc（插件安装）。
           <b>留空 = 不使用镜像源</b>（走 npm 官方源）。大陆网络可填
@@ -3496,121 +3619,9 @@ function SettingsDialog({
             ))}
           </div>
         )}
-        <div className="modal-hint" style={{ marginTop: 6 }}>
-          <b>关于 / 更新</b>
         </div>
-        <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
-          <button className="btn tiny" onClick={() => setAboutOpen(!aboutOpen)}>
-            <Icon name="info" size={12} /> 关于本项目
-          </button>
-          <button
-            className="btn tiny"
-            disabled={checking}
-            onClick={async () => {
-              setChecking(true);
-              setUpdateInfo(null);
-              try {
-                setUpdateInfo(await api.checkUpdate());
-              } catch (e) {
-                setUpdateInfo({ current: "", latest: "", hasUpdate: false, url: "", error: String(e) });
-              } finally {
-                setChecking(false);
-              }
-            }}
-          >
-            {checking ? "检查中…" : <><Icon name="refresh" /> 检查更新</>}
-          </button>
-        </div>
-        {aboutOpen && (
-          <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.26</span></div>
-            <div style={{ color: "var(--text-dim)" }}>
-              图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
-              支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
-            </div>
-            <div style={{ marginTop: 6 }}>
-              <button className="btn tiny" onClick={() => api.openUrl("https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/")}>
-                <Icon name="globe" /> 项目地址（GitHub）
-              </button>
-            </div>
-            <div style={{ marginTop: 6 }}>
-              QQ 交流群：<b>1044723843</b>
-            </div>
-          </div>
-        )}
-        {updateInfo && (
-          <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            {updateInfo.error ? (
-              <div style={{ color: "#ffb3ad" }}>{updateInfo.error}</div>
-            ) : updateInfo.hasUpdate ? (
-              <div>
-                <div style={{ color: "#ffd479" }}>
-                  发现新版本：当前 v{updateInfo.current} → v{updateInfo.latest}
-                </div>
-                {!downloading && !downPath && (
-                  <button
-                    className="btn tiny"
-                    style={{ marginTop: 6 }}
-                    disabled={downloading}
-                    onClick={async () => {
-                      setDownloading(true);
-                      setDownPercent(0);
-                      setDownPath("");
-                      setDownErr("");
-                      try {
-                        const path = await api.downloadUpdate(updateInfo.latest);
-                        setDownPath(path);
-                      } catch (e) {
-                        setDownErr(String(e));
-                        setDownloading(false);
-                      }
-                    }}
-                  >
-                    <Icon name="download" /> 下载 v{updateInfo.latest}
-                  </button>
-                )}
-                {downloading && (
-                  <div style={{ marginTop: 6, display: "flex", alignItems: "center", gap: 8 }}>
-                    <div style={{ flex: 1, height: 6, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
-                      <div style={{ width: `${downPercent}%`, height: "100%", background: "#5b8cff", transition: "width .15s" }} />
-                    </div>
-                    <span style={{ color: "var(--text-dim)", width: 44, textAlign: "right" }}>{downPercent}%</span>
-                  </div>
-                )}
-                {downErr && <div style={{ color: "#ffb3ad", marginTop: 6 }}>{downErr}</div>}
-                {downPath && (
-                  <div style={{ marginTop: 6 }}>
-                    <div style={{ color: "#7fd6a2", wordBreak: "break-all" }}>✅ 已保存：{downPath}</div>
-                    <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-                      <button className="btn tiny" onClick={() => api.openPath(downPath)}>
-                        <Icon name="folder" /> 打开所在文件夹
-                      </button>
-                      <button
-                        className="btn tiny"
-                        disabled={closingForUpdate}
-                        onClick={async () => {
-                          setClosingForUpdate(true);
-                          try {
-                            await api.launchInstallerAndExit(downPath);
-                          } catch (e) {
-                            setDownErr(String(e));
-                            setClosingForUpdate(false);
-                          }
-                        }}
-                      >
-                        {closingForUpdate ? "正在启动安装程序…" : <><Icon name="refresh" /> 关闭程序并更新</>}
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div style={{ color: "var(--text)" }}>
-                ✅ 已是最新版本（v{updateInfo.current || "?"}）{updateInfo.latest ? `（最新 v${updateInfo.latest}）` : ""}
-              </div>
-            )}
-          </div>
-        )}
+        <div className="settings-card">
+          <div className="settings-card-title">存储</div>
         <label>
           DSH 下载目录（多版本共存根目录）
           <input
@@ -3629,6 +3640,7 @@ function SettingsDialog({
             <Icon name="folder" /> 选择目录
           </button>
         </label>
+        </div>
         {err && <div className="modal-err">{err}</div>}
         <div className="modal-actions">
           <button className="btn" onClick={onClose} disabled={busy}>取消</button>
