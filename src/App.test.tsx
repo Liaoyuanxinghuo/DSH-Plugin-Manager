@@ -2070,7 +2070,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.28", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.29", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -2097,27 +2097,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.28", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.29", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.28_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.29_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("下载 v0.3.28"));
+    await user.click(screen.getByText("下载 v0.3.29"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.28" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.29" });
     // 打开所在文件夹
     await user.click(screen.getByText("打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.28_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.29_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.28_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.29_x64-setup.exe" });
     });
   });
 });
@@ -2272,9 +2272,11 @@ describe("整合包导入导出与备注", () => {
     });
     const user = userEvent.setup();
     await user.click(screen.getAllByText("导出")[0]);
-    expect(screen.getByText("完整 profile zip")).toBeInTheDocument();
-    await user.click(screen.getByText("整合包（.dspack）"));
-    expect(screen.getByText("选择位置并导出整合包")).toBeInTheDocument();
+    // 三张去向卡片：完整备份 / 整合包 / 克隆副本
+    expect(screen.getByText("完整备份 zip")).toBeInTheDocument();
+    expect(screen.getByText("克隆副本")).toBeInTheDocument();
+    await user.click(screen.getByText("整合包 .dspack"));
+    expect(screen.getByText("选择位置并导出")).toBeInTheDocument();
     // 包名默认取 profile 名
     const nameInput = screen.getByPlaceholderText("如 my-pack") as HTMLInputElement;
     expect(nameInput.value).toBeTruthy();

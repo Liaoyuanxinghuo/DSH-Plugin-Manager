@@ -249,8 +249,10 @@ body { background: var(--bg); color: var(--text); font-size: 14px; }
 [data-theme="deepseek"] .tag.official { background: var(--info-soft); color: var(--info); border: 1px solid var(--info-border); }
 /* 导入对话框 */
 .import-choices { display: flex; flex-direction: column; gap: 12px; margin: 12px 0; }
+.export-choices { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 12px 0; }
 .choice-card { text-align: left; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-bg); cursor: pointer; transition: border-color .15s; }
 .choice-card:hover { border-color: var(--accent); }
+.choice-card.on { border-color: var(--accent); background: var(--accent-soft); }
 .choice-card:disabled { opacity: .5; cursor: default; }
 .choice-title { font-size: 14px; font-weight: 600; margin-bottom: 6px; color: var(--text); }
 .choice-desc { font-size: 12px; color: var(--text-dim); }

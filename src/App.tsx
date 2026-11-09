@@ -1062,12 +1062,21 @@ export default function App() {
     );
   });
 
-  // 刷新：环境 + Profiles 都立刻重扫，列表与增删保持同步
+  // 刷新：环境 + Profiles 都立刻重扫，列表与增删保持同步；
+  // 同时重拉运行列表（后端 list_running_cmd 内置认领）——窗口不可见期间轮询被跳过时，
+  // 点刷新也能立即接管放生/遗留实例并刷新运行状态
   const refreshAll = async () => {
     setError("");
     setInfo("");
-    await Promise.all([loadEnvs(), loadProfiles()]);
-    setInfo("已刷新：环境与 Profile 列表已重新扫描");
+    await Promise.all([
+      loadEnvs(),
+      loadProfiles(),
+      api
+        .listRunning()
+        .then((l) => setRunnings(l ?? []))
+        .catch(() => {}),
+    ]);
+    setInfo("已刷新：环境、Profile 与运行状态已重新扫描");
   };
 
   // M3：检查插件更新（并行查询 npm）
@@ -2863,21 +2872,8 @@ export default function App() {
       {/* 导出确认弹窗 */}
       {exportTarget && (
         <div className="modal-mask" onClick={() => exporting === null && setExportTarget(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <h3>导出 Profile「{exportTarget.profile}」</h3>
-            <p className="modal-hint">
-              node_modules 体积：
-              {exportTarget.nmSize === null ? (
-                <span className="size-pending" title="正在后台统计目录体积（数万文件，需要几秒）">
-                  计算中…
-                </span>
-              ) : (
-                formatSize(exportTarget.nmSize)
-              )}
-              {exportTarget.nmSize !== null && exportTarget.nmSize > 20 * 1024 * 1024
-                ? "（较大，建议排除后导入再重建依赖）"
-                : ""}
-            </p>
+        <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 760 }}>
+          <h3>导出 Profile「{exportTarget.profile}」</h3>
             {/* 长任务进度：导出/打包/克隆期间给明确反馈（不确定进度 → 滚动条 + 已运行秒数） */}
             {exporting !== null && (
               <div className="install-progress">
@@ -3053,7 +3049,7 @@ function ExportOptions({
   onCancel: () => void;
   busy: boolean;
 }) {
-  const [mode, setMode] = useState<"zip" | "pack">("zip");
+  const [mode, setMode] = useState<"zip" | "pack" | "clone">("zip");
   // 体积未知（还在后台算）时默认勾上「排除 node_modules」——大包占多数，先给安全默认；
   // 算出来之后若其实很小，且用户没手动改过，再自动取消勾选。
   const [exclude, setExclude] = useState(nmSize === null ? true : nmSize > 20 * 1024 * 1024);
@@ -3071,27 +3067,62 @@ function ExportOptions({
   const [customHint, setCustomHint] = useState("");
   return (
     <div>
-      <div className="seg-row">
-        <button className={`seg ${mode === "zip" ? "on" : ""}`} onClick={() => setMode("zip")} disabled={busy}>
-          完整 profile zip
+      {/* 三种去向平级选择：选中哪张卡，下方才出现对应表单 */}
+      <div className="export-choices">
+        <button
+          type="button"
+          className={`choice-card ${mode === "zip" ? "on" : ""}`}
+          onClick={() => setMode("zip")}
+          disabled={busy}
+        >
+          <div className="choice-title"><Icon name="export" /> 完整备份 zip</div>
+          <div className="choice-desc">整个 profile 打包 zip，可原样恢复；可选择排除 node_modules 减小体积。</div>
         </button>
-        <button className={`seg ${mode === "pack" ? "on" : ""}`} onClick={() => setMode("pack")} disabled={busy}>
-          整合包（.dspack）
+        <button
+          type="button"
+          className={`choice-card ${mode === "pack" ? "on" : ""}`}
+          onClick={() => setMode("pack")}
+          disabled={busy}
+        >
+          <div className="choice-title"><Icon name="package" /> 整合包 .dspack</div>
+          <div className="choice-desc">DSH-PackForge 规范分享包；自动剔除 node_modules / 运行数据 / 凭据。</div>
+        </button>
+        <button
+          type="button"
+          className={`choice-card ${mode === "clone" ? "on" : ""}`}
+          onClick={() => setMode("clone")}
+          disabled={busy}
+        >
+          <div className="choice-title"><Icon name="plus" /> 克隆副本</div>
+          <div className="choice-desc">本机同目录复制一份（自动 -1 递增名）；含 node_modules，立即可用。用于适配新版 DSH，原件不受影响。</div>
         </button>
       </div>
-      {mode === "zip" ? (
-        <label className="check-row">
-          <input
-            type="checkbox"
-            checked={exclude}
-            onChange={(e) => {
-              excludeTouched.current = true;
-              setExclude(e.target.checked);
-            }}
-          />
-          排除 node_modules（压缩包更小；导入后可重建依赖）
-        </label>
-      ) : (
+
+      {mode === "zip" && (
+        <>
+          <p className="modal-hint">
+            node_modules 体积：
+            {nmSize === null ? (
+              <span className="size-pending" title="正在后台统计目录体积（数万文件，需要几秒）">计算中…</span>
+            ) : (
+              formatSize(nmSize)
+            )}
+            {nmSize !== null && nmSize > 20 * 1024 * 1024 ? "（较大，建议排除后导入再重建依赖）" : ""}
+          </p>
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={exclude}
+              onChange={(e) => {
+                excludeTouched.current = true;
+                setExclude(e.target.checked);
+              }}
+            />
+            排除 node_modules（压缩包更小；导入后可重建依赖）
+          </label>
+        </>
+      )}
+      {mode === "pack" && (
         <div className="pack-form">
           <div className="field-row">
             <label>
@@ -3133,14 +3164,22 @@ function ExportOptions({
           </p>
         </div>
       )}
-      <div className="modal-actions" style={{ flexWrap: "wrap", gap: 8 }}>
+      {mode === "clone" && (
+        <p className="modal-hint">
+          复制整个 profile 到当前 profiles 目录，名字自动补 -1 递增（如 xxx-1）；
+          node_modules 一并复制，克隆完立即可用，不打压缩包。
+        </p>
+      )}
+
+      <div className="modal-actions">
         <button className="btn" onClick={onCancel} disabled={busy}>
           取消
         </button>
-        <button className="btn" onClick={onClone} disabled={busy} title="复制到同目录，自动补 -1 递增名（含 node_modules，立即可用）">
-          📋 复制并重命名副本
-        </button>
-        {mode === "zip" ? (
+        {mode === "clone" ? (
+          <button className="btn primary" onClick={onClone} disabled={busy}>
+            {busy ? "克隆中..." : "开始克隆"}
+          </button>
+        ) : mode === "zip" ? (
           <button className="btn primary" onClick={() => onConfirmZip(exclude)} disabled={busy}>
             {busy ? "导出中..." : "选择位置并导出"}
           </button>
@@ -3157,7 +3196,7 @@ function ExportOptions({
             }
             disabled={busy || (dshHint === "__custom__" && !customHint.trim())}
           >
-            {busy ? "导出中..." : "选择位置并导出整合包"}
+            {busy ? "导出中..." : "选择位置并导出"}
           </button>
         )}
       </div>
@@ -3439,7 +3478,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.28</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.29</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
