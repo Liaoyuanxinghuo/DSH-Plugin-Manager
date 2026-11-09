@@ -16,6 +16,7 @@ import type {
   OrphanProcess,
   PackMarketEntry,
   PackImportResult,
+  PackVersionInfo,
   PluginInfo,
   PluginUpdate,
   ProfileInfo,
@@ -316,6 +317,19 @@ export default function App() {
   // 在线安装对话框
   const [showInstall, setShowInstall] = useState(false);
   const [installTab, setInstallTab] = useState<"market" | "search" | "custom" | "local">("market");
+  // 启动自动检查软件自身更新（后台静默，失败不打扰；有更新才弹模态，本次运行最多弹一次）
+  const [startupUpdate, setStartupUpdate] = useState<UpdateInfo | null>(null);
+  useEffect(() => {
+    const t = setTimeout(() => {
+      api
+        .checkUpdate()
+        .then((info) => {
+          if (info?.hasUpdate && !info.error) setStartupUpdate(info);
+        })
+        .catch(() => {});
+    }, 3000);
+    return () => clearTimeout(t);
+  }, []);
   // 插件补全对话框
   const [showComplement, setShowComplement] = useState(false);
   // M3 插件管理
@@ -2971,6 +2985,10 @@ export default function App() {
       )}
 
       {/* 备注对话框（右键 profile） */}
+      {/* 启动自动检查出的新版本提醒（本次运行最多一次） */}
+      {startupUpdate && (
+        <StartupUpdateModal info={startupUpdate} onClose={() => setStartupUpdate(null)} />
+      )}
       {/* 重命名对话框（右键菜单 / 行内 ✏ 打开） */}
       {renameTarget && (
         <RenameDialog
@@ -3805,6 +3823,11 @@ function ImportDialog({
   const [marketPacks, setMarketPacks] = useState<PackMarketEntry[] | null>(null);
   const [marketErr, setMarketErr] = useState("");
   const [loadingMarket, setLoadingMarket] = useState(false);
+  // 历史版本（懒加载：展开卡片时才拉该包的 GitHub Releases）
+  const [histOpen, setHistOpen] = useState<string | null>(null);
+  const [histCache, setHistCache] = useState<Record<string, PackVersionInfo[]>>({});
+  const [histLoading, setHistLoading] = useState<Record<string, boolean>>({});
+  const [histErr, setHistErr] = useState<Record<string, string>>({});
   const [logs, setLogs] = useState<InstallLogLine[]>([]);
   const [installing, setInstalling] = useState(false);
   const [done, setDone] = useState<{ success: boolean; summary: string } | null>(null);
@@ -3892,13 +3915,13 @@ function ImportDialog({
     }
   };
 
-  // 在线市场列表
-  const loadMarket = async () => {
+  // 在线市场列表（后端有进程级缓存：首次拉网，之后读缓存；force 绕过缓存）
+  const loadMarket = async (force = false) => {
     if (loadingMarket) return;
     setLoadingMarket(true);
     setMarketErr("");
     try {
-      const list = await api.marketPacks();
+      const list = await api.marketPacks(force);
       setMarketPacks(list);
       setStep("pack-online");
     } catch (e) {
@@ -3907,6 +3930,35 @@ function ImportDialog({
       setLoadingMarket(false);
     }
   };
+
+  // 拉取某包历史版本（失败可重试；按包粒度 loading，互不阻塞）
+  const loadHistory = async (mp: PackMarketEntry) => {
+    if (histCache[mp.id] || histLoading[mp.id]) return;
+    setHistLoading((p) => ({ ...p, [mp.id]: true }));
+    setHistErr((p) => ({ ...p, [mp.id]: "" }));
+    try {
+      const list = await api.listPackVersions(mp.owner, mp.repo);
+      setHistCache((p) => ({ ...p, [mp.id]: list }));
+    } catch (e) {
+      setHistErr((p) => ({ ...p, [mp.id]: String(e) }));
+    } finally {
+      setHistLoading((p) => ({ ...p, [mp.id]: false }));
+    }
+  };
+
+  // 展开/收起某包的历史版本（首次展开时拉取）
+  const toggleHistory = (mp: PackMarketEntry) => {
+    if (histOpen === mp.id) {
+      setHistOpen(null);
+      return;
+    }
+    setHistOpen(mp.id);
+    if (!histCache[mp.id]) loadHistory(mp);
+  };
+
+  // 从市场条目的 downloadUrl 判断是否 GitHub Release 形态（只有这种才有历史版本可查）
+  const isGhReleasePack = (mp: PackMarketEntry) =>
+    /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\/download\//.test(mp.downloadUrl);
 
   return (
     <div className="modal-mask" onClick={close}>
@@ -3955,7 +4007,7 @@ function ImportDialog({
 
         {step === "pack-source" && (
           <div className="import-choices">
-            <button className="choice-card" onClick={loadMarket} disabled={loadingMarket || installing}>
+            <button className="choice-card" onClick={() => loadMarket()} disabled={loadingMarket || installing}>
               <div className="choice-title"><Icon name="globe" /> 在线下载整合包</div>
               <div className="choice-desc">浏览 dsh-pack-market 整合包市场，下载并校验 SHA-256 后导入。</div>
               {loadingMarket && <div className="dim">加载市场…</div>}
@@ -3974,6 +4026,16 @@ function ImportDialog({
 
         {step === "pack-online" && (
           <div>
+            <div className="row" style={{ marginBottom: 8 }}>
+              <span className="dim" style={{ fontSize: 12 }}>
+                市场数据本次运行内已缓存，作者发布新包后可手动刷新
+              </span>
+              <span className="flex-spacer" />
+              <button className="btn tiny" disabled={loadingMarket || installing} onClick={() => loadMarket(true)}>
+                刷新
+              </button>
+            </div>
+            {loadingMarket && <div className="dim" style={{ marginBottom: 6 }}>加载市场…</div>}
             {marketErr && <div className="error">{marketErr}</div>}
             {marketPacks && marketPacks.length === 0 && <div className="empty">市场暂无整合包</div>}
             <div className="pack-list">
@@ -4010,7 +4072,55 @@ function ImportDialog({
                     >
                       下载并导入
                     </button>
+                    {isGhReleasePack(mp) && (
+                      <button className="btn tiny" disabled={installing} onClick={() => toggleHistory(mp)}>
+                        {histOpen === mp.id ? "收起历史" : "历史版本"}
+                      </button>
+                    )}
                   </div>
+                  {histOpen === mp.id && (
+                    <div className="pack-versions">
+                      {histLoading[mp.id] && <div className="dim" style={{ padding: "6px 2px" }}>拉取历史版本…</div>}
+                      {histErr[mp.id] && (
+                        <div className="pack-ver-err">
+                          历史版本获取失败（网络原因可稍后重试）
+                          <button className="btn tiny" style={{ marginLeft: 8 }} onClick={() => loadHistory(mp)}>重试</button>
+                        </div>
+                      )}
+                      {histCache[mp.id]?.length === 0 && <div className="dim" style={{ padding: "6px 2px" }}>该仓库没有可用的历史 Release 附件</div>}
+                      {histCache[mp.id]?.map((v) => {
+                        const latest = v.tag === mp.version || v.tag === `v${mp.version}`;
+                        return (
+                          <div key={v.tag} className={`pack-ver${latest ? " latest" : ""}`}>
+                            <div className="pack-ver-head">
+                              <span className="pack-ver-tag">{v.tag}</span>
+                              {v.prerelease && <span className="tag warn">pre</span>}
+                              {latest && <span className="tag">索引最新</span>}
+                              {v.dshHint ? <span className="tag ok">适配 DSH {v.dshHint}</span> : <span className="tag">未标注适配</span>}
+                              <span className="dim pack-ver-sub">{v.publishedAt}{v.size > 0 && ` · ${formatSize(v.size)}`}</span>
+                              <span className="flex-spacer" />
+                              <button
+                                className="btn tiny primary"
+                                disabled={installing}
+                                onClick={async () => {
+                                  try {
+                                    const local = await api.downloadPack(v.downloadUrl, v.sha256, v.size);
+                                    await importAndInstall(local);
+                                  } catch (e) {
+                                    setGlobalError(String(e));
+                                  }
+                                }}
+                              >
+                                下载并导入
+                              </button>
+                            </div>
+                            {v.notes && <div className="pack-ver-notes">{v.notes}</div>}
+                            {!v.sha256 && <div className="dim" style={{ fontSize: 11 }}>⚠ 无哈希（跳过校验）</div>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -4048,6 +4158,112 @@ function ImportDialog({
 
 // ==================== 备注对话框（右键 profile，仅提示无约束） ====================
 // ==================== 重命名 Profile 对话框 ====================
+// ==================== 启动自动更新提醒模态框 ====================
+// 复用设置页同一套后端：download_update_cmd（update-download 进度事件）→ launch_installer_and_exit_cmd
+function StartupUpdateModal({ info, onClose }: { info: UpdateInfo; onClose: () => void }) {
+  const [downloading, setDownloading] = useState(false);
+  const [downPercent, setDownPercent] = useState(0);
+  const [downPath, setDownPath] = useState("");
+  const [downErr, setDownErr] = useState("");
+  const [closingForUpdate, setClosingForUpdate] = useState(false);
+
+  // 监听更新下载进度（与设置页的监听互不影响，各自更新各自状态）
+  useEffect(() => {
+    const un = listen("update-download", (e) => {
+      const p = e.payload as { done?: number | boolean; total?: number; percent?: number; path?: string; launched?: boolean };
+      if (typeof p?.done === "boolean" || p?.path) {
+        setDownloading(false);
+        if (p.path) setDownPath(p.path);
+      } else if (typeof p?.percent === "number") {
+        setDownPercent(p.percent);
+      }
+    });
+    return () => {
+      un.then((f) => f());
+    };
+  }, []);
+
+  const busy = downloading || !!downPath || closingForUpdate;
+
+  return (
+    <div className="modal-mask" onClick={busy ? undefined : onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 500 }}>
+        <div className="modal-head">
+          <h3>发现新版本 v{info.latest}</h3>
+          {!busy && (
+            <button className="btn tiny" onClick={onClose}><Icon name="x" size={11} /></button>
+          )}
+        </div>
+        <p className="modal-hint">
+          当前版本 v{info.current} → 最新版本 v{info.latest}。下载完成后可选择退出并自动运行安装程序。
+        </p>
+
+        {!downloading && !downPath && (
+          <button
+            className="btn primary"
+            style={{ width: "100%" }}
+            onClick={async () => {
+              setDownloading(true);
+              setDownPercent(0);
+              setDownPath("");
+              setDownErr("");
+              try {
+                const path = await api.downloadUpdate(info.latest);
+                setDownPath(path);
+              } catch (e) {
+                setDownErr(String(e));
+                setDownloading(false);
+              }
+            }}
+          >
+            <Icon name="download" /> 立即下载 v{info.latest}
+          </button>
+        )}
+        {downloading && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, margin: "10px 0" }}>
+            <div style={{ flex: 1, height: 6, background: "var(--border)", borderRadius: 3, overflow: "hidden" }}>
+              <div style={{ width: `${downPercent}%`, height: "100%", background: "#5b8cff", transition: "width .15s" }} />
+            </div>
+            <span style={{ color: "var(--text-dim)", width: 44, textAlign: "right" }}>{downPercent}%</span>
+          </div>
+        )}
+        {downErr && <div className="modal-err">{downErr}</div>}
+        {downPath && (
+          <div>
+            <div style={{ color: "var(--ok)", wordBreak: "break-all", fontSize: 12 }}>✅ 已保存：{downPath}</div>
+            <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+              <button className="btn tiny" onClick={() => api.openPath(downPath)}>
+                <Icon name="folder" /> 打开所在文件夹
+              </button>
+              <button
+                className="btn primary"
+                disabled={closingForUpdate}
+                onClick={async () => {
+                  setClosingForUpdate(true);
+                  try {
+                    await api.launchInstallerAndExit(downPath);
+                  } catch (e) {
+                    setDownErr(String(e));
+                    setClosingForUpdate(false);
+                  }
+                }}
+              >
+                {closingForUpdate ? "正在启动安装程序…" : <><Icon name="refresh" /> 关闭程序并更新</>}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {!downPath && (
+          <div className="modal-actions">
+            <button className="btn" onClick={onClose} disabled={closingForUpdate}>暂不更新</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function RenameDialog({
   name,
   profilesDir,

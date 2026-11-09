@@ -11,6 +11,7 @@ import type {
   DshEnv,
   InstallDone,
   InstallLogLine,
+  MarketCatalog,
   MarketPlugin,
   NpmPackageInfo,
   NpmSearchHit,
@@ -105,28 +106,37 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
     }
   }, [logs]);
 
-  // 加载市场目录
-  useEffect(() => {
-    if (tab !== "market" || catalog) return;
+  // 应用市场目录（源站有重复条目，按 name+owner 去重，避免 React key 冲突导致列表异常）
+  const applyCatalog = (cat: MarketCatalog) => {
+    const seen = new Set<string>();
+    const unique = (cat.plugins ?? []).filter((p) => {
+      const id = `${p.owner || ""}/${p.name || ""}|${p.install || ""}`;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+    setCatalog(unique);
+    setCategories(cat.categories);
+    setCatLabels(cat.categoryLabels ?? {});
+  };
+
+  // 加载市场目录（后端有进程级缓存：首次拉网，之后读缓存；force 绕过缓存）
+  const fetchCatalog = async (force = false) => {
     setCatLoading(true);
     setCatErr("");
-    api
-      .marketCatalog()
-      .then((cat) => {
-        // 源站有重复条目，按 name+owner 去重，避免 React key 冲突导致列表异常
-        const seen = new Set<string>();
-        const unique = (cat.plugins ?? []).filter((p) => {
-          const id = `${p.owner || ""}/${p.name || ""}|${p.install || ""}`;
-          if (seen.has(id)) return false;
-          seen.add(id);
-          return true;
-        });
-        setCatalog(unique);
-        setCategories(cat.categories);
-        setCatLabels(cat.categoryLabels ?? {});
-      })
-      .catch((e) => setCatErr(String(e)))
-      .finally(() => setCatLoading(false));
+    try {
+      applyCatalog(await api.marketCatalog(force));
+    } catch (e) {
+      setCatErr(String(e));
+    } finally {
+      setCatLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (tab !== "market" || catalog) return;
+    fetchCatalog();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, catalog]);
 
   const doSearch = async () => {
@@ -356,6 +366,14 @@ export default function InstallDialog({ env, profile, profilesDir, onClose, onIn
                   </option>
                 ))}
               </select>
+              <button
+                className="btn tiny"
+                title="绕过缓存，重新拉取市场目录"
+                disabled={catLoading}
+                onClick={() => fetchCatalog(true)}
+              >
+                刷新
+              </button>
             </div>
             {catLoading && <div className="hint">正在拉取市场目录（约 4MB）...</div>}
             {catErr && <div className="error">{catErr}</div>}

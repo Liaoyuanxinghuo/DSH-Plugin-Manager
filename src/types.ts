@@ -281,6 +281,18 @@ export interface PackMarketEntry {
   packType: string;
 }
 
+// 整合包历史版本（包仓库 GitHub Releases 懒加载）
+export interface PackVersionInfo {
+  tag: string;
+  publishedAt: string;
+  prerelease: boolean;
+  size: number;
+  downloadUrl: string;
+  sha256: string;
+  notes: string;
+  dshHint: string;
+}
+
 export interface PackExportResult {
   fileCount: number;
   zipSize: number;

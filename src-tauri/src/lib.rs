@@ -2645,14 +2645,25 @@ async fn export_pack_cmd(
 
 /// 拉取整合包市场索引（dsh-pack-market index.json）
 #[tauri::command]
-async fn market_packs_cmd() -> Result<Vec<packforge::MarketPackEntry>, String> {
+async fn market_packs_cmd(force: Option<bool>) -> Result<Vec<packforge::MarketPackEntry>, String> {
     tauri::async_runtime::spawn_blocking(move || {
 
-    packforge::read_market_index()
+    packforge::read_market_index_cached(force.unwrap_or(false))
 
     })
     .await
     .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+/// 拉取整合包历史版本（包仓库 GitHub Releases，懒加载）→ 阻塞线程池
+#[tauri::command]
+async fn list_pack_versions_cmd(
+    owner: String,
+    repo: String,
+) -> Result<Vec<packforge::PackVersionInfo>, String> {
+    tauri::async_runtime::spawn_blocking(move || packforge::list_pack_versions(&owner, &repo))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
 /// 下载整合包到缓存目录并校验 sha256 + size
@@ -2835,10 +2846,10 @@ async fn check_compat_cmd(
 
 /// 拉取插件市场目录
 #[tauri::command]
-async fn market_catalog_cmd() -> Result<market::MarketCatalog, String> {
+async fn market_catalog_cmd(force: Option<bool>) -> Result<market::MarketCatalog, String> {
     tauri::async_runtime::spawn_blocking(move || {
 
-    market::market_catalog()
+    market::market_catalog_cached(force.unwrap_or(false))
 
     })
     .await
@@ -3309,6 +3320,7 @@ pub fn run() {
             profile_node_modules_size,
             export_pack_cmd,
             market_packs_cmd,
+            list_pack_versions_cmd,
             download_pack_cmd,
             import_pack_cmd,
             complement_manifest_cmd,

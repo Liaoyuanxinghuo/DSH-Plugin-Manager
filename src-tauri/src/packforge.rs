@@ -46,6 +46,260 @@ struct MarketIndex {
     modpacks: Vec<serde_json::Value>,
 }
 
+/// 历史版本条目（来自包仓库的 GitHub Releases，懒加载）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackVersionInfo {
+    /// Release tag（如 v2.9.0）
+    pub tag: String,
+    /// 发布日期（YYYY-MM-DD）
+    pub published_at: String,
+    /// 预发布标记
+    pub prerelease: bool,
+    /// 包资产大小（字节）
+    pub size: u64,
+    /// 包下载 URL（Release 资产直链，走镜像轮询）
+    pub download_url: String,
+    /// SHA-256（来自 GitHub 资产 digest 字段，缺失为空串=跳过校验）
+    pub sha256: String,
+    /// 发行说明摘要（去 markdown 标记、截断）
+    pub notes: String,
+    /// 从说明里提取的适配 DSH 版本（尽力而为，未标注为空串）
+    pub dsh_hint: String,
+}
+
+/// 市场卡片「历史版本」：列出包仓库 GitHub Releases 的 .dspack/.tgz 资产
+pub fn list_pack_versions(owner: &str, repo: &str) -> Result<Vec<PackVersionInfo>, String> {
+    let owner = owner.trim();
+    let repo = repo.trim();
+    if owner.is_empty() || repo.is_empty() || owner.contains('/') || repo.contains('/') {
+        return Err("无效的 owner/repo".to_string());
+    }
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=30");
+    let (_used, body) = crate::ghnet::fetch_text(&url)
+        .map_err(|e| format!("拉取历史版本失败: {e}"))?;
+    let rels: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("解析 Releases 失败: {e}"))?;
+    let arr = rels
+        .as_array()
+        .ok_or_else(|| "Releases 响应格式异常".to_string())?;
+
+    let mut out = Vec::new();
+    for r in arr {
+        let tag = r.get("tag_name").and_then(|x| x.as_str()).unwrap_or("");
+        if tag.is_empty() {
+            continue;
+        }
+        // 每个取一个包资产：优先 .dspack，其次 .tgz（契约允许两种格式）
+        let assets = r.get("assets").and_then(|x| x.as_array());
+        let mut pack: Option<&serde_json::Value> = None;
+        for want in [".dspack", ".tgz"] {
+            if let Some(a) = assets.and_then(|as_| {
+                as_.iter().find(|a| {
+                    a.get("name")
+                        .and_then(|x| x.as_str())
+                        .map(|n| n.to_lowercase().ends_with(want))
+                        .unwrap_or(false)
+                })
+            }) {
+                pack = Some(a);
+                break;
+            }
+        }
+        let Some(a) = pack else { continue };
+        let download_url = a
+            .get("browser_download_url")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if download_url.is_empty() {
+            continue;
+        }
+        let digest = a
+            .get("digest")
+            .and_then(|x| x.as_str())
+            .and_then(|d| d.strip_prefix("sha256:"))
+            .unwrap_or("")
+            .to_string();
+        let notes_full = r.get("body").and_then(|x| x.as_str()).unwrap_or("");
+        out.push(PackVersionInfo {
+            tag: tag.to_string(),
+            published_at: r
+                .get("published_at")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .get(..10)
+                .unwrap_or("")
+                .to_string(),
+            prerelease: r
+                .get("prerelease")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            size: a.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+            download_url,
+            sha256: digest,
+            notes: summarize_notes(notes_full),
+            dsh_hint: extract_release_dsh_hint(notes_full),
+        });
+    }
+    Ok(out)
+}
+
+/// 发行说明摘要：剥掉常见 markdown 标记，压成单行，截 160 字符
+fn summarize_notes(body: &str) -> String {
+    let mut line = String::new();
+    for raw in body.lines() {
+        let t = raw.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with('>') || t.starts_with("|") {
+            continue;
+        }
+        let clean = t
+            .replace("**", "")
+            .replace('`', "")
+            .replace("[", "")
+            .replace("]", "");
+        if !clean.is_empty() {
+            line = clean;
+            break;
+        }
+    }
+    if line.is_empty() {
+        line = body.trim().replace('\n', " ");
+    }
+    if line.chars().count() > 160 {
+        let head: String = line.chars().take(160).collect();
+        line = format!("{head}…");
+    }
+    line
+}
+
+/// 从发行说明提取适配 DSH 版本（尽力而为，宁缺勿错）。
+/// 分层候选：0 箭头升级句式（"基座 X → Y" 取 Y）> 1 关键词紧邻（"DSH `0.2.x`"）> 2 关键词近窗（12 字符内）。
+/// 只认 dsh/基座/适配/pinned 等关键词行，避免把插件版本（billion-context@0.1.212）当基座。
+fn extract_release_dsh_hint(body: &str) -> String {
+    const KEYWORDS: &[&str] = &["dsh", "基座", "适配", "pinned to", "pinned", "锁定"];
+
+    // 版本号必须精确起始于 pos：0.x.y[-pre]，两三个点、纯数字段
+    fn version_at(s: &str, pos: usize) -> Option<String> {
+        let b = s.as_bytes();
+        if pos + 1 >= b.len() || b[pos] != b'0' || b[pos + 1] != b'.' {
+            return None;
+        }
+        let mut end = pos + 2;
+        while end < b.len() && (b[end].is_ascii_digit() || b[end] == b'.') {
+            end += 1;
+        }
+        // 预发布后缀：-rc.2 / -alpha.1 / -pre.4
+        let mut full = end;
+        if full < b.len() && b[full] == b'-' {
+            let mut j = full + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'.') {
+                j += 1;
+            }
+            if j > full + 1 {
+                full = j;
+            }
+        }
+        let cand = &s[pos..full];
+        let core = cand.split('-').next().unwrap_or("");
+        let dots = core.matches('.').count();
+        if (2..=3).contains(&dots)
+            && core.split('.').all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+        {
+            Some(cand.to_string())
+        } else {
+            None
+        }
+    }
+
+    // 自由扫描：左边界干净（前一字符非数字/点，排除 IP 127.0.0.1）的第一个版本号
+    fn scan_version(s: &str) -> Option<String> {
+        let b = s.as_bytes();
+        for i in 0..b.len() {
+            let clean_left = i == 0 || !(b[i - 1].is_ascii_digit() || b[i - 1] == b'.');
+            if clean_left && b[i] == b'0' && i + 1 < b.len() && b[i + 1] == b'.' {
+                if let Some(v) = version_at(s, i) {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    let mut best: Option<(u8, String)> = None;
+    let mut consider = |tier: u8, v: Option<String>, best: &mut Option<(u8, String)>| {
+        let Some(v) = v else { return };
+        let better = match best {
+            None => true,
+            Some((t, _)) => tier < *t,
+        };
+        if better {
+            *best = Some((tier, v));
+        }
+    };
+
+    for line in body.lines() {
+        let lower = line.to_lowercase();
+        if !KEYWORDS.iter().any(|k| lower.contains(k)) {
+            continue;
+        }
+        // 长度不一致说明 to_lowercase 改了字节数（罕见 Unicode），关键词定位不可靠，跳过定位
+        let aligned = lower.len() == line.len();
+        // tier 0：升级箭头后的新版本（"基座 DSH 0.2.0-rc.2 → 0.2.1-rc.2"）
+        let arrow = line.rfind('→').or_else(|| line.rfind("->"));
+        if let Some(pos) = arrow {
+            let skip = if line[pos..].starts_with("->") { 2 } else { '→'.len_utf8() };
+            let tail = &line[pos + skip..];
+            let mut tlen = tail.len().min(60);
+            while tlen > 0 && !tail.is_char_boundary(tlen) {
+                tlen -= 1;
+            }
+            consider(0, scan_version(&tail[..tlen]), &mut best);
+        }
+        if !aligned {
+            continue;
+        }
+        // tier 1/2：关键词后紧邻/近窗的版本号
+        for kw in KEYWORDS {
+            let mut from = 0;
+            while let Some(rel) = lower[from..].find(kw) {
+                let at = from + rel + kw.len();
+                from = at;
+                if at >= line.len() {
+                    break;
+                }
+                let rest = &line[at..];
+                // 跳过 markdown/引号/空白等分隔符
+                let seps = [' ', '\t', '`', '*', '"', '\'', '「', '『', '(', '（', '[', '>'];
+                let mut i = 0;
+                for c in rest.chars() {
+                    if seps.contains(&c) {
+                        i += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                let rb = rest.as_bytes();
+                // 可选 v/V 前缀（"requires DSH v0.2.0-rc.1"）
+                if i + 1 < rb.len() && (rb[i] == b'v' || rb[i] == b'V') && rb[i + 1] == b'0' {
+                    i += 1;
+                }
+                if let Some(v) = version_at(rest, i) {
+                    consider(1, Some(v), &mut best);
+                    continue;
+                }
+                // tier 2：关键词后 14 字符窗内自由扫描（多字节字符按边界收缩）
+                let mut end = rest.len().min(14);
+                while end > 0 && !rest.is_char_boundary(end) {
+                    end -= 1;
+                }
+                consider(2, scan_version(&rest[..end]), &mut best);
+            }
+        }
+    }
+    best.map(|(_, v)| v).unwrap_or_default()
+}
+
 /// 导出结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -462,6 +716,8 @@ const MARKET_INDEX_URL: &str =
     "https://raw.githubusercontent.com/DSH-PackForge/dsh-pack-market/main/index/index.json";
 
 /// 拉取整合包市场索引（统一 ghnet 镜像轮询）
+///
+/// 注意：一般应走 [`read_market_index_cached`]（进程级内存缓存，软件退出自动释放）
 pub fn read_market_index() -> Result<Vec<MarketPackEntry>, String> {
     let (_used, body) = crate::ghnet::fetch_text(MARKET_INDEX_URL)
         .map_err(|e| format!("拉取整合包市场失败: {e}"))?;
@@ -500,6 +756,27 @@ pub fn read_market_index() -> Result<Vec<MarketPackEntry>, String> {
         });
     }
     Ok(out)
+}
+
+// ==================== 进程级内存缓存（软件退出自动释放） ====================
+
+fn pack_index_cell() -> &'static std::sync::Mutex<Option<Vec<MarketPackEntry>>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<Vec<MarketPackEntry>>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 带缓存的市场索引：force=false 优先读缓存（本次运行内只拉一次网）；force=true 强制重拉
+pub fn read_market_index_cached(force: bool) -> Result<Vec<MarketPackEntry>, String> {
+    if !force {
+        let guard = pack_index_cell().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(list) = guard.as_ref() {
+            return Ok(list.clone());
+        }
+    }
+    let list = read_market_index()?;
+    *pack_index_cell().lock().unwrap_or_else(|p| p.into_inner()) = Some(list.clone());
+    Ok(list)
 }
 
 /// 下载整合包到缓存目录，校验 sha256 + size（统一 ghnet 镜像轮询）
@@ -1157,6 +1434,117 @@ pub fn note_key(name: &str, profiles_dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_release_dsh_hint() {
+        // 关键词行优先
+        assert_eq!(
+            extract_release_dsh_hint("## v2.9.0\n基座 DSH 0.2.0-rc.2 不变。换装桌宠。"),
+            "0.2.0-rc.2"
+        );
+        assert_eq!(
+            extract_release_dsh_hint("适配 DSH 0.2.1-rc.2（预发布）"),
+            "0.2.1-rc.2"
+        );
+        // 升级箭头句式：取箭头后的新版本（真实 v3.0.0 场景）
+        assert_eq!(
+            extract_release_dsh_hint("> 基座 DSH `0.2.0-rc.2` → **`0.2.1-rc.2`**。重新划分插件。"),
+            "0.2.1-rc.2"
+        );
+        // 英文 changelog + markdown 反引号 + pinned to 句式（真实 pre-release 场景）
+        assert_eq!(
+            extract_release_dsh_hint("Kept the DSH host pinned to `0.2.2-rc.1` and the existing 10 plugins."),
+            "0.2.2-rc.1"
+        );
+        // 插件版本号不误判为基座（真实事故：billion-context@0.1.212）
+        assert_eq!(
+            extract_release_dsh_hint("Added `billion-context@0.1.212` for compression. Ships a DSH bundle patch."),
+            ""
+        );
+        // 无关键词兜底已移除：宁标未标注不给错的
+        assert_eq!(extract_release_dsh_hint("锁定 0.1.5-alpha.2 版本"), "0.1.5-alpha.2");
+        assert_eq!(extract_release_dsh_hint("没有任何版本号"), "");
+        // 关键词行内多个 0.x 时取紧邻关键词的第一个
+        assert_eq!(extract_release_dsh_hint("基座 0.2.0，插件 dsh-cost-meter 1.9.30"), "0.2.0");
+        // 非版本数字不误判（IP / 端口）：127.0.0.1 的 0.0.1 有左边界，不认
+        assert_eq!(extract_release_dsh_hint("端口 3082 与 IP 127.0.0.1"), "");
+    }
+
+    #[test]
+    fn test_summarize_notes() {
+        // 跳过标题/引用/空行，取第一段正文并剥 markdown
+        let body = "# v2.9.0\n\n> 引用不取\n\n本版做两件事：**桌宠换装**与 `ego-browser`。";
+        assert_eq!(summarize_notes(body), "本版做两件事：桌宠换装与 ego-browser。");
+        // 截断：160 字符 + 省略号
+        let long = "x".repeat(200);
+        let s = summarize_notes(&long);
+        assert!(s.chars().count() == 161 && s.ends_with('…'));
+        // 空说明
+        assert_eq!(summarize_notes(""), "");
+    }
+
+    #[test]
+    fn test_list_pack_versions_input_guard() {
+        assert!(list_pack_versions("", "repo").is_err());
+        assert!(list_pack_versions("a/b", "repo").is_err());
+        assert!(list_pack_versions("owner", "").is_err());
+    }
+
+    #[test]
+    fn test_pack_index_cache_hit_without_network() {
+        // 预置哨兵缓存：force=false 必须直接返回缓存（不发网络请求）
+        let sentinel = vec![MarketPackEntry {
+            name: "sentinel-pack".into(),
+            version: "9.9.9".into(),
+            display_name: String::new(),
+            description: String::new(),
+            author: String::new(),
+            category: String::new(),
+            dsh_version: String::new(),
+            profile_name: String::new(),
+            download_url: String::new(),
+            sha256: String::new(),
+            size: 0,
+            updated_at: String::new(),
+            id: "sentinel".into(),
+            owner: "s".into(),
+            repo: "r".into(),
+            bundle_count: 0,
+            dep_count: 0,
+            profile_count: 0,
+            manifest_version: 5,
+            pack_type: "profile".into(),
+        }];
+        *pack_index_cell().lock().unwrap_or_else(|p| p.into_inner()) = Some(sentinel);
+        let list = read_market_index_cached(false).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "sentinel-pack");
+        // 清理
+        *pack_index_cell().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// 真实拉取验证（网络可用时）：Release 资产 digest / 摘要 / hint 提取
+    /// `cargo test --lib packforge::tests::test_list_pack_versions_real -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn test_list_pack_versions_real() {
+        match list_pack_versions("yukitakasama", "better-deepseek-harness-codex") {
+            Ok(list) => {
+                eprintln!("版本数: {}", list.len());
+                assert!(!list.is_empty(), "应有历史版本");
+                let with_hash = list.iter().filter(|v| !v.sha256.is_empty()).count();
+                eprintln!("带 digest: {with_hash}/{}", list.len());
+                assert!(with_hash > 0, "Release 资产应带 sha256 digest");
+                for v in list.iter().take(5) {
+                    eprintln!("- {} | pre={} | {} | dsh={} | {}", v.tag, v.prerelease, v.published_at, v.dsh_hint, &v.notes[..v.notes.len().min(40)]);
+                }
+                assert!(list.iter().any(|v| !v.download_url.is_empty()));
+            }
+            Err(e) => {
+                eprintln!("SKIP: 网络不可用 {e}");
+            }
+        }
+    }
 
     #[test]
     fn extract_dsh_hint_prefers_manifest_field() {

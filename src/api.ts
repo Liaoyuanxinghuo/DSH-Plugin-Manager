@@ -7,6 +7,7 @@ import type {
   PackExportResult,
   PackImportResult,
   PackMarketEntry,
+  PackVersionInfo,
   PackPeekResult,
   ProfileManifest,
   ProfileNotesMap,
@@ -61,7 +62,7 @@ export const api = {
   disallowVersion: (envId: string, profile: string, profilesDir: string, pkgSpec: string) =>
     invoke<InstallOutcome>("disallow_version_cmd", { envId, profile, profilesDirStr: profilesDir, pkgSpec }),
   // 插件市场目录
-  marketCatalog: () => invoke<MarketCatalog>("market_catalog_cmd"),
+  marketCatalog: (force = false) => invoke<MarketCatalog>("market_catalog_cmd", { force }),
   // 修复 pnpm 构建白名单（git 源插件）
   fixBuildPermit: (envId: string, profile: string, packages: string[]) =>
     invoke<string[]>("fix_build_permit_cmd", { envId, profile, packages }),
@@ -184,7 +185,9 @@ export const api = {
     displayName: string,
     dshHint?: string,
   ) => invoke<PackExportResult>("export_pack_cmd", { envId, profile, profilesDirStr: profilesDir, targetPath, packName, packVersion, displayName, dshHint }),
-  marketPacks: () => invoke<PackMarketEntry[]>("market_packs_cmd"),
+  marketPacks: (force = false) => invoke<PackMarketEntry[]>("market_packs_cmd", { force }),
+  listPackVersions: (owner: string, repo: string) =>
+    invoke<PackVersionInfo[]>("list_pack_versions_cmd", { owner, repo }),
   downloadPack: (url: string, sha256: string, size: number) =>
     invoke<string>("download_pack_cmd", { url, sha256, size }),
   importPack: (envId: string, packPath: string, profilesDir: string) =>

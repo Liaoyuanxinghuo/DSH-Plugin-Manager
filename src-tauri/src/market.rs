@@ -138,12 +138,51 @@ pub fn market_catalog() -> Result<MarketCatalog, String> {
     })
 }
 
+// ==================== 进程级内存缓存（软件退出自动释放） ====================
+
+fn catalog_cell() -> &'static std::sync::Mutex<Option<MarketCatalog>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<MarketCatalog>>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 带缓存的市场目录：force=false 优先读缓存（本次运行内只拉一次网）；force=true 强制重拉
+pub fn market_catalog_cached(force: bool) -> Result<MarketCatalog, String> {
+    if !force {
+        let guard = catalog_cell().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(c) = guard.as_ref() {
+            return Ok(c.clone());
+        }
+    }
+    let cat = market_catalog()?;
+    *catalog_cell().lock().unwrap_or_else(|p| p.into_inner()) = Some(cat.clone());
+    Ok(cat)
+}
+
 fn name(p: &serde_json::Value) -> &str {
     p.get("name").and_then(|v| v.as_str()).unwrap_or("")
 }
 
 fn owner(p: &serde_json::Value) -> &str {
     p.get("owner").and_then(|v| v.as_str()).unwrap_or("")
+}
+
+#[test]
+fn test_catalog_cache_hit_without_network() {
+    // 预置哨兵缓存：force=false 必须直接返回缓存（不发网络请求）
+    let mut guard = catalog_cell().lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some(MarketCatalog {
+        name: "sentinel".into(),
+        count: 0,
+        updated: String::new(),
+        categories: vec![],
+        category_labels: Default::default(),
+        plugins: vec![],
+    });
+    drop(guard);
+    let c = market_catalog_cached(false).unwrap();
+    assert_eq!(c.name, "sentinel");
+    // 清理，避免污染其他测试
+    *catalog_cell().lock().unwrap_or_else(|p| p.into_inner()) = None;
 }
 
 #[cfg(test)]
