@@ -3439,7 +3439,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.27</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.28</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -4112,7 +4112,7 @@ function ImportDialog({
                           <div key={v.tag} className={`pack-ver${latest ? " latest" : ""}`}>
                             <div className="pack-ver-head">
                               <span className="pack-ver-tag">{v.tag}</span>
-                              {v.prerelease && <span className="tag warn">pre</span>}
+                              {v.prerelease && <span className="tag hint">pre</span>}
                               {latest && <span className="tag">索引最新</span>}
                               {v.dshHint ? <span className="tag ok">适配 DSH {v.dshHint}</span> : <span className="tag">未标注适配</span>}
                               <span className="dim pack-ver-sub">{v.publishedAt}{v.size > 0 && ` · ${formatSize(v.size)}`}</span>

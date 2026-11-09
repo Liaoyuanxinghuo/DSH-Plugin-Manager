@@ -5,7 +5,7 @@
 // 差集规则：包名精确匹配，同名无论版本异同都跳过；基础包永不参与。
 import { useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { api, pickDspackFile } from "./api";
+import { api, formatSize, pickDspackFile } from "./api";
 import type {
   ComplementCopyItem,
   DshEnv,
@@ -13,6 +13,7 @@ import type {
   InstallLogLine,
   PackMarketEntry,
   PackPeekResult,
+  PackVersionInfo,
   ProfileInfo,
 } from "./types";
 
@@ -95,6 +96,11 @@ export default function ComplementDialog({ env, profile, profilesDir, profiles, 
   const [packsLoading, setPacksLoading] = useState(false);
   const [packsErr, setPacksErr] = useState("");
   const [packId, setPackId] = useState("");
+  // B: 历史版本（懒加载 + 失败重试，与导入对话框同款交互；histOpen 记录展开的包 id）
+  const [histOpen, setHistOpen] = useState<string | null>(null);
+  const [histList, setHistList] = useState<Record<string, PackVersionInfo[]>>({});
+  const [histLoading, setHistLoading] = useState<Record<string, boolean>>({});
+  const [histErr, setHistErr] = useState<Record<string, string>>({});
 
   // B+C 共用：peek 结果
   const [peek, setPeek] = useState<PackPeekResult | null>(null);
@@ -144,6 +150,9 @@ export default function ComplementDialog({ env, profile, profilesDir, profiles, 
     setPeek(null);
     setPeekUnit("");
     setPeekErr("");
+    setHistOpen(null);
+    setHistList({});
+    setHistErr({});
     setChecked(new Set());
     setResults([]);
     setLogs([]);
@@ -208,9 +217,10 @@ export default function ComplementDialog({ env, profile, profilesDir, profiles, 
     }
   };
 
-  // B: 下载在线包后 peek
+  // B: 下载在线包后 peek（切换包时收起历史面板；列表缓存按包保留）
   const peekMarketPack = async (id: string) => {
     setPackId(id);
+    setHistOpen(null);
     const hit = packs?.find((p) => p.id === id);
     if (!hit) return;
     setPeekLoading(true);
@@ -220,6 +230,50 @@ export default function ComplementDialog({ env, profile, profilesDir, profiles, 
     setResults([]);
     try {
       const local = await api.downloadPack(hit.downloadUrl, hit.sha256, hit.size);
+      await peekPackPath(local);
+    } catch (e) {
+      setPeekErr(String(e));
+    } finally {
+      setPeekLoading(false);
+    }
+  };
+
+  // B: 历史版本 —— 只有 GitHub Release 形态的包才有历史可查
+  const isGhReleasePack = (mp: PackMarketEntry) =>
+    /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\/download\//.test(mp.downloadUrl);
+
+  const loadHistory = async (mp: PackMarketEntry) => {
+    if (histList[mp.id] || histLoading[mp.id]) return;
+    setHistLoading((p) => ({ ...p, [mp.id]: true }));
+    setHistErr((p) => ({ ...p, [mp.id]: "" }));
+    try {
+      const list = await api.listPackVersions(mp.owner, mp.repo);
+      setHistList((p) => ({ ...p, [mp.id]: list }));
+    } catch (e) {
+      setHistErr((p) => ({ ...p, [mp.id]: String(e) }));
+    } finally {
+      setHistLoading((p) => ({ ...p, [mp.id]: false }));
+    }
+  };
+
+  const toggleHistory = (mp: PackMarketEntry) => {
+    if (histOpen === mp.id) {
+      setHistOpen(null);
+      return;
+    }
+    setHistOpen(mp.id);
+    if (!histList[mp.id]) loadHistory(mp);
+  };
+
+  // 下载指定历史版本的包后 peek（不落 profile，仅读清单做差集）
+  const peekMarketVersion = async (v: PackVersionInfo) => {
+    setPeekLoading(true);
+    setPeekErr("");
+    setPeek(null);
+    setChecked(new Set());
+    setResults([]);
+    try {
+      const local = await api.downloadPack(v.downloadUrl, v.sha256, v.size);
       await peekPackPath(local);
     } catch (e) {
       setPeekErr(String(e));
@@ -380,16 +434,68 @@ export default function ComplementDialog({ env, profile, profilesDir, profiles, 
             {packsLoading && <div className="hint">正在拉取整合包市场…</div>}
             {packsErr && <div className="error">{packsErr}</div>}
             {packs && (
-              <div className="row">
-                <select className="input grow" value={packId} onChange={(e) => peekMarketPack(e.target.value)}>
-                  <option value="">选择在线整合包（下载后只读清单，不新建 profile）</option>
-                  {packs.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.displayName || p.name} v{p.version}{p.packType === "dshhome" ? "（多 profile）" : ""}{p.dshVersion ? ` · dsh ${p.dshVersion}` : ""}
-                    </option>
+              <>
+                <div className="hit-meta dim-note" style={{ marginBottom: 0 }}>
+                  选择在线整合包（下载后只读清单，不新建 profile）：
+                </div>
+                <div className="pack-list" style={{ margin: "8px 0" }}>
+                  {packs.map((mp) => (
+                    <div key={mp.id} className={`pack-item${packId === mp.id ? " selected" : ""}`}>
+                      <div className="pack-item-head">
+                        <span className="pack-name">{mp.displayName || mp.name}</span>
+                        <span className="tag">v{mp.version}</span>
+                        {mp.packType === "dshhome" && <span className="tag">多 profile</span>}
+                        {mp.dshVersion && <span className="tag">dsh {mp.dshVersion}</span>}
+                      </div>
+                      <div className="pack-desc">
+                        {mp.description || "（无描述）"}
+                        {mp.author && <span className="dim"> — {mp.author}</span>}
+                      </div>
+                      <div className="pack-actions">
+                        <button className="btn tiny primary" disabled={peekLoading} onClick={() => peekMarketPack(mp.id)}>
+                          {packId === mp.id ? "重新解析" : "选择补全"}
+                        </button>
+                        {isGhReleasePack(mp) && (
+                          <button className="btn tiny" disabled={peekLoading} onClick={() => toggleHistory(mp)}>
+                            {histOpen === mp.id ? "收起历史" : "历史版本"}
+                          </button>
+                        )}
+                      </div>
+                      {histOpen === mp.id && (
+                        <div className="pack-versions">
+                          {histLoading[mp.id] && <div className="dim" style={{ padding: "6px 2px" }}>拉取历史版本…</div>}
+                          {histErr[mp.id] && (
+                            <div className="pack-ver-err">
+                              历史版本获取失败（网络原因可稍后重试）
+                              <button className="btn tiny" style={{ marginLeft: 8 }} onClick={() => loadHistory(mp)}>重试</button>
+                            </div>
+                          )}
+                          {histList[mp.id]?.length === 0 && <div className="dim" style={{ padding: "6px 2px" }}>该仓库没有可用的历史 Release 附件</div>}
+                          {histList[mp.id]?.map((v) => {
+                            const latest = v.tag === mp.version || v.tag === `v${mp.version}`;
+                            return (
+                              <div key={v.tag} className={`pack-ver${latest ? " latest" : ""}`}>
+                                <div className="pack-ver-head">
+                                  <span className="pack-ver-tag">{v.tag}</span>
+                                  {v.prerelease && <span className="tag hint">pre</span>}
+                                  {latest && <span className="tag bundle">索引最新</span>}
+                                  {v.dshHint ? <span className="tag ok">适配 DSH {v.dshHint}</span> : <span className="tag">未标注适配</span>}
+                                  <span className="dim pack-ver-sub">{v.publishedAt}{v.size > 0 && ` · ${formatSize(v.size)}`}</span>
+                                  <span className="flex-spacer" />
+                                  <button className="btn tiny primary" disabled={peekLoading} onClick={() => peekMarketVersion(v)}>
+                                    补全此版本
+                                  </button>
+                                </div>
+                                {v.notes && <div className="pack-ver-notes">{v.notes}</div>}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
                   ))}
-                </select>
-              </div>
+                </div>
+              </>
             )}
             {peekLoading && <div className="hint">正在下载并解析清单…</div>}
             {peekErr && <div className="error">{peekErr}</div>}
