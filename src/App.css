@@ -713,3 +713,83 @@ html, body { transition: background-color 0.25s ease, color 0.25s ease; }
   0% { background-position: 100% 50%; }
   100% { background-position: 0 50%; }
 }
+
+/* ==================== 会话修复对话框（对齐 dsh-session-compat-fix 插件界面） ==================== */
+.sfix-head { margin-bottom: 10px; }
+.sfix-title { margin: 0; font-size: 15px; font-weight: 600; }
+.sfix-sub { margin: 6px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-dim); }
+.sfix-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sfix-spacer { flex: 1; }
+.sfix-summary { font-size: 12px; color: var(--text-dim); }
+.sfix-list { max-height: 42vh; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+.sfix-row {
+  display: grid;
+  grid-template-columns: 24px 76px minmax(0, 1fr) minmax(140px, auto) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.sfix-row:last-child { border-bottom: none; }
+.sfix-row-head {
+  background: var(--panel-2);
+  font-weight: 600;
+  color: var(--text-dim);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.sfix-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sfix-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  border: 1px solid transparent;
+  white-space: nowrap;
+  text-align: center;
+}
+.sfix-badge-healthy { color: var(--ok); border-color: var(--ok); }
+.sfix-badge-contaminated { color: var(--warn); border-color: var(--warn); }
+.sfix-badge-unreadable { color: var(--danger); border-color: var(--danger); }
+.sfix-types {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sfix-muted { color: var(--text-dim); }
+.sfix-mono { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11px; }
+.sfix-alert {
+  font-size: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  white-space: pre-wrap;
+}
+.sfix-ok {
+  font-size: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--ok);
+  color: var(--ok);
+  white-space: pre-wrap;
+}
+.sfix-empty { padding: 30px; text-align: center; font-size: 12px; color: var(--text-dim); }
+.sfix-detail {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  max-height: 40vh;
+  overflow: auto;
+  font-size: 12px;
+  background: var(--panel-2);
+}
+.sfix-kv { display: grid; grid-template-columns: 110px 1fr; gap: 5px 12px; margin: 10px 0; }
+.sfix-kv dt { color: var(--text-dim); }
+.sfix-kv dd { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

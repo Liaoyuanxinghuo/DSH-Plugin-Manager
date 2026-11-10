@@ -15,6 +15,7 @@ mod packforge;
 mod patchfile;
 mod portgit;
 mod settings;
+mod session_fix;
 mod toolchain;
 mod profile_io;
 mod runner;
@@ -26,7 +27,7 @@ mod webauth;
 use models::*;
 use std::collections::HashMap;
 use tauri::Manager;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::State;
 use tauri::Emitter;
@@ -1992,6 +1993,167 @@ fn pick_release_notes(releases: &serde_json::Value, latest: &str) -> String {
     String::new()
 }
 
+// ==================== 命令：会话版本兼容修复 ====================
+
+/// 会话修复：词汇表来源根（env home + 下载目录各版本 + profiles 全局 npm 包）
+fn session_vocab_roots(state: &State<'_, AppState>, env_id: &str) -> Result<Vec<PathBuf>, String> {
+    let env = get_env_inner(state, env_id)?;
+    let mut roots = vec![PathBuf::from(&env.home_dir)];
+    let dl = settings::load_settings().dsh_download_dir;
+    if !dl.trim().is_empty() {
+        roots.push(PathBuf::from(dl.trim()));
+    }
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".dsh").join("profiles"));
+    }
+    Ok(roots)
+}
+
+/// 解析扫描/回滚用的会话目录（自定义优先，否则 env.home/sessions）
+fn session_dir_for(env: &models::DshEnv, custom_dir: Option<&str>) -> PathBuf {
+    match custom_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(d) => PathBuf::from(d),
+        None => session_fix::sessions_dir_for_home(Path::new(env.home_dir.trim())),
+    }
+}
+
+/// 列出本机可用的会话事件词汇表版本（内置 0.2.0/0.2.1 兜底 + 本机探测）
+#[tauri::command]
+async fn session_vocab_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+) -> Result<Vec<session_fix::VocabInfo>, String> {
+    let roots = session_vocab_roots(&state, &env_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(session_fix::merged_vocabs(&roots).into_iter().map(|e| e.info).collect())
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+/// 扫描会话目录：列出故障会话（未知且未标 ignorable 的事件）
+#[tauri::command]
+async fn session_scan_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    target_version: String,
+    custom_dir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let roots = session_vocab_roots(&state, &env_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = session_dir_for(&env, custom_dir.as_deref());
+        let entries = session_fix::merged_vocabs(&roots);
+        let picked = session_fix::pick_vocab_entry(&entries, target_version.trim())
+            .ok_or_else(|| format!("未找到任何词汇表（检查 DSH 安装目录：{roots:?}）"))?;
+        let known: std::collections::HashSet<String> = picked.types.iter().cloned().collect();
+        let items = session_fix::scan_sessions_dir(&dir, &known)?;
+        Ok(serde_json::json!({
+            "dir": dir.to_string_lossy(),
+            "usedVersion": picked.info.version,
+            "usedCount": known.len(),
+            "items": items,
+        }))
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+/// 修复选中会话（支持单个；帧级重写；活跃保护；自动备份；幂等）
+#[tauri::command]
+async fn session_fix_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    target_version: String,
+    paths: Vec<String>,
+) -> Result<session_fix::FixResult, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let roots = session_vocab_roots(&state, &env_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let entries = session_fix::merged_vocabs(&roots);
+        let picked = session_fix::pick_vocab_entry(&entries, target_version.trim())
+            .ok_or_else(|| "未找到任何词汇表".to_string())?;
+        let known: std::collections::HashSet<String> = picked.types.iter().cloned().collect();
+        let dir = session_dir_for(&env, None);
+        let backups_root = session_fix::backups_root_for(&dir);
+        let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let window = std::time::Duration::from_secs(session_fix::ACTIVE_WINDOW_SECS);
+        session_fix::fix_sessions(&paths, &backups_root, &known, target_version.trim(), window)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+/// 截断回滚（破坏性兜底）：删除第一个未知事件及其后全部内容（仅修复无效时用）
+#[tauri::command]
+async fn session_truncate_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    target_version: String,
+    paths: Vec<String>,
+) -> Result<session_fix::TruncateResult, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let roots = session_vocab_roots(&state, &env_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let entries = session_fix::merged_vocabs(&roots);
+        let picked = session_fix::pick_vocab_entry(&entries, target_version.trim())
+            .ok_or_else(|| "未找到任何词汇表".to_string())?;
+        let known: std::collections::HashSet<String> = picked.types.iter().cloned().collect();
+        let dir = session_dir_for(&env, None);
+        let backups_root = session_fix::backups_root_for(&dir);
+        let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let window = std::time::Duration::from_secs(session_fix::ACTIVE_WINDOW_SECS);
+        session_fix::truncate_sessions(&paths, &backups_root, &known, target_version.trim(), window)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+/// 回滚最近一次备份（按清单精确还原；回滚前自动快照当前状态）
+#[tauri::command]
+async fn session_rollback_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+) -> Result<session_fix::RollbackResult, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let dir = session_dir_for(&env, None);
+    tauri::async_runtime::spawn_blocking(move || session_fix::rollback_last(&dir))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+/// 列出某会话文件的备份（详情面板「备份列表」用）
+#[tauri::command]
+async fn session_backups_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    path: String,
+) -> Result<Vec<session_fix::SessionBackupEntry>, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let dir = session_dir_for(&env, None);
+    tauri::async_runtime::spawn_blocking(move || session_fix::list_session_backups(&dir, &path))
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
+/// 回滚单个会话文件到指定备份（sha256 校验 + 先快照当前状态）
+#[tauri::command]
+async fn session_restore_cmd(
+    state: State<'_, AppState>,
+    env_id: String,
+    path: String,
+    set_dir: String,
+    backup_name: String,
+) -> Result<session_fix::RestoreOneResult, String> {
+    let env = get_env_inner(&state, &env_id)?;
+    let dir = session_dir_for(&env, None);
+    tauri::async_runtime::spawn_blocking(move || {
+        session_fix::restore_session_backup(&dir, &set_dir, &backup_name, &path)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
 /// 检查更新（统一走 ghnet 镜像轮询，无总时限；每镜像约 10s 自动切换）：
 /// 1) 仓库根 VERSION（main / master）；2) GitHub API releases/latest。
 /// 判定有更新后额外拉 Releases 列表取对应 tag 的发行说明（失败不影响主判定）。
@@ -2428,25 +2590,6 @@ async fn clean_junk_cmd(
     tauri::async_runtime::spawn_blocking(move || health::clean_junk(&pd, &ns))
         .await
         .map_err(|e| format!("清理任务失败：{e}"))?
-}
-
-/// 导出诊断包（配置文件 + 会话/存储摘要 + 各 profile 元数据）
-#[tauri::command]
-async fn export_diag_cmd(
-    state: State<'_, AppState>,
-    env_id: String,
-    target_path: String,
-) -> Result<profile_io::ExportResult, String> {
-    let env = get_env_inner(&state, &env_id)?;
-    let home = std::path::Path::new(&env.home_dir);
-    let target = if target_path.trim().is_empty() {
-        let backups = home.join("backups");
-        let _ = std::fs::create_dir_all(&backups);
-        backups.join(format!("dsh-diag-{}.zip", timestamp_compact()))
-    } else {
-        std::path::PathBuf::from(target_path)
-    };
-    profile_io::export_diag(home, &target)
 }
 
 /// 计算环境 profiles 目录（扫描目录适配）
@@ -3366,7 +3509,6 @@ pub fn run() {
             fix_deps_cmd,
             scan_junk_cmd,
             clean_junk_cmd,
-            export_diag_cmd,
             start_dsh_cmd,
             stop_dsh_cmd,
             find_orphan_nodes_cmd,
@@ -3388,6 +3530,13 @@ pub fn run() {
             profile_node_modules_size,
             export_pack_cmd,
             market_packs_cmd,
+            session_vocab_cmd,
+            session_scan_cmd,
+            session_fix_cmd,
+            session_truncate_cmd,
+            session_rollback_cmd,
+            session_backups_cmd,
+            session_restore_cmd,
             list_pack_versions_cmd,
             download_pack_cmd,
             import_pack_cmd,
@@ -3453,9 +3602,9 @@ mod tests {
         assert_eq!(pick_release_notes(&json, "0.3.29"), "V0.3.29:优化了导出的UI");
         // 多行正文原样保留（仅去空行）
         let json2: serde_json::Value = serde_json::json!([
-            { "tag_name": "V0.3.30", "name": "V0.3.30", "body": "V0.3.30:三件事\n- 导出重构\n\n- 拉杆修复\n" }
+            { "tag_name": "V0.3.31", "name": "V0.3.31", "body": "V0.3.31:三件事\n- 导出重构\n\n- 拉杆修复\n" }
         ]);
-        assert_eq!(pick_release_notes(&json2, "0.3.30"), "V0.3.30:三件事\n- 导出重构\n- 拉杆修复");
+        assert_eq!(pick_release_notes(&json2, "0.3.31"), "V0.3.31:三件事\n- 导出重构\n- 拉杆修复");
         // 无匹配版本 → 空串；非数组（错误响应）→ 空串
         assert_eq!(pick_release_notes(&json, "9.9.9"), "");
         assert_eq!(pick_release_notes(&serde_json::json!({"message": "x"}), "0.3.29"), "");
@@ -3725,13 +3874,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.30_x64-setup.exe", "0.3.30"));
-        assert!(asset_matches("dsh-manager_0.3.30_x64-setup.exe", "0.3.30"));
-        assert!(asset_matches("任意名_0.3.30_x64-setup.exe", "0.3.30"));
-        assert!(!asset_matches("DSH-Manager-0.3.30-win-x64.exe", "0.3.30"));
-        assert!(!asset_matches("DSH Manager_0.3.30_x64-setup.exe.sha256", "0.3.30"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.30"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.30"));
+        assert!(asset_matches("DSH Manager_0.3.31_x64-setup.exe", "0.3.31"));
+        assert!(asset_matches("dsh-manager_0.3.31_x64-setup.exe", "0.3.31"));
+        assert!(asset_matches("任意名_0.3.31_x64-setup.exe", "0.3.31"));
+        assert!(!asset_matches("DSH-Manager-0.3.31-win-x64.exe", "0.3.31"));
+        assert!(!asset_matches("DSH Manager_0.3.31_x64-setup.exe.sha256", "0.3.31"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.31"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.31"));
     }
 
     #[test]
@@ -3864,10 +4013,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.30_x64-setup.exe", "0.3.30"));
+        assert!(asset_matches("DSH.Manager_0.3.31_x64-setup.exe", "0.3.31"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.30_x64-setup.exe", "0.3.30"));
-        assert!(asset_matches("DSH.MANAGER_0.3.30_X64-SETUP.EXE", "0.3.30"));
+        assert!(asset_matches("dsh.manager_0.3.31_x64-setup.exe", "0.3.31"));
+        assert!(asset_matches("DSH.MANAGER_0.3.31_X64-SETUP.EXE", "0.3.31"));
     }
 
     #[test]
@@ -3875,7 +4024,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.30", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.31", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

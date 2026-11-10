@@ -22,6 +22,10 @@ import type {
   ProfileInfo,
   ProfileNote,
   ProfileNotesMap,
+  SessionVocabInfo,
+  SessionScanResult,
+  SessionScanItem,
+  SessionBackupEntry,
   RunningProcess,
   Settings,
   DshVersionInfo,
@@ -303,6 +307,8 @@ export default function App() {
   // profile 备注
   const [notes, setNotes] = useState<ProfileNotesMap>({});
   const [noteTarget, setNoteTarget] = useState<{ profile: string; profilesDir: string } | null>(null);
+  // 会话版本兼容修复（右键 profile → 会话修复）
+  const [sessionFixTarget, setSessionFixTarget] = useState<{ profile: string; profilesDir: string } | null>(null);
   const [showInitHint, setShowInitHint] = useState(false);
   const [showInitBtn, setShowInitBtn] = useState(false);
   /** 流式渲染：扫到一个显示一个；此项仅表示「扫描是否结束」（空态文案用） */
@@ -366,7 +372,6 @@ export default function App() {
   const [scanningJunk, setScanningJunk] = useState(false);
   const [cleaningJunk, setCleaningJunk] = useState(false);
   const [confirmCleanJunk, setConfirmCleanJunk] = useState(false);
-  const [diagExporting, setDiagExporting] = useState(false);
   // 卡片折叠：文件系统默认折叠、健康维护默认展开；记住用户选择（localStorage）
   const [foldFs, setFoldFs] = useState<boolean>(() => localStorage.getItem("dshpm-fold-fs") !== "expanded");
   const [foldHealth, setFoldHealth] = useState<boolean>(() => localStorage.getItem("dshpm-fold-health") === "collapsed");
@@ -1659,25 +1664,6 @@ export default function App() {
     }
   };
 
-  // M4：导出诊断包
-  const handleExportDiag = async () => {
-    if (!selectedEnv) return;
-    setDiagExporting(true);
-    setError("");
-    setInfo("");
-    try {
-      const path = await pickSaveZipPath("dsh-diag.zip");
-      if (!path) return;
-      const r = await api.exportDiag(selectedEnv, path);
-      setInfo(`诊断包导出成功：${r.fileCount} 个文件，${formatSize(r.zipSize)}`);
-      api.openPath(path).catch(() => {});
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setDiagExporting(false);
-    }
-  };
-
   // 扫描 dsh 本体（自动探测其中安装的 dsh 可执行文件）
   const handleAddDshScan = async () => {
     const path = await pickFolder("选择包含 dsh 本体的目录（如全局 npm 目录、项目 node_modules 或 DSH Desktop 安装目录）");
@@ -2053,7 +2039,7 @@ export default function App() {
                       : { name: p.name, profilesDir: p.profilesDir },
                   );
                 }}
-                title="右键：重命名 / 备注"
+                title="右键：重命名 / 备注 / 会话修复"
               >
                 {/* 重命名入口：行右上角 hover 浮现的铅笔（desktop 归官方桌面客户端，禁改） */}
                 {p.name.toLowerCase() !== "desktop" && (
@@ -2088,6 +2074,15 @@ export default function App() {
                       }}
                     >
                       📝 备注 / 适配版本
+                    </button>
+                    <button
+                      className="row-menu-item"
+                      onClick={() => {
+                        setRowMenu(null);
+                        setSessionFixTarget({ profile: p.name, profilesDir: p.profilesDir });
+                      }}
+                    >
+                      <Icon name="broom" /> 会话修复
                     </button>
                   </div>
                 )}
@@ -2483,8 +2478,13 @@ export default function App() {
                   >
                     {cleaningJunk ? "清理中..." : <><Icon name="trash" /> 清理残留</>}
                   </button>
-                  <button className="btn tiny" onClick={handleExportDiag} disabled={diagExporting}>
-                    {diagExporting ? "导出中..." : <><Icon name="package" /> 导出诊断包</>}
+                  <button
+                    className="btn tiny"
+                    onClick={() => setSessionFixTarget({ profile: selectedProfile, profilesDir: selectedProfilesDir })}
+                    disabled={!selectedProfile}
+                    title="扫描并修复被高版本 DSH 写坏的会话（未知事件补 ignorable，自动备份可回滚）"
+                  >
+                    <><Icon name="broom" /> 会话修复</>
                   </button>
                 </div>
                 {deps && (
@@ -3034,6 +3034,16 @@ export default function App() {
       )}
 
       {/* 备注对话框（右键 profile） */}
+      {/* 会话版本兼容修复（右键 profile → 会话修复） */}
+      {sessionFixTarget && selectedEnv && (
+        <SessionFixDialog
+          envId={selectedEnv}
+          envVersion={envs.find((e) => e.id === selectedEnv)?.version ?? ""}
+          profile={sessionFixTarget.profile}
+          onClose={() => setSessionFixTarget(null)}
+          setGlobalInfo={setInfo}
+        />
+      )}
       {/* 启动自动检查出的新版本提醒（本次运行最多一次） */}
       {startupUpdate && (
         <StartupUpdateModal info={startupUpdate} onClose={() => setStartupUpdate(null)} />
@@ -3596,7 +3606,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.30</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.31</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -4348,6 +4358,396 @@ function ImportDialog({
 
 // ==================== 备注对话框（右键 profile，仅提示无约束） ====================
 // ==================== 重命名 Profile 对话框 ====================
+// ==================== 会话修复对话框（界面按 dsh-session-compat-fix 插件设置页布局） ====================
+/** 提示信息里的短路径：取最后两级（工作区/会话目录） */
+function shortName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.slice(-2).join("/");
+}
+
+function SessionFixDialog({
+  envId,
+  envVersion,
+  profile,
+  onClose,
+  setGlobalInfo,
+}: {
+  envId: string;
+  envVersion: string;
+  profile: string;
+  onClose: () => void;
+  setGlobalInfo: (m: string) => void;
+}) {
+  const [vocabs, setVocabs] = useState<SessionVocabInfo[]>([]);
+  const [ver, setVer] = useState("");
+  const [customDir, setCustomDir] = useState("");
+  const [scan, setScan] = useState<SessionScanResult | null>(null);
+  const [scanned, setScanned] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState<"" | "scan" | "fix" | "detail" | "restore" | "truncate">("");
+  const [err, setErr] = useState("");
+  const [notice, setNotice] = useState("");
+  const [detail, setDetail] = useState<{ item: SessionScanItem; backups: SessionBackupEntry[] } | null>(
+    null,
+  );
+
+  const runScan = async (version: string): Promise<SessionScanResult | null> => {
+    setBusy("scan");
+    setErr("");
+    setNotice("");
+    try {
+      const r = await api.sessionScan(envId, version, customDir.trim() || undefined);
+      setScan(r);
+      setScanned(true);
+      // 默认勾选全部故障会话
+      setSelected(new Set(r.items.filter((i) => i.faulty).map((i) => i.path)));
+      return r;
+    } catch (e) {
+      setErr(String(e));
+      return null;
+    } finally {
+      setBusy("");
+    }
+  };
+
+  // 初始版本：env 版本精确命中用它；否则取「退一步」的次新版本（插件同款默认）
+  useEffect(() => {
+    let alive = true;
+    api
+      .sessionVocab(envId)
+      .then((list) => {
+        if (!alive) return;
+        setVocabs(list);
+        const exact = list.find((v) => v.version === envVersion)?.version;
+        const fallback = list.length > 1 ? list[list.length - 2].version : list[0]?.version ?? "";
+        const init = exact ?? fallback;
+        setVer(init);
+        if (init) void runScan(init);
+      })
+      .catch((e) => alive && setErr(String(e)));
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [envId, envVersion]);
+
+  const openDetail = async (it: SessionScanItem) => {
+    setBusy("detail");
+    setErr("");
+    setNotice("");
+    try {
+      const backups = await api.sessionBackups(envId, it.path);
+      setDetail({ item: it, backups });
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** 操作后用重扫结果刷新详情面板（同路径找回最新状态与备份列表） */
+  const refreshDetail = async (path: string, rs: SessionScanResult | null) => {
+    try {
+      const s = rs ?? (await api.sessionScan(envId, ver, customDir.trim() || undefined));
+      const item = s.items.find((i) => i.path === path);
+      if (!item) {
+        setDetail(null);
+        return;
+      }
+      const backups = await api.sessionBackups(envId, path);
+      setDetail({ item, backups });
+    } catch {
+      setDetail(null);
+    }
+  };
+
+  /** 修复（批量或单个，详情面板「修复此会话」复用） */
+  const doFix = async (paths: string[]) => {
+    if (paths.length === 0 || busy !== "") return;
+    if (!window.confirm(`将修复 ${paths.length} 个会话。修复前会自动完整备份原文件。确定继续？`)) return;
+    setBusy("fix");
+    setErr("");
+    setNotice("");
+    try {
+      const r = await api.sessionFix(envId, ver, paths);
+      const v = r.outcomes;
+      const fixed = v.filter((o) => o.status === "fixed");
+      const skipped = v.filter((o) => o.status === "skipped").length;
+      const failedList = v.filter((o) => o.status === "failed");
+      const marked = fixed.reduce((s, o) => s + o.fixedLines, 0);
+      setNotice(
+        `修复完成：${fixed.length} 个会话已修复（补标记 ${marked} 条）` +
+          (skipped ? ` · 跳过 ${skipped} 个` : "") +
+          (failedList.length ? ` · 失败 ${failedList.length} 个` : ""),
+      );
+      if (failedList.length) {
+        setErr(failedList.map((f) => `${shortName(f.path)}: ${f.reason}`).join("\n"));
+      } else if (skipped) {
+        setErr("该会话最近仍在写入，已跳过。请先关闭该会话后重试。");
+      }
+      setGlobalInfo(`会话修复完成：${fixed.length} 个会话，补标记 ${marked} 行（原文件已备份）`);
+      const rs = await runScan(ver);
+      if (detail) await refreshDetail(detail.item.path, rs);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** 截断回滚（破坏性兜底，单会话） */
+  const doTruncateOne = async (path: string) => {
+    if (busy !== "") return;
+    if (
+      !window.confirm(
+        "危险操作：将删除第一个低版本不识别的事件及其之后的所有内容，后续对话会丢失。建议优先使用「修复」。确定继续？",
+      )
+    )
+      return;
+    setBusy("truncate");
+    setErr("");
+    setNotice("");
+    try {
+      const r = await api.sessionTruncate(envId, ver, [path]);
+      const o = r.outcomes[0];
+      if (o?.status === "truncated") {
+        setNotice(`已截断：从 seq ${o.removedFromSeq ?? "?"} 起删除 ${o.removedCount} 条事件`);
+        setGlobalInfo(`会话已截断：删除 ${o.removedCount} 行（原文件已备份）`);
+      } else if (o?.status === "skipped") {
+        setErr(o.reason || "会话近期仍在写入，已跳过");
+      } else if (o?.status === "failed") {
+        setErr(`${shortName(path)}: ${o.reason}`);
+      }
+      const rs = await runScan(ver);
+      if (detail) await refreshDetail(path, rs);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  /** 按备份回滚单个会话（详情面板「备份列表」） */
+  const doRestore = async (b: SessionBackupEntry) => {
+    if (busy !== "" || !detail) return;
+    if (!window.confirm("将把该会话恢复为备份时的内容，当前状态会先另存为 pre-restore 备份。确定继续？"))
+      return;
+    setBusy("restore");
+    setErr("");
+    setNotice("");
+    try {
+      await api.sessionRestore(envId, detail.item.path, b.setDir, b.backupName);
+      setNotice(`已回滚到备份 ${b.setDir}`);
+      const rs = await runScan(ver);
+      await refreshDetail(detail.item.path, rs);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const toggle = (path: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+
+  const selectAllDamaged = () =>
+    setSelected(new Set((scan?.items ?? []).filter((i) => i.faulty).map((i) => i.path)));
+
+  const statusBadge = (it: SessionScanItem): [string, string] =>
+    !it.readable ? ["unreadable", "不可读"] : it.faulty ? ["contaminated", "需修复"] : ["healthy", "正常"];
+
+  const items = scan?.items ?? [];
+  const healthy = items.filter((i) => i.readable && !i.faulty).length;
+  const contaminated = items.filter((i) => i.faulty).length;
+  const unreadable = items.filter((i) => !i.readable).length;
+
+  return (
+    <div className="modal-mask" onClick={busy ? undefined : onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()} style={{ width: 820 }}>
+        <div className="modal-head">
+          <h3>会话修复 — Profile「{profile}」</h3>
+          <button className="btn tiny" onClick={onClose} disabled={busy !== ""}>
+            <Icon name="x" size={11} />
+          </button>
+        </div>
+        <div className="sfix-head">
+          <h4 className="sfix-title">会话版本兼容修复</h4>
+          <p className="sfix-sub">
+            高版本 DSH 打开旧会话时会写入它新增的事件类型，低版本不认识这些事件，就会拒绝加载整个会话日志。
+            修复只给这些事件加上 <code>ignorable</code> 标记，不改动任何聊天内容，也不调整序号。
+          </p>
+        </div>
+        <div className="sfix-bar" style={{ marginBottom: 10 }}>
+          <span className="sfix-summary">目标低版本</span>
+          <select
+            className="input"
+            style={{ width: "auto" }}
+            value={ver}
+            disabled={busy !== ""}
+            onChange={(e) => {
+              setVer(e.target.value);
+              void runScan(e.target.value);
+            }}
+          >
+            {vocabs.map((v) => (
+              <option key={v.version} value={v.version}>
+                {v.version}（{v.count} 种{v.builtin ? "" : " · 探测"}）
+              </option>
+            ))}
+          </select>
+          <button className="btn primary" disabled={busy !== ""} onClick={() => void runScan(ver)}>
+            {busy === "scan" ? "扫描中…" : "扫描会话"}
+          </button>
+          <button className="btn" disabled={busy !== "" || selected.size === 0} onClick={() => void doFix([...selected])}>
+            {busy === "fix" ? "修复中…" : `修复选中项 (${selected.size})`}
+          </button>
+          <button className="btn" disabled={busy !== "" || items.length === 0} onClick={selectAllDamaged}>
+            全选故障会话
+          </button>
+          {scan && (
+            <span className="sfix-summary">
+              共 {items.length} 个会话 · 正常 {healthy} · 需修复 {contaminated} · 不可读 {unreadable}
+            </span>
+          )}
+        </div>
+        <div className="sfix-bar" style={{ marginBottom: 10 }}>
+          <input
+            className="input grow"
+            style={{ fontSize: 12 }}
+            placeholder="会话目录（留空 = 当前环境默认 sessions 目录）"
+            value={customDir}
+            onChange={(e) => setCustomDir(e.target.value)}
+            disabled={busy !== ""}
+          />
+        </div>
+        {err && <div className="sfix-alert" style={{ marginBottom: 10 }}>{err}</div>}
+        {notice && <div className="sfix-ok" style={{ marginBottom: 10 }}>{notice}</div>}
+        {items.length === 0 ? (
+          <div className="sfix-empty">{scanned ? "会话目录为空或无会话文件" : "选择目标版本后点击「扫描会话」"}</div>
+        ) : (
+          <div className="sfix-list" style={{ marginBottom: detail ? 10 : 0 }}>
+            <div className="sfix-row sfix-row-head">
+              <span />
+              <span>状态</span>
+              <span>会话</span>
+              <span>低版本不识别的类型</span>
+              <span />
+            </div>
+            {items.map((it) => {
+              const [cls, label] = statusBadge(it);
+              const unknownText = it.unknown.map((u) => `${u.kind}×${u.count}`).join("  ") || "—";
+              return (
+                <div key={it.path} className="sfix-row">
+                  {it.faulty ? (
+                    <input type="checkbox" checked={selected.has(it.path)} disabled={busy !== ""} onChange={() => toggle(it.path)} />
+                  ) : (
+                    <span className="sfix-muted">·</span>
+                  )}
+                  <span>
+                    <span className={`sfix-badge sfix-badge-${cls}`}>{label}</span>
+                  </span>
+                  <div title={`${it.workspace}\n${it.path}`}>
+                    <div className="sfix-name">
+                      {it.title || it.sessionId}
+                      {it.active && <span className="sfix-muted">（活跃）</span>}
+                      {it.readable && it.tornTail && <span className="sfix-muted">（断尾）</span>}
+                    </div>
+                    <div className="sfix-mono sfix-muted">{it.workspace} / {it.sessionId}</div>
+                  </div>
+                  <div className="sfix-types" title={unknownText}>
+                    {unknownText}
+                  </div>
+                  <div className="sfix-bar">
+                    <span className="sfix-muted">{formatSize(it.size)}</span>
+                    <button className="btn" disabled={busy !== ""} onClick={() => void openDetail(it)}>
+                      详情
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {detail && (
+          <div className="sfix-detail">
+            <div className="sfix-bar">
+              <strong>{detail.item.title || detail.item.sessionId}</strong>
+              <span className={`sfix-badge sfix-badge-${statusBadge(detail.item)[0]}`}>{statusBadge(detail.item)[1]}</span>
+              {detail.item.active && <span className="sfix-muted">活跃（近期仍在写入）</span>}
+              {detail.item.readable && detail.item.tornTail && <span className="sfix-muted">尾部不完整</span>}
+              <div className="sfix-spacer" />
+              {detail.item.faulty && (
+                <button className="btn primary" disabled={busy !== ""} onClick={() => void doFix([detail.item.path])}>
+                  {busy === "fix" ? "修复中…" : "修复此会话"}
+                </button>
+              )}
+              {detail.item.faulty && (
+                <button className="btn danger" disabled={busy !== ""} onClick={() => void doTruncateOne(detail.item.path)}>
+                  {busy === "truncate" ? "截断中…" : "截断回滚"}
+                </button>
+              )}
+              <button className="btn" onClick={() => setDetail(null)}>关闭</button>
+            </div>
+            <dl className="sfix-kv">
+              <dt>Session ID</dt>
+              <dd className="sfix-mono" title={detail.item.sessionId}>{detail.item.sessionId}</dd>
+              <dt>事件数</dt>
+              <dd>{detail.item.lines}</dd>
+              <dt>最大 seq</dt>
+              <dd>{detail.item.maxSeq >= 0 ? detail.item.maxSeq : "-"}</dd>
+              <dt>格式版本</dt>
+              <dd>{detail.item.formatVersion ?? "-"}</dd>
+              <dt>大小</dt>
+              <dd>{formatSize(detail.item.size)}</dd>
+              <dt>修改时间</dt>
+              <dd>{detail.item.modified}</dd>
+              <dt>路径</dt>
+              <dd className="sfix-mono" title={detail.item.path}>{detail.item.path}</dd>
+            </dl>
+            {detail.item.unknown.length > 0 ? (
+              <div style={{ marginBottom: 10 }}>
+                <div className="sfix-types" style={{ marginBottom: 4 }}>低版本不识别的类型</div>
+                {detail.item.unknown.map((u) => (
+                  <div key={u.kind} className="sfix-mono sfix-muted" style={{ marginBottom: 2 }}>
+                    {u.kind}  ×{u.count}  seq[{u.seqs.slice(0, 24).join(", ")}{u.seqs.length > 24 ? ", …" : ""}]
+                  </div>
+                ))}
+              </div>
+            ) : (
+              detail.item.readable && <div className="sfix-ok" style={{ marginBottom: 10 }}>目标版本可正常读取该会话</div>
+            )}
+            <div>
+              <div className="sfix-types sfix-muted" style={{ marginBottom: 4 }}>
+                备份列表（{detail.backups.length}）
+              </div>
+              {detail.backups.length === 0 ? (
+                <div className="sfix-muted">暂无备份</div>
+              ) : (
+                detail.backups.map((b) => (
+                  <div key={b.setDir + b.backupName} className="sfix-bar" style={{ marginBottom: 4 }}>
+                    <span className="sfix-mono">{b.setDir}</span>
+                    <span className="sfix-muted">
+                      {b.trigger} · {b.createdAt} · 适配 {b.targetVersion} · {formatSize(b.bytes)}
+                    </span>
+                    <button className="btn" disabled={busy !== ""} onClick={() => void doRestore(b)}>
+                      回滚
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ==================== 启动自动更新提醒模态框 ====================
 // 复用设置页同一套后端：download_update_cmd（update-download 进度事件）→ launch_installer_and_exit_cmd
 function StartupUpdateModal({ info, onClose }: { info: UpdateInfo; onClose: () => void }) {

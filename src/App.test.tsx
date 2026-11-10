@@ -1569,28 +1569,66 @@ describe("M4 健康与维护", () => {
     });
   });
 
-  it("导出诊断包调用 export_diag_cmd", async () => {
+  it("健康与维护提供会话修复入口（替代导出诊断包）", async () => {
     mockInvoke.mockImplementation((cmd: string) => {
-      if (cmd === "export_diag_cmd") {
-        return Promise.resolve({ fileCount: 12, zipSize: 1024, skippedSymlinks: [], targetPath: "C:\\diag.zip" });
+      if (cmd === "session_vocab_cmd") {
+        return Promise.resolve([{ version: "0.2.1-rc.2", count: 62, source: "C:/x/known-event-types.js", builtin: false }]);
+      }
+      if (cmd === "session_scan_cmd") {
+        return Promise.resolve({
+          dir: "C:/Users/t/.dsh/sessions",
+          usedVersion: "0.2.1-rc.2",
+          usedCount: 62,
+          items: [
+            {
+              path: "C:/Users/t/.dsh/sessions/ws1/session-abc/session.v4.jsonl.zstd",
+              sessionId: "session-abc",
+              workspace: "ws1",
+              title: "被污染的会话",
+              maxSeq: 27,
+              formatVersion: 4,
+              lines: 30,
+              size: 4096,
+              modified: "2025-01-01 10:00",
+              readable: true,
+              tornTail: false,
+              active: false,
+              faulty: true,
+              unknown: [{ kind: "job/registered", count: 1, seqs: [27] }],
+            },
+          ],
+        });
+      }
+      if (cmd === "session_backups_cmd") {
+        return Promise.resolve([]);
       }
       return mockAllDefault(cmd);
     });
     const user = userEvent.setup();
     render(<App />);
     await waitFor(() => {
-      expect(screen.getByText("导出诊断包")).toBeInTheDocument();
+      expect(screen.getByText("会话修复")).toBeInTheDocument();
     });
-    await user.click(screen.getByText("导出诊断包"));
+    await user.click(screen.getByText("会话修复"));
+    // 打开对话框 → 自动拉词汇表并扫描 → 表格列表带状态徽章
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalled();
+      expect(mockInvoke).toHaveBeenCalledWith("session_vocab_cmd", { envId: "global" });
+      expect(mockInvoke).toHaveBeenCalledWith("session_scan_cmd", { envId: "global", targetVersion: "0.2.1-rc.2", customDir: undefined });
     });
-    const calls = mockInvoke.mock.calls.filter((c) => c[0] === "export_diag_cmd");
-
-    expect(calls.length).toBeGreaterThan(0);
-    const last = calls[calls.length - 1];
-    expect(last[0]).toBe("export_diag_cmd");
-    expect(last[1]).toEqual({ envId: "global", targetPath: "C:\\diag.zip" });
+    await waitFor(() => {
+      expect(screen.getByText(/共 1 个会话 · 正常 0 · 需修复 1 · 不可读 0/)).toBeInTheDocument();
+      expect(screen.getByText("需修复")).toBeInTheDocument();
+      expect(screen.getByText("被污染的会话")).toBeInTheDocument();
+      expect(screen.getByText(/job\/registered×1/)).toBeInTheDocument();
+    });
+    // 详情面板：KV 信息 + 未知类型 seq + 备份列表
+    await user.click(screen.getByText("详情"));
+    await waitFor(() => {
+      expect(mockInvoke).toHaveBeenCalledWith("session_backups_cmd", { envId: "global", path: "C:/Users/t/.dsh/sessions/ws1/session-abc/session.v4.jsonl.zstd" });
+      expect(screen.getByText(/seq\[27\]/)).toBeInTheDocument();
+      expect(screen.getByText(/备份列表（0）/)).toBeInTheDocument();
+      expect(screen.getByText("修复此会话")).toBeInTheDocument();
+    });
   });
 });
 
@@ -2072,7 +2110,7 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.30", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.31", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       return mockAllDefault(cmd);
     });
@@ -2099,27 +2137,27 @@ describe("M5 设置与 DSH 下载", () => {
         return Promise.resolve({ npmRegistry: "https://registry.npmmirror.com", dshDownloadDir: "C:\\dsh-versions", githubMirror: "https://ghfast.top" });
       }
       if (cmd === "check_update_cmd") {
-        return Promise.resolve({ current: "0.2.0", latest: "0.3.30", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
+        return Promise.resolve({ current: "0.2.0", latest: "0.3.31", hasUpdate: true, url: "https://github.com/Liaoyuanxinghuo/DSH-Plugin-Manager/", error: "" });
       }
       if (cmd === "download_update_cmd") {
-        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.30_x64-setup.exe");
+        return Promise.resolve("C:\\Users\\test\\Downloads\\DSH Manager_0.3.31_x64-setup.exe");
       }
       return mockAllDefault(cmd);
     });
-    await user.click(screen.getByText("下载 v0.3.30"));
+    await user.click(screen.getByText("下载 v0.3.31"));
     await waitFor(() => {
       expect(screen.getByText(/已保存/)).toBeInTheDocument();
     });
-    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.30" });
+    expect(mockInvoke).toHaveBeenCalledWith("download_update_cmd", { version: "0.3.31" });
     // 打开所在文件夹
     await user.click(screen.getByText("打开所在文件夹"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.30_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("open_path", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.31_x64-setup.exe" });
     });
     // 关闭程序并更新：启动安装程序
     await user.click(screen.getByText("关闭程序并更新"));
     await waitFor(() => {
-      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.30_x64-setup.exe" });
+      expect(mockInvoke).toHaveBeenCalledWith("launch_installer_and_exit_cmd", { path: "C:\\Users\\test\\Downloads\\DSH Manager_0.3.31_x64-setup.exe" });
     });
   });
 });

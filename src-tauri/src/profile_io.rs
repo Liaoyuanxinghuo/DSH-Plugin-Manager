@@ -370,89 +370,6 @@ pub fn rename_profile(profiles_dir: &Path, old: &str, new: &str) -> Result<Strin
 }
 
 /// 导出诊断包：DSH_HOME 配置 + 会话/存储摘要 + 各 profile 元数据（不含 node_modules）
-pub fn export_diag(home_dir: &Path, target_zip: &Path) -> Result<ExportResult, String> {
-    if let Some(dir) = target_zip.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let file = fs::File::create(target_zip).map_err(|e| format!("创建压缩包失败: {e}"))?;
-    let mut zip = ZipWriter::new(file);
-    let opts = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .unix_permissions(0o644);
-
-    let mut count = 0usize;
-    let mut skipped = Vec::new();
-
-    // 顶层配置（排除 .credentials.yaml —— 含密钥，不进诊断包）
-    if let Ok(entries) = fs::read_dir(home_dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name == ".credentials.yaml" || name == "profiles" || name == "sessions" || name == "storages" {
-                continue;
-            }
-            let path = e.path();
-            if path.is_file() {
-                if let Ok(md) = fs::metadata(&path) {
-                    if md.len() <= 1 * 1024 * 1024 {
-                        zip.start_file(format!("dsh-home/{name}"), opts).map_err(|e| format!("写入压缩包失败: {e}"))?;
-                        if let Ok(content) = fs::read(&path) {
-                            zip.write_all(&content).map_err(|e| format!("写入压缩包失败: {e}"))?;
-                            count += 1;
-                        }
-                    } else {
-                        skipped.push(name);
-                    }
-                }
-            }
-        }
-    }
-
-    // profiles 元数据（每个 profile 的 package.json / 补丁 / 配置文件，不含 node_modules）
-    let profiles_dir = home_dir.join("profiles");
-    if profiles_dir.is_dir() {
-        if let Ok(entries) = fs::read_dir(&profiles_dir) {
-            for e in entries.flatten() {
-                let pname = e.file_name().to_string_lossy().to_string();
-                let pdir = e.path();
-                if !pdir.is_dir() || pname.starts_with('.') || pname == "node_modules" {
-                    continue;
-                }
-                for f in ["package.json", "cordis.patch.yml", "cordis.patch.yml.bak", "dsh.bundle.patch", "pnpm-workspace.yaml", ".npmrc"] {
-                    let fpath = pdir.join(f);
-                    if fpath.is_file() {
-                        if let Ok(md) = fs::metadata(&fpath) {
-                            if md.len() <= 512 * 1024 {
-                                zip.start_file(format!("profiles/{pname}/{f}"), opts).map_err(|e| format!("写入压缩包失败: {e}"))?;
-                                if let Ok(content) = fs::read(&fpath) {
-                                    zip.write_all(&content).map_err(|e| format!("写入压缩包失败: {e}"))?;
-                                    count += 1;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // sessions / storages：目录清单 + 小文件（≤256KB）
-    for area in ["sessions", "storages"] {
-        let area_dir = home_dir.join(area);
-        if !area_dir.is_dir() {
-            continue;
-        }
-        add_area_summary(&mut zip, &area_dir, area, &opts, &mut count, &mut skipped)?;
-    }
-
-    zip.finish().map_err(|e| format!("压缩包写入失败: {e}"))?;
-    let zip_size = fs::metadata(target_zip).map(|m| m.len()).unwrap_or(0);
-    Ok(ExportResult {
-        file_count: count,
-        zip_size,
-        skipped_symlinks: skipped,
-        target_path: target_zip.to_string_lossy().to_string(),
-    })
-}
 
 /// 打包某区域（sessions/storages）：目录清单 + 小文件
 fn add_area_summary(
@@ -899,35 +816,6 @@ mod tests {
         assert!(imp2.renamed);
         assert_ne!(imp2.final_name, imp.final_name);
 
-        let _ = fs::remove_dir_all(&work);
-    }
-
-    #[test]
-    fn test_export_diag() {
-        let work = std::env::temp_dir().join(format!("dshpm-diag-{}", std::process::id()));
-        if work.exists() {
-            let _ = fs::remove_dir_all(&work);
-        }
-        let home = work.join("dsh-home");
-        fs::create_dir_all(home.join("profiles").join("web")).unwrap();
-        fs::create_dir_all(home.join("sessions").join("s1")).unwrap();
-        fs::write(home.join("settings.yaml.imported"), "theme: dark").unwrap();
-        fs::write(home.join(".credentials.yaml"), "SECRET").unwrap();
-        fs::write(home.join("profiles").join("web").join("package.json"), r#"{"name":"web"}"#).unwrap();
-        fs::write(home.join("sessions").join("s1").join("meta.json"), "{}").unwrap();
-
-        let zip_path = work.join("diag.zip");
-        let r = export_diag(&home, &zip_path).unwrap();
-        assert!(r.file_count >= 4, "应打包配置+package.json+会话，实际 {}", r.file_count);
-        assert!(zip_path.exists());
-
-        // credentials 不应进入诊断包
-        let file = fs::File::open(&zip_path).unwrap();
-        let mut archive = ZipArchive::new(file).unwrap();
-        let names: Vec<String> = (0..archive.len()).map(|i| archive.by_index(i).unwrap().name().to_string()).collect();
-        assert!(!names.iter().any(|n| n.contains("credentials")), "诊断包不应含密钥");
-        assert!(names.iter().any(|n| n.contains("package.json")));
-        assert!(names.iter().any(|n| n.contains("settings.yaml.imported")));
         let _ = fs::remove_dir_all(&work);
     }
 

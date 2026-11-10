@@ -98,6 +98,101 @@ export interface UpdateInfo {
   notes?: string;
 }
 
+// ===== 会话版本兼容修复 =====
+export interface SessionVocabInfo {
+  version: string;
+  count: number;
+  source: string;
+  /** 内置清单（非本机探测） */
+  builtin: boolean;
+}
+export interface SessionUnknownEvent {
+  kind: string;
+  count: number;
+  /** 受影响 seq（最多 64 个） */
+  seqs: number[];
+}
+export interface SessionScanItem {
+  path: string;
+  sessionId: string;
+  workspace: string;
+  /** 会话标题（session/title 优先，兜底首条用户消息） */
+  title: string;
+  maxSeq: number;
+  formatVersion: number | null;
+  lines: number;
+  size: number;
+  modified: string;
+  /** 帧解码失败/损坏（刻意不修） */
+  readable: boolean;
+  /** 尾部不完整帧（正在写入或上次异常退出；完整帧仍可修，修复时断尾丢弃） */
+  tornTail: boolean;
+  /** 90 秒内被写入过（可能正在使用；修复/截断会跳过） */
+  active: boolean;
+  /** 存在未知且未标 ignorable 的事件 */
+  faulty: boolean;
+  unknown: SessionUnknownEvent[];
+}
+export interface SessionScanResult {
+  dir: string;
+  usedVersion: string;
+  usedCount: number;
+  items: SessionScanItem[];
+}
+export interface SessionFixOutcome {
+  path: string;
+  /** fixed | unchanged | skipped | failed */
+  status: string;
+  fixedLines: number;
+  /** skipped/failed 原因 */
+  reason: string;
+  /** 修复后重读复查通过 */
+  verified: boolean;
+}
+export interface SessionFixResult {
+  backupDir: string;
+  outcomes: SessionFixOutcome[];
+}
+export interface SessionRollbackFailure {
+  path: string;
+  reason: string;
+}
+export interface SessionRollbackResult {
+  restored: number;
+  /** 回滚前对当前状态的快照目录（回滚本身可撤销）；空 = 未做快照（旧格式备份） */
+  preRestoreDir: string;
+  failed: SessionRollbackFailure[];
+}
+export interface SessionTruncateOutcome {
+  path: string;
+  /** truncated | skipped | failed */
+  status: string;
+  removedCount: number;
+  removedFromSeq: number | null;
+  removedTypes: string[];
+  reason: string;
+  verified: boolean;
+}
+export interface SessionTruncateResult {
+  backupDir: string;
+  outcomes: SessionTruncateOutcome[];
+}
+/** 某会话的一条备份（详情面板「备份列表」） */
+export interface SessionBackupEntry {
+  /** 备份集目录名（毫秒时间戳） */
+  setDir: string;
+  /** pre-repair | pre-truncate | pre-restore */
+  trigger: string;
+  createdAt: string;
+  targetVersion: string;
+  backupName: string;
+  bytes: number;
+}
+export interface SessionRestoreResult {
+  /** 回滚前当前状态的快照集合；空 = 未快照 */
+  preRestoreDir: string;
+}
+
 export interface DshVersionInfo {
   version: string;
   tags: string[];

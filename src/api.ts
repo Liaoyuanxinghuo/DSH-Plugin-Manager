@@ -8,6 +8,13 @@ import type {
   PackImportResult,
   PackMarketEntry,
   PackVersionInfo,
+  SessionVocabInfo,
+  SessionScanResult,
+  SessionFixResult,
+  SessionTruncateResult,
+  SessionRollbackResult,
+  SessionBackupEntry,
+  SessionRestoreResult,
   PackPeekResult,
   ProfileManifest,
   ProfileNotesMap,
@@ -154,8 +161,6 @@ export const api = {
     invoke<JunkEntry[]>("scan_junk_cmd", { envId, profile, profilesDirStr: profilesDir }),
   cleanJunk: (envId: string, profile: string, profilesDir: string, names: string[]) =>
     invoke<string[]>("clean_junk_cmd", { envId, profile, profilesDirStr: profilesDir, names }),
-  exportDiag: (envId: string, targetPath: string) =>
-    invoke<ExportResult>("export_diag_cmd", { envId, targetPath }),
   // M5 设置 / DSH 下载
   getSettings: () => invoke<Settings>("get_settings_cmd"),
   checkUpdate: () => invoke<UpdateInfo>("check_update_cmd"),
@@ -167,6 +172,23 @@ export const api = {
   checkPortableGit: () => invoke<string>("check_portable_git_cmd"),
   downloadUpdate: (version: string) => invoke<string>("download_update_cmd", { version }),
   launchInstallerAndExit: (path: string) => invoke<void>("launch_installer_and_exit_cmd", { path }),
+  sessionVocab: (envId: string) =>
+    invoke<SessionVocabInfo[]>("session_vocab_cmd", { envId }),
+  sessionScan: (envId: string, targetVersion: string, customDir?: string) =>
+    invoke<SessionScanResult>("session_scan_cmd", { envId, targetVersion, customDir }),
+  sessionFix: (envId: string, targetVersion: string, paths: string[]) =>
+    invoke<SessionFixResult>("session_fix_cmd", { envId, targetVersion, paths }),
+  /** 截断回滚（破坏性兜底）：删除第一个未知事件及其后全部内容，仅修复无效时用 */
+  sessionTruncate: (envId: string, targetVersion: string, paths: string[]) =>
+    invoke<SessionTruncateResult>("session_truncate_cmd", { envId, targetVersion, paths }),
+  /** 某会话的备份列表（详情面板） */
+  sessionBackups: (envId: string, path: string) =>
+    invoke<SessionBackupEntry[]>("session_backups_cmd", { envId, path }),
+  /** 回滚单个会话到指定备份 */
+  sessionRestore: (envId: string, path: string, setDir: string, backupName: string) =>
+    invoke<SessionRestoreResult>("session_restore_cmd", { envId, path, setDir, backupName }),
+  sessionRollback: (envId: string) =>
+    invoke<SessionRollbackResult>("session_rollback_cmd", { envId }),
   setSettings: (
     npmRegistry: string,
     dshDownloadDir: string,

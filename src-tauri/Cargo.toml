@@ -1,6 +1,6 @@
 [package]
 name = "dsh-manager"
-version = "0.3.30"
+version = "0.3.31"
 description = "DSH Manager - 图形化 DSH 环境与插件管理工具"
 authors = ["dshpm"]
 edition = "2021"
@@ -20,6 +20,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zstd = "0.13"
 serde_yaml = "0.9"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 dirs = "6"
