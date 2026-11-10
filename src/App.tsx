@@ -23,6 +23,7 @@ import type {
   ProfileNote,
   ProfileNotesMap,
   RunningProcess,
+  Settings,
   DshVersionInfo,
   DshInstallResult,
   UpdateInfo,
@@ -931,6 +932,53 @@ export default function App() {
       startingRef.current = false;
     }
   };
+
+  // ==================== 启动后自动启动选中的 Profile（设置：autoStartProfile） ====================
+  // 每次软件启动生效一次；等待 Profile 扫描完成 + 选中恢复后触发，走「启动」按钮同一条链路
+  const [appSettings, setAppSettings] = useState<Settings | null>(null);
+  const autoStartDoneRef = useRef(false);
+  useEffect(() => {
+    api.getSettings().then((s) => setAppSettings(s ?? null)).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (autoStartDoneRef.current) return;
+    if (!appSettings?.autoStartProfile) return;
+    if (!profilesReady || !selectedEnv || !selectedProfile) return;
+    // 只有「用户上次选中」的 profile 才自动启动；扫描锚定回退到第一项不算
+    const storedProf = localStorage.getItem("dshpm-sel-profile") ?? "";
+    if (!storedProf || selectedProfile !== storedProf) {
+      autoStartDoneRef.current = true;
+      return;
+    }
+    const storedDir = localStorage.getItem("dshpm-sel-profile-dir") ?? "";
+    const dir =
+      profiles.find((x) => x.name === selectedProfile && (!storedDir || x.profilesDir === storedDir))
+        ?.profilesDir ?? storedDir;
+    if (!dir) {
+      autoStartDoneRef.current = true;
+      return;
+    }
+    autoStartDoneRef.current = true;
+    // 已在运行 → 跳过（认领机制会接上状态，不重复拉起）
+    if (runnings.some((r) => r.profile === selectedProfile && r.profilesDir === dir)) {
+      setInfo(`Profile「${selectedProfile}」已在运行，跳过自动启动`);
+      return;
+    }
+    // 孤儿进程预检：自动模式不弹确认窗，跳过并提示（可手动点「启动」走确认流程）
+    void (async () => {
+      try {
+        const orphans = (await api.findOrphanNodes(selectedEnv, selectedProfile).catch(() => [])) ?? [];
+        if (orphans.length > 0) {
+          setInfo(`Profile「${selectedProfile}」存在遗留进程，未自动启动（可手动点「启动」处理）`);
+          return;
+        }
+        await handleStart(selectedEnv, selectedProfile, dir);
+      } catch (e) {
+        setError(`自动启动失败：${String(e)}`);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appSettings, profilesReady, selectedEnv, selectedProfile, profiles, runnings]);
 
   // 孤儿确认弹窗：清理并启动 / 直接启动 / 取消
   const startWithOrphanChoice = async (clean: boolean) => {
@@ -3340,6 +3388,12 @@ function SettingsDialog({
   const [err, setErr] = useState("");
   const [aboutOpen, setAboutOpen] = useState(false);
   const [checking, setChecking] = useState(false);
+  // 启动行为：开机自启本软件 / 启动后自动启动选中的 Profile
+  const [launchOnBoot, setLaunchOnBoot] = useState(false);
+  const [autoStartProfile, setAutoStartProfile] = useState(false);
+  // 拉杆即开即存：以「加载时的其他字段快照」提交，避免把未保存的镜像编辑一起带存
+  const [settingsReady, setSettingsReady] = useState(false);
+  const loadedSnapRef = useRef<{ npmRegistry: string; dshDownloadDir: string; githubMirror: string; githubMirrors: string[] }>({ npmRegistry: "", dshDownloadDir: "", githubMirror: "", githubMirrors: [] });
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [downPercent, setDownPercent] = useState(0);
@@ -3369,6 +3423,15 @@ function SettingsDialog({
       setDownloadDir(typeof s?.dshDownloadDir === "string" ? s.dshDownloadDir : "");
       setGithubMirror(typeof s?.githubMirror === "string" ? s.githubMirror : "");
       setCustomMirrors(Array.isArray(s?.githubMirrors) ? s.githubMirrors : []);
+      setLaunchOnBoot(!!s?.launchOnBoot);
+      setAutoStartProfile(!!s?.autoStartProfile);
+      loadedSnapRef.current = {
+        npmRegistry: typeof s?.npmRegistry === "string" ? s.npmRegistry : "",
+        dshDownloadDir: typeof s?.dshDownloadDir === "string" ? s.dshDownloadDir : "",
+        githubMirror: typeof s?.githubMirror === "string" ? s.githubMirror : "",
+        githubMirrors: Array.isArray(s?.githubMirrors) ? s.githubMirrors : [],
+      };
+      setSettingsReady(true);
     }).catch((e) => setErr(String(e)));
   }, []);
 
@@ -3376,9 +3439,31 @@ function SettingsDialog({
     setBusy(true);
     setErr("");
     try {
-      await api.setSettings(registry, downloadDir, githubMirror, customMirrors);
+      await api.setSettings(registry, downloadDir, githubMirror, customMirrors, launchOnBoot, autoStartProfile);
       onSaved();
     } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 拉杆即开即存：乐观更新 UI，写盘失败回滚到旧值并提示；其他字段用加载时快照提交（不带未保存的编辑）
+  const saveSwitch = async (patch: { launchOnBoot?: boolean; autoStartProfile?: boolean }) => {
+    const lo = patch.launchOnBoot ?? launchOnBoot;
+    const ap = patch.autoStartProfile ?? autoStartProfile;
+    const prevLo = launchOnBoot;
+    const prevAp = autoStartProfile;
+    const snap = loadedSnapRef.current;
+    if (patch.launchOnBoot !== undefined) setLaunchOnBoot(patch.launchOnBoot);
+    if (patch.autoStartProfile !== undefined) setAutoStartProfile(patch.autoStartProfile);
+    setBusy(true);
+    setErr("");
+    try {
+      await api.setSettings(snap.npmRegistry, snap.dshDownloadDir, snap.githubMirror, snap.githubMirrors, lo, ap);
+    } catch (e) {
+      setLaunchOnBoot(prevLo);
+      setAutoStartProfile(prevAp);
       setErr(String(e));
     } finally {
       setBusy(false);
@@ -3453,6 +3538,39 @@ function SettingsDialog({
         </label>
         </div>
         <div className="settings-card">
+          <div className="settings-card-title">启动</div>
+          <div className="settings-switch-row">
+            <div>
+              <div className="settings-switch-label">开机自动启动 DSH Manager</div>
+              <div className="settings-switch-desc">登录 Windows 后自动打开本软件</div>
+            </div>
+            <button
+              className={`switch ${launchOnBoot ? "on" : ""}`}
+              role="switch"
+              aria-checked={launchOnBoot}
+              onClick={() => saveSwitch({ launchOnBoot: !launchOnBoot })}
+              disabled={busy || !settingsReady}
+            >
+              <span className="switch-knob" />
+            </button>
+          </div>
+          <div className="settings-switch-row">
+            <div>
+              <div className="settings-switch-label">启动后自动启动选中的 DSH x Profile</div>
+              <div className="settings-switch-desc">每次打开软件自动启动上次选中的 DSH x Profile 组合</div>
+            </div>
+            <button
+              className={`switch ${autoStartProfile ? "on" : ""}`}
+              role="switch"
+              aria-checked={autoStartProfile}
+              onClick={() => saveSwitch({ autoStartProfile: !autoStartProfile })}
+              disabled={busy || !settingsReady}
+            >
+              <span className="switch-knob" />
+            </button>
+          </div>
+        </div>
+        <div className="settings-card">
           <div className="settings-card-title">关于 / 更新</div>
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
           <button className="btn tiny" onClick={() => setAboutOpen(!aboutOpen)}>
@@ -3478,7 +3596,7 @@ function SettingsDialog({
         </div>
         {aboutOpen && (
           <div style={{ background: "var(--panel)", border: "1px solid var(--border)", borderRadius: 8, padding: "10px 12px", marginBottom: 10, fontSize: 12, lineHeight: 1.8 }}>
-            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.29</span></div>
+            <div><b>DSH Manager</b> <span style={{ color: "var(--text-dim)" }}>v0.3.30</span></div>
             <div style={{ color: "var(--text-dim)" }}>
               图形化 DSH 环境与插件管理工具（Tauri 2 + React）。仅管理本地 CLI 版 DSH；
               支持多版本下载、Profile 管理、插件安装、整合包、多实例独立运行。
@@ -3502,6 +3620,21 @@ function SettingsDialog({
                 <div style={{ color: "#ffd479" }}>
                   发现新版本：当前 v{updateInfo.current} → v{updateInfo.latest}
                 </div>
+                {updateInfo.notes && (
+                  <div
+                    style={{
+                      marginTop: 6,
+                      fontSize: 12,
+                      lineHeight: 1.7,
+                      maxHeight: 120,
+                      overflowY: "auto",
+                      whiteSpace: "pre-line",
+                      color: "var(--text-dim)",
+                    }}
+                  >
+                    {updateInfo.notes}
+                  </div>
+                )}
                 {!downloading && !downPath && (
                   <button
                     className="btn tiny"
@@ -4254,6 +4387,25 @@ function StartupUpdateModal({ info, onClose }: { info: UpdateInfo; onClose: () =
         <p className="modal-hint">
           当前版本 v{info.current} → 最新版本 v{info.latest}。下载完成后可选择退出并自动运行安装程序。
         </p>
+        {info.notes && (
+          <div
+            style={{
+              background: "var(--panel)",
+              border: "1px solid var(--border)",
+              borderRadius: 6,
+              padding: "8px 10px",
+              marginBottom: 10,
+              fontSize: 12,
+              lineHeight: 1.7,
+              maxHeight: 140,
+              overflowY: "auto",
+              whiteSpace: "pre-line",
+              color: "var(--text-dim)",
+            }}
+          >
+            {info.notes}
+          </div>
+        )}
 
         {!downloading && !downPath && (
           <button

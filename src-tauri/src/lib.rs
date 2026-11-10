@@ -1817,15 +1817,18 @@ async fn get_settings_cmd() -> settings::Settings {
         .unwrap_or_default()
 }
 
-/// 保存设置（FS 写 → 阻塞线程池）
+/// 保存设置（FS 写 → 阻塞线程池）；开机自启同步注册表（用户级，无需管理员权限）
 #[tauri::command]
 async fn set_settings_cmd(
+    app: tauri::AppHandle,
     npm_registry: String,
     dsh_download_dir: String,
     github_mirror: String,
     github_mirrors: Option<Vec<String>>,
+    launch_on_boot: Option<bool>,
+    auto_start_profile: Option<bool>,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let saved = tauri::async_runtime::spawn_blocking(move || {
         settings::validate_registry(&npm_registry)?;
         settings::validate_github_mirror(&github_mirror)?;
         if dsh_download_dir.trim().is_empty() {
@@ -1836,7 +1839,23 @@ async fn set_settings_cmd(
         s.dsh_download_dir = dsh_download_dir.trim().to_string();
         s.github_mirror = settings::normalize_github_mirror(&github_mirror);
         s.github_mirrors = settings::normalize_github_mirrors(&github_mirrors.unwrap_or_default())?;
-        settings::save_settings(&s)
+        s.launch_on_boot = launch_on_boot.unwrap_or(s.launch_on_boot);
+        s.auto_start_profile = auto_start_profile.unwrap_or(s.auto_start_profile);
+        settings::save_settings(&s)?;
+        Ok(s)
+    })
+    .await
+    .map_err(|e| format!("后台任务失败: {e}"))??;
+    // 注册表同步放阻塞池（注册表 IO 很快，但保持一致性）
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_autostart::ManagerExt;
+        let autolaunch = app.autolaunch();
+        let r = if saved.launch_on_boot {
+            autolaunch.enable()
+        } else {
+            autolaunch.disable()
+        };
+        r.map_err(|e| format!("同步开机自启失败: {e}"))
     })
     .await
     .map_err(|e| format!("后台任务失败: {e}"))?
@@ -1948,8 +1967,34 @@ fn github_get_text_deadline(fetch_url: &str, deadline: std::time::Instant) -> (u
     }
 }
 
+/// 从 Releases JSON 里挑出与 latest 版本匹配的 release，直接抄正文 body
+/// （原样，仅去空行、截 400 字符兜底；tag 大小写/v 前缀容错；找不到匹配返回空串）。
+fn pick_release_notes(releases: &serde_json::Value, latest: &str) -> String {
+    let norm = |t: &str| t.trim().trim_start_matches(['v', 'V']).to_lowercase();
+    let want = norm(latest);
+    let Some(arr) = releases.as_array() else {
+        return String::new();
+    };
+    for r in arr {
+        let tag = r.get("tag_name").and_then(|x| x.as_str()).unwrap_or("");
+        if tag.is_empty() || norm(tag) != want {
+            continue;
+        }
+        let body = r.get("body").and_then(|x| x.as_str()).unwrap_or("");
+        let lines: Vec<&str> = body.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        let mut out = lines.join("\n");
+        if out.chars().count() > 400 {
+            let head: String = out.chars().take(400).collect();
+            out = format!("{head}…");
+        }
+        return out;
+    }
+    String::new()
+}
+
 /// 检查更新（统一走 ghnet 镜像轮询，无总时限；每镜像约 10s 自动切换）：
 /// 1) 仓库根 VERSION（main / master）；2) GitHub API releases/latest。
+/// 判定有更新后额外拉 Releases 列表取对应 tag 的发行说明（失败不影响主判定）。
 #[tauri::command]
 async fn check_update_cmd() -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -2003,16 +2048,30 @@ async fn check_update_cmd() -> Result<serde_json::Value, String> {
                 "latest": "",
                 "hasUpdate": false,
                 "url": repo_url,
+                "notes": "",
                 "error": format!("网络有问题，检查更新失败：{err_hint}。可更换 GitHub 镜像后重试。"),
             }));
         }
 
         let has_update = compare_versions(&latest, &current) > 0;
+
+        // 发行说明：只在确实有更新时拉（拉不到不影响主判定）
+        let mut notes = String::new();
+        if has_update {
+            let api_url = format!("https://api.github.com/repos/{PROJECT_REPO}/releases?per_page=10");
+            if let Ok((_used, body)) = ghnet::fetch_text(&api_url) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+                    notes = pick_release_notes(&v, &latest);
+                }
+            }
+        }
+
         Ok(serde_json::json!({
             "current": current,
             "latest": latest,
             "hasUpdate": has_update,
             "url": repo_url,
+            "notes": notes,
             "error": "",
         }))
     })
@@ -3267,6 +3326,10 @@ pub fn run() {
     let scan_dirs = load_scan_dirs();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(AppState {
             manual_envs: Mutex::new(manual_envs),
             scan_dirs: Mutex::new(scan_dirs),
@@ -3356,6 +3419,20 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_size(tauri::PhysicalSize::new(1375, 840));
             }
+            // 开机自启：按设置同步注册表（手动删了注册表项后启动软件会自动补回）
+            {
+                use tauri_plugin_autostart::ManagerExt;
+                let s = settings::load_settings();
+                let autolaunch = app.autolaunch();
+                let r = if s.launch_on_boot {
+                    autolaunch.enable()
+                } else {
+                    autolaunch.disable()
+                };
+                if let Err(e) = r {
+                    eprintln!("同步开机自启状态失败: {e}");
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -3365,6 +3442,30 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pick_release_notes() {
+        // 真实发布格式：直接抄 body（含用户自己写的「V0.3.29:」前缀，原样展示）
+        let json: serde_json::Value = serde_json::json!([
+            { "tag_name": "V0.3.29", "name": "V0.3.29", "body": "V0.3.29:优化了导出的UI" },
+            { "tag_name": "v0.3.28", "name": "v0.3.28", "body": "旧版说明" }
+        ]);
+        assert_eq!(pick_release_notes(&json, "0.3.29"), "V0.3.29:优化了导出的UI");
+        // 多行正文原样保留（仅去空行）
+        let json2: serde_json::Value = serde_json::json!([
+            { "tag_name": "V0.3.30", "name": "V0.3.30", "body": "V0.3.30:三件事\n- 导出重构\n\n- 拉杆修复\n" }
+        ]);
+        assert_eq!(pick_release_notes(&json2, "0.3.30"), "V0.3.30:三件事\n- 导出重构\n- 拉杆修复");
+        // 无匹配版本 → 空串；非数组（错误响应）→ 空串
+        assert_eq!(pick_release_notes(&json, "9.9.9"), "");
+        assert_eq!(pick_release_notes(&serde_json::json!({"message": "x"}), "0.3.29"), "");
+        // 截断 400 字符
+        let long_body = "x".repeat(500);
+        let j2 = serde_json::json!([{ "tag_name": "v0.1.0", "name": "", "body": long_body }]);
+        let s = pick_release_notes(&j2, "0.1.0");
+        assert_eq!(s.chars().count(), 401);
+        assert!(s.ends_with('…'));
+    }
 
     /// 认领测试用运行记录
     fn adopt_sample(key: &str, pid: u32) -> (String, RunningProcess) {
@@ -3624,13 +3725,13 @@ mod tests {
 
     #[test]
     fn asset_match_rules() {
-        assert!(asset_matches("DSH Manager_0.3.29_x64-setup.exe", "0.3.29"));
-        assert!(asset_matches("dsh-manager_0.3.29_x64-setup.exe", "0.3.29"));
-        assert!(asset_matches("任意名_0.3.29_x64-setup.exe", "0.3.29"));
-        assert!(!asset_matches("DSH-Manager-0.3.29-win-x64.exe", "0.3.29"));
-        assert!(!asset_matches("DSH Manager_0.3.29_x64-setup.exe.sha256", "0.3.29"));
-        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.29"));
-        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.29"));
+        assert!(asset_matches("DSH Manager_0.3.30_x64-setup.exe", "0.3.30"));
+        assert!(asset_matches("dsh-manager_0.3.30_x64-setup.exe", "0.3.30"));
+        assert!(asset_matches("任意名_0.3.30_x64-setup.exe", "0.3.30"));
+        assert!(!asset_matches("DSH-Manager-0.3.30-win-x64.exe", "0.3.30"));
+        assert!(!asset_matches("DSH Manager_0.3.30_x64-setup.exe.sha256", "0.3.30"));
+        assert!(!asset_matches("DSH Manager_0.2.0_x64-setup.exe", "0.3.30"));
+        assert!(!asset_matches("DSH Manager_0.3.1_x64-setup.exe", "0.3.30"));
     }
 
     #[test]
@@ -3763,10 +3864,10 @@ mod tests {
                 && u.contains("DSH%20Manager_0.2.0_x64-setup.exe")
         }));
         // 实际 release 用的点号名
-        assert!(asset_matches("DSH.Manager_0.3.29_x64-setup.exe", "0.3.29"));
+        assert!(asset_matches("DSH.Manager_0.3.30_x64-setup.exe", "0.3.30"));
         // 大小写不敏感
-        assert!(asset_matches("dsh.manager_0.3.29_x64-setup.exe", "0.3.29"));
-        assert!(asset_matches("DSH.MANAGER_0.3.29_X64-SETUP.EXE", "0.3.29"));
+        assert!(asset_matches("dsh.manager_0.3.30_x64-setup.exe", "0.3.30"));
+        assert!(asset_matches("DSH.MANAGER_0.3.30_X64-SETUP.EXE", "0.3.30"));
     }
 
     #[test]
@@ -3774,7 +3875,7 @@ mod tests {
         assert_eq!(compare_versions("0.2.0", "0.2.0"), 0);
         assert_eq!(compare_versions("0.2.1", "0.2.0"), 1);
         assert_eq!(compare_versions("0.1.9", "0.2.0"), -1);
-        assert_eq!(compare_versions("v0.3.29", "0.2.9"), 1);
+        assert_eq!(compare_versions("v0.3.30", "0.2.9"), 1);
         assert_eq!(compare_versions("0.2.0-rc.1", "0.2.0"), 0);
         assert_eq!(compare_versions("1.0.0", "0.9.9"), 1);
     }

@@ -167,8 +167,22 @@ export const api = {
   checkPortableGit: () => invoke<string>("check_portable_git_cmd"),
   downloadUpdate: (version: string) => invoke<string>("download_update_cmd", { version }),
   launchInstallerAndExit: (path: string) => invoke<void>("launch_installer_and_exit_cmd", { path }),
-  setSettings: (npmRegistry: string, dshDownloadDir: string, githubMirror: string, githubMirrors?: string[]) =>
-    invoke<void>("set_settings_cmd", { npmRegistry, dshDownloadDir, githubMirror, githubMirrors }),
+  setSettings: (
+    npmRegistry: string,
+    dshDownloadDir: string,
+    githubMirror: string,
+    githubMirrors?: string[],
+    launchOnBoot?: boolean,
+    autoStartProfile?: boolean,
+  ) =>
+    invoke<void>("set_settings_cmd", {
+      npmRegistry,
+      dshDownloadDir,
+      githubMirror,
+      githubMirrors,
+      launchOnBoot,
+      autoStartProfile,
+    }),
   listDshVersions: () => invoke<DshVersionInfo[]>("list_dsh_versions_cmd"),
   installDshVersion: (version: string, targetDir: string) =>
     invoke<DshInstallResult>("install_dsh_version_cmd", { version, targetDir }),

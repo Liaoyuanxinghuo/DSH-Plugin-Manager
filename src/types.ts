@@ -72,6 +72,10 @@ export interface Settings {
   githubMirror: string;
   /** 用户自定义 GitHub 镜像列表（轮流尝试） */
   githubMirrors: string[];
+  /** 开机自动启动本软件 */
+  launchOnBoot: boolean;
+  /** 软件启动后自动启动当前选中的 Profile */
+  autoStartProfile: boolean;
 }
 
 /** 已安装浏览器（「打开界面」下拉框用）；id 空串 = 系统默认浏览器 */
@@ -90,6 +94,8 @@ export interface UpdateInfo {
   hasUpdate: boolean;
   url: string;
   error: string;
+  /** 发行说明（release 标题 + 正文，拉取失败为空） */
+  notes?: string;
 }
 
 export interface DshVersionInfo {

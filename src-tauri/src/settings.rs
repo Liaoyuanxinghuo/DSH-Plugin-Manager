@@ -23,6 +23,10 @@ pub struct Settings {
     pub github_mirrors: Vec<String>,
     /// 各 DSH 版本安装后的实际体积（学习式进度总量：首次安装记录，后续安装有准确百分比）
     pub dsh_install_sizes: std::collections::HashMap<String, u64>,
+    /// 开机自动启动本软件（注册表 HKCU\...\Run，用户级无需管理员权限）
+    pub launch_on_boot: bool,
+    /// 软件每次启动后自动启动当前选中的 Profile
+    pub auto_start_profile: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +37,8 @@ impl Default for Settings {
             github_mirror: DEFAULT_GITHUB_MIRROR.to_string(),
             github_mirrors: Vec::new(),
             dsh_install_sizes: std::collections::HashMap::new(),
+            launch_on_boot: false,
+            auto_start_profile: false,
         }
     }
 }
